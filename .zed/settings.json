@@ -1,0 +1,15 @@
+{
+  "languages": {
+    "Rust": {
+      "language_servers": ["rust-analyzer"]
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "path": ".devenv/profile/bin/rust-glancer",
+        "arguments": ["lsp"]
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "verified-cli"
+description = "Command-line interface for verified"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "verified"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+verified.workspace = true
+
+[lints]
+workspace = true

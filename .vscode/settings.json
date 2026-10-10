@@ -1,0 +1,6 @@
+{
+  "rust-glancer.server.path": ".devenv/profile/bin/rust-glancer",
+  "rust-glancer.diagnostics.onSave": true,
+  "rust-glancer.diagnostics.command": "check",
+  "rust-glancer.diagnostics.cargoArguments": ["--workspace"]
+}

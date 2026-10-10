@@ -1,0 +1,9 @@
+[profile.default]
+retries = 0
+fail-fast = false
+slow-timeout = { period = "20s", terminate-after = 3 }
+leak-timeout = "500ms"
+
+[profile.ci]
+fail-fast = true
+final-status-level = "flaky"

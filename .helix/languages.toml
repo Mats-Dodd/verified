@@ -1,0 +1,7 @@
+[language-server.rust-glancer]
+command = "rust-glancer"
+args = ["lsp"]
+
+[[language]]
+name = "rust"
+language-servers = ["rust-glancer"]

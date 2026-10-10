@@ -1,0 +1,4 @@
+{
+  "recommendations": ["rust-glancer.rust-glancer"],
+  "unwantedRecommendations": ["rust-lang.rust-analyzer"]
+}
