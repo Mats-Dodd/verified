@@ -15,23 +15,28 @@
 //!   durable, or left over from an earlier life, does not match); and the
 //!   final log still holds them.
 //! - I2 every call has exactly one `ToolResult` in the final log.
-//! - I3 no Never-class (`bash`) call executed twice.
+//! - I3 an Unsafe call (`edit`, `bash`) acted on the world at most once,
+//!   across every crash.
 //! - I4 every recovered log extends every record acknowledged as synced.
 //! - I5 at quiescence every turn ended and every call resolved.
 //! - I6 exactly: each stream read the TUI folded, `from..next`, arrived as
 //!   the projection of exactly the log's records `from..next`, and the reads
 //!   tile the stream from offset 0; once caught up, the TUI's folded
 //!   transcript equals the projection of the daemon's log.
-//! - I7 the world agrees with the durable results: an `edit` the log says
-//!   succeeded is in the file after the final crash (including one whose
-//!   daemon crashed between its marker and its rename, and finished it on
-//!   the rerun).
+//! - I7 an `edit` the log says succeeded finished a write of its file, and
+//!   what it wrote is a version of that file the edit could have read (as
+//!   it booted, or as some write before it left it) holding `old` once, with
+//!   `old` replaced by `new`: judged from that call's write in the ledger,
+//!   since approved edits run at once and one may overwrite another. And
+//!   edits are durable: after the final crash each file holds what the last
+//!   write to it that finished wrote, or what a write that overlapped that
+//!   one wrote (two racing renames land in either order).
 //! - I8 each message the user sent started exactly one turn.
 
 use core::fmt;
 use std::collections::BTreeMap;
 
-use verified_domain::{EffectId, Exit, Record, Request, Tool};
+use verified_domain::{EffectId, Exit, Record, Request, Rerun, Tool};
 use verified_server::payload::{Parsed, ToolArgs};
 use verified_server::projection::Projector;
 use verified_wire::WireLimits;
@@ -68,6 +73,8 @@ struct Call {
     args: Option<ToolArgs>,
     approved: usize,
     dispatched: usize,
+    /// The seq of each of its `Dispatched` records: its effects' seqs.
+    effects: Vec<u64>,
     results: Vec<Exit>,
 }
 
@@ -77,7 +84,7 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
     let mut calls: Vec<Call> = Vec::new();
     let mut base = 0usize;
     let mut turn = 0usize;
-    for record in log {
+    for (seq, record) in (0u64..).zip(log) {
         let ix = match record {
             Record::TurnStarted { .. } => {
                 base = calls.len();
@@ -99,6 +106,7 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                         args,
                         approved: 0,
                         dispatched: 0,
+                        effects: Vec::new(),
                         results: Vec::new(),
                     });
                 }
@@ -136,6 +144,7 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                     ));
                 }
                 call.dispatched = call.dispatched.saturating_add(1);
+                call.effects.push(seq);
             }
             Record::ToolResult { exit, .. } => call.results.push(*exit),
             Record::TurnStarted { .. }
@@ -228,9 +237,9 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     let mut found = Vec::new();
     let mut log: Vec<Record<Parsed>> = Vec::new();
     let mut last_recovered: Option<(usize, Vec<Record<Parsed>>)> = None;
-    let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut mutations: Vec<(Option<String>, Op)> = Vec::new();
     let mut reads: Vec<Read<'_>> = Vec::new();
+    let mut disk = Disk::default();
     // Whether this daemon life has opened or created its log yet: until it
     // has, it knows nothing durable, and no tool of it may run.
     let mut known = false;
@@ -279,10 +288,11 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 quiescent(&log, "at quiescence", &mut found);
                 caught_up(&log, *offset, transcript, &mut found);
             }
-            Entry::Boot { files: seen, .. } => {
-                files.clone_from(seen);
+            Entry::Boot { files, .. } => {
                 known = false;
+                disk.boot(at, files);
             }
+            Entry::Wrote { effect } => disk.wrote(at, *effect, &mut found),
             Entry::Mutation { call, effect, op } => {
                 licensed_now(
                     &log,
@@ -293,6 +303,17 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                     stamped,
                     &mut found,
                 );
+                if let Op::Write { path, text } = op {
+                    disk.writes.push(Write {
+                        call: call.as_deref(),
+                        effect: *effect,
+                        path,
+                        text,
+                        start: at,
+                        done: None,
+                        end: None,
+                    });
+                }
                 mutations.push((call.clone(), op.clone()));
             }
             Entry::Read { from, next, chunks } => reads.push(Read {
@@ -327,19 +348,197 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
             "the final recovery came before the TUI was quiescent".to_owned(),
         ));
     }
-    final_log(&last, &files, &mutations, scenario, &mut found);
+    final_log(&last, &mutations, scenario, &mut found);
+    edits_applied(&last, &disk, &mut found);
+    edits_durable(&disk, &mut found);
     reads_exact(&last, &reads, &mut found);
     found
+}
+
+/// One `edit`'s write, as the ledger tells it.
+#[derive(Debug, Clone, Copy)]
+struct Write<'ledger> {
+    call: Option<&'ledger str>,
+    effect: EffectId,
+    path: &'ledger str,
+    text: &'ledger str,
+    /// The ledger index it started at.
+    start: usize,
+    /// The ledger index it returned at, if it did.
+    done: Option<usize>,
+    /// The ledger index a crash cut it off at (the next boot), if one did.
+    end: Option<usize>,
+}
+
+impl Write<'_> {
+    /// Whether this write may still have been landing at ledger index `at`.
+    fn open_at(&self, at: usize) -> bool {
+        self.done.or(self.end).is_none_or(|end| end > at)
+    }
+}
+
+/// The project's files as each boot found them, and every edit's write.
+#[derive(Debug, Default)]
+struct Disk<'ledger> {
+    boots: Vec<(usize, &'ledger BTreeMap<String, String>)>,
+    writes: Vec<Write<'ledger>>,
+}
+
+impl<'ledger> Disk<'ledger> {
+    /// A boot at ledger index `at` found `files`; it cut off every write
+    /// still running.
+    fn boot(&mut self, at: usize, files: &'ledger BTreeMap<String, String>) {
+        for write in &mut self.writes {
+            if write.done.is_none() && write.end.is_none() {
+                write.end = Some(at);
+            }
+        }
+        self.boots.push((at, files));
+    }
+
+    /// The write of `effect` returned at ledger index `at`.
+    fn wrote(&mut self, at: usize, effect: EffectId, found: &mut Vec<Violation>) {
+        let running =
+            self.writes.iter_mut().rev().find(|write| {
+                write.effect == effect && write.done.is_none() && write.end.is_none()
+            });
+        match running {
+            Some(write) => write.done = Some(at),
+            None => found.push(violation(
+                "harness",
+                format!("the write of effect {effect} returned, but none was running"),
+            )),
+        }
+    }
+
+    /// Every text `path` could hold before ledger index `at`: as some boot
+    /// found it, or as some write that started earlier left it.
+    fn versions<'disk>(
+        &'disk self,
+        path: &'disk str,
+        at: usize,
+    ) -> impl Iterator<Item = &'ledger str> + 'disk {
+        let booted = self
+            .boots
+            .iter()
+            .filter(move |(boot, _)| *boot < at)
+            .filter_map(move |(_, files)| files.get(path).map(String::as_str));
+        let written = self
+            .writes
+            .iter()
+            .filter(move |write| write.path == path && write.start < at)
+            .map(|write| write.text);
+        booted.chain(written)
+    }
+}
+
+/// I7, edit by edit: each edit the final log says succeeded finished a
+/// write that is an earlier version of its file with `old` replaced by
+/// `new`.
+fn edits_applied(log: &[Record<Parsed>], disk: &Disk<'_>, found: &mut Vec<Violation>) {
+    let mut ignored = Vec::new();
+    for call in calls(log, &mut ignored) {
+        let Some(ToolArgs::Edit { path, old, new }) = &call.args else {
+            continue;
+        };
+        if !matches!(call.results.as_slice(), [Exit::Ok]) {
+            continue;
+        }
+        let path = path.as_str();
+        let finished: Vec<&Write<'_>> = disk
+            .writes
+            .iter()
+            .filter(|write| {
+                write.call == Some(call.id.as_str())
+                    && call.effects.contains(&write.effect.seq)
+                    && write.path == path
+                    && write.done.is_some()
+            })
+            .collect();
+        if finished.is_empty() {
+            found.push(violation(
+                "I7",
+                format!(
+                    "the log says edit {} put {new:?} in {path}, but no write of it finished",
+                    call.id
+                ),
+            ));
+            continue;
+        }
+        let applied = finished.iter().any(|write| {
+            disk.versions(path, write.start).any(|before| {
+                before.match_indices(old.as_str()).take(2).count() == 1
+                    && before.replacen(old.as_str(), new, 1) == write.text
+            })
+        });
+        if !applied {
+            let wrote: Vec<&str> = finished.iter().map(|write| write.text).collect();
+            found.push(violation(
+                "I7",
+                format!(
+                    "edit {} wrote {wrote:?} to {path}, which is no earlier version of it with {old:?} replaced by {new:?}",
+                    call.id
+                ),
+            ));
+        }
+    }
+}
+
+/// I7, durably: after the final crash each file holds what the last write
+/// to it that finished wrote (or, with none, what it held at first), or what
+/// a write still open when that one started wrote.
+fn edits_durable(disk: &Disk<'_>, found: &mut Vec<Violation>) {
+    let (Some((_, first)), Some((last_boot, last))) = (disk.boots.first(), disk.boots.last())
+    else {
+        return;
+    };
+    for write in &disk.writes {
+        if !last.contains_key(write.path) {
+            found.push(violation(
+                "harness",
+                format!("an edit wrote {}, which no boot reads back", write.path),
+            ));
+        }
+    }
+    for (path, holds) in *last {
+        let writes: Vec<&Write<'_>> = disk
+            .writes
+            .iter()
+            .filter(|write| write.path == path && write.start < *last_boot)
+            .collect();
+        let finished = writes
+            .iter()
+            .filter_map(|write| write.done.map(|done| (done, *write)))
+            .max_by_key(|(done, _)| *done)
+            .map(|(_, write)| write);
+        let mut allowed: Vec<&str> = match finished {
+            Some(landed) => vec![landed.text],
+            None => first.get(path).map(String::as_str).into_iter().collect(),
+        };
+        let since = finished.map_or(0, |landed| landed.start);
+        allowed.extend(
+            writes
+                .iter()
+                .filter(|write| write.open_at(since))
+                .map(|write| write.text),
+        );
+        if !allowed.contains(&holds.as_str()) {
+            found.push(violation(
+                "I7",
+                format!(
+                    "after the final crash {path} holds {holds:?}, but the last finished write to it left {:?}",
+                    allowed.first().copied().unwrap_or_default()
+                ),
+            ));
+        }
+    }
 }
 
 /// Whether `tool` makes changes like `op`.
 const fn makes(tool: Option<Tool>, op: &Op) -> bool {
     matches!(
         (tool, op),
-        (
-            Some(Tool::Edit),
-            Op::Write { .. } | Op::Rename { .. } | Op::Remove { .. }
-        ) | (Some(Tool::Bash), Op::Exec { .. })
+        (Some(Tool::Edit), Op::Write { .. }) | (Some(Tool::Bash), Op::Exec { .. })
     )
 }
 
@@ -495,10 +694,9 @@ fn reads_exact(log: &[Record<Parsed>], reads: &[Read<'_>], found: &mut Vec<Viola
     }
 }
 
-/// I1, I2, I3, I7 and I8 over the log the final recovery found.
+/// I1, I2, I3 and I8 over the log the final recovery found.
 fn final_log(
     log: &[Record<Parsed>],
-    files: &BTreeMap<String, String>,
     mutations: &[(Option<String>, Op)],
     scenario: &Scenario,
     found: &mut Vec<Violation>,
@@ -518,7 +716,7 @@ fn final_log(
             ));
         }
     }
-    let mut execs: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut acted: BTreeMap<&str, usize> = BTreeMap::new();
     for (call, op) in mutations {
         let Some(id) = call else {
             found.push(violation(
@@ -538,35 +736,25 @@ fn final_log(
                 ),
             ));
         }
-        if matches!(op, Op::Exec { .. }) {
-            let count = execs.entry(id.as_str()).or_default();
-            *count = count.saturating_add(1);
-        }
+        let count = acted.entry(id.as_str()).or_default();
+        *count = count.saturating_add(1);
     }
-    for (id, count) in execs {
+    for (id, count) in acted {
+        // The fake model reuses ids across turns: each turn's call may act once.
         let allowed = calls
             .iter()
-            .filter(|call| call.id == id && call.tool == Some(Tool::Bash) && call.dispatched > 0)
+            .filter(|call| {
+                call.id == id
+                    && call.dispatched > 0
+                    && call
+                        .tool
+                        .is_some_and(|tool| matches!(tool.rerun(), Rerun::Unsafe))
+            })
             .count();
         if count > allowed {
-            found.push(violation("I3", format!("bash call {id} ran {count} times")));
-        }
-    }
-    for call in &calls {
-        let Some(ToolArgs::Edit { path, new, .. }) = &call.args else {
-            continue;
-        };
-        if !matches!(call.results.as_slice(), [Exit::Ok]) {
-            continue;
-        }
-        let text = files.get(path.as_str()).map_or("", String::as_str);
-        if !text.contains(new.as_str()) {
             found.push(violation(
-                "I7",
-                format!(
-                    "the log says edit {} put {new:?} in {path}, but after the final crash it holds {text:?}",
-                    call.id
-                ),
+                "I3",
+                format!("Unsafe call {id} acted on the world {count} times"),
             ));
         }
     }

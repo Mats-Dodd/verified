@@ -331,7 +331,7 @@ fn session_is_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// Tools, approvals and concurrency
+// Tools and approvals
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -454,46 +454,43 @@ fn invalid_request_fails_without_running() {
 }
 
 #[test]
-fn bash_waits_for_running_tools() {
+fn approved_calls_run_at_once_beside_anything() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
-    driver.finish(
+    let (_, effects) = driver.finish(
         call,
-        vec![propose("edit", Tool::Edit), propose("bash", Tool::Bash)],
+        vec![
+            propose("edit-a", Tool::Edit),
+            propose("edit-b", Tool::Edit),
+            propose("bash", Tool::Bash),
+            propose("read", Tool::Read),
+        ],
     );
-    let (_, effects) = driver.approve("edit", Verdict::Approve);
-    let edit = single_run(&effects, "edit");
-    let from = driver.log.len();
+    let read = single_run(&effects, "read");
+    let (_, effects) = driver.approve("edit-a", Verdict::Approve);
+    let edit_a = single_run(&effects, "edit-a");
     let (_, effects) = driver.approve("bash", Verdict::Approve);
-    assert!(tool_runs(&effects).is_empty(), "bash waits for the edit");
+    let bash = single_run(&effects, "bash");
+    let from = driver.log.len();
+    let (_, effects) = driver.approve("edit-b", Verdict::Approve);
+    let edit_b = single_run(&effects, "edit-b");
     assert_eq!(
         driver.since(from),
-        vec![Record::Approved {
-            call: CallIx(1),
-            by: Approver::User
-        }],
-        "approved, not dispatched"
+        vec![
+            Record::Approved {
+                call: CallIx(1),
+                by: Approver::User
+            },
+            Record::Dispatched { call: CallIx(1) },
+        ],
+        "a second edit runs beside the first, bash and the read"
     );
-    let (_, effects) = driver.tool_done(edit, Exit::Ok);
-    let bash = single_run(&effects, "bash");
-    let (_, effects) = driver.tool_done(bash, Exit::Ok);
+    for id in [read, edit_a, bash] {
+        let (_, effects) = driver.tool_done(id, Exit::Ok);
+        assert!(effects.is_empty(), "the step waits for every result");
+    }
+    let (_, effects) = driver.tool_done(edit_b, Exit::Ok);
     model_call(&effects);
-}
-
-#[test]
-fn running_bash_blocks_new_tools() {
-    let mut driver = Driver::new(small_limits());
-    let call = driver.start();
-    driver.finish(
-        call,
-        vec![propose("bash", Tool::Bash), propose("edit", Tool::Edit)],
-    );
-    let (_, effects) = driver.approve("bash", Verdict::Approve);
-    let bash = single_run(&effects, "bash");
-    let (_, effects) = driver.approve("edit", Verdict::Approve);
-    assert!(tool_runs(&effects).is_empty(), "nothing runs beside bash");
-    let (_, effects) = driver.tool_done(bash, Exit::Ok);
-    single_run(&effects, "edit");
 }
 
 #[test]
@@ -505,34 +502,6 @@ fn safe_tools_run_together() {
         vec![propose("read-a", Tool::Read), propose("read-b", Tool::Read)],
     );
     assert_eq!(tool_runs(&effects).len(), 2, "both reads start at once");
-}
-
-#[test]
-fn edits_run_one_at_a_time_beside_reads() {
-    let mut driver = Driver::new(small_limits());
-    let call = driver.start();
-    let (_, effects) = driver.finish(
-        call,
-        vec![
-            propose("edit-a", Tool::Edit),
-            propose("edit-b", Tool::Edit),
-            propose("read", Tool::Read),
-        ],
-    );
-    let read = single_run(&effects, "read");
-    let (_, effects) = driver.approve("edit-a", Verdict::Approve);
-    let first = single_run(&effects, "edit-a");
-    let (_, effects) = driver.approve("edit-b", Verdict::Approve);
-    assert!(
-        tool_runs(&effects).is_empty(),
-        "a second edit waits for the first (the read runs beside both)"
-    );
-    let (_, effects) = driver.tool_done(read, Exit::Ok);
-    assert!(tool_runs(&effects).is_empty(), "still one edit at a time");
-    let (_, effects) = driver.tool_done(first, Exit::Ok);
-    let second = single_run(&effects, "edit-b");
-    let (_, effects) = driver.tool_done(second, Exit::Ok);
-    model_call(&effects);
 }
 
 // ---------------------------------------------------------------------------
@@ -913,14 +882,42 @@ fn crash_makes_dispatched_bash_unknown() {
 }
 
 #[test]
-fn crash_reruns_keyed_tool_with_same_key() {
+fn crash_makes_dispatched_edit_unknown() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
     driver.finish(call, vec![propose("edit", Tool::Edit)]);
     let (_, effects) = driver.approve("edit", Verdict::Approve);
-    let before = single_run(&effects, "edit");
+    let edit = single_run(&effects, "edit");
+    let from = driver.log.len();
     let effects = driver.crash();
-    let after = single_run(&effects, "edit");
+    assert!(tool_runs(&effects).is_empty(), "an edit is never rerun");
+    assert_eq!(
+        driver.since(from),
+        vec![
+            Record::EpochBumped { epoch: Epoch(1) },
+            result(0, Exit::Err(Cause::Unknown), None),
+            Record::StepStarted { step: step(1) },
+        ],
+        "its outcome is unknown and the model is told"
+    );
+    let (outcome, _) = driver.tool_done(edit, Exit::Ok);
+    assert_eq!(outcome, Outcome::Stale, "a reply from before the crash");
+}
+
+#[test]
+fn crash_reruns_a_safe_tool_and_resolves_the_rest_unknown() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    let (_, effects) = driver.finish(
+        call,
+        vec![propose("read", Tool::Read), propose("bash", Tool::Bash)],
+    );
+    let before = single_run(&effects, "read");
+    let (_, effects) = driver.approve("bash", Verdict::Approve);
+    single_run(&effects, "bash");
+    let from = driver.log.len();
+    let effects = driver.crash();
+    let after = single_run(&effects, "read");
     assert_eq!(
         after,
         EffectId {
@@ -929,12 +926,20 @@ fn crash_reruns_keyed_tool_with_same_key() {
         },
         "same licensing record, new epoch"
     );
+    assert_eq!(
+        driver.since(from),
+        vec![
+            Record::EpochBumped { epoch: Epoch(1) },
+            result(1, Exit::Err(Cause::Unknown), None),
+        ],
+        "bash is unknown; the read runs again"
+    );
     let dispatches = driver
         .log
         .iter()
         .filter(|record| matches!(record, Record::Dispatched { .. }))
         .count();
-    assert_eq!(dispatches, 1, "a rerun is not a second dispatch");
+    assert_eq!(dispatches, 2, "a rerun is not a second dispatch");
     let (outcome, _) = driver.tool_done(before, Exit::Ok);
     assert_eq!(outcome, Outcome::Stale, "old epoch");
     let (outcome, effects) = driver.tool_done(after, Exit::Ok);
@@ -1114,11 +1119,12 @@ fn policy_approves_only_safe_calls() {
 }
 
 #[test]
-fn a_log_dispatching_conflicting_calls_is_corrupt() {
+fn a_log_dispatching_calls_together_recovers() {
     for (first, second) in [
         (Tool::Edit, Tool::Edit),
         (Tool::Bash, Tool::Read),
-        (Tool::Read, Tool::Bash),
+        (Tool::Bash, Tool::Bash),
+        (Tool::Edit, Tool::Bash),
     ] {
         let mut log = proposed(vec![propose("first", first), propose("second", second)]);
         for index in 0..2 {
@@ -1129,33 +1135,11 @@ fn a_log_dispatching_conflicting_calls_is_corrupt() {
         }
         log.push(Record::Dispatched { call: CallIx(0) });
         log.push(Record::Dispatched { call: CallIx(1) });
-        assert_eq!(
-            Core::recover(small_limits(), &log),
-            Err(Corrupt {
-                seq: 6,
-                violation: Violation::Concurrent
-            }),
-            "{first:?} beside {second:?}"
+        assert!(
+            Core::recover(small_limits(), &log).is_ok(),
+            "{first:?} beside {second:?}: the core has no concurrency rules"
         );
     }
-    let mut log = proposed(vec![
-        propose("edit", Tool::Edit),
-        propose("read", Tool::Read),
-    ]);
-    log.push(Record::Approved {
-        call: CallIx(0),
-        by: Approver::User,
-    });
-    log.push(Record::Approved {
-        call: CallIx(1),
-        by: Approver::Policy,
-    });
-    log.push(Record::Dispatched { call: CallIx(0) });
-    log.push(Record::Dispatched { call: CallIx(1) });
-    assert!(
-        Core::recover(small_limits(), &log).is_ok(),
-        "a read runs beside an edit"
-    );
 }
 
 // ---------------------------------------------------------------------------

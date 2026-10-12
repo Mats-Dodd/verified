@@ -14,13 +14,13 @@ use verified_domain::id::{CallId, IdEntropy, MessageId, SessionId, TurnId, UnixM
 use verified_domain::{Cause, Exit, Limits, LimitsConfig, Millis, Record, TurnOutcome};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
-    BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Fingerprint,
-    MarkerKey, Stat, Stopped,
+    BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Stopped,
+    Written,
 };
 use verified_server::limits::ServerLimits;
 use verified_server::log::{MemDisk, MemLogStore};
 use verified_server::model::fake::FakeModel;
-use verified_server::payload::{Parsed, ProjectPath, Sibling};
+use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, World};
 use verified_server::shell::{CommandError, Seams, SessionHandle, ShellConfig};
@@ -60,11 +60,11 @@ struct MemEnv {
     commands: std::sync::Mutex<Vec<(String, String)>>,
     #[expect(
         clippy::disallowed_types,
-        reason = "test env: edit tasks mark and read, the shell unmarks; dropped with the test"
+        reason = "test env: edit tasks append, the test reads after a turn ends; dropped with the test"
     )]
-    markers: std::sync::Mutex<BTreeMap<MarkerKey, Fingerprint>>,
-    /// Paths whose stage never returns: a crash between dispatch and result.
-    stall_staging: bool,
+    writes: std::sync::Mutex<Vec<String>>,
+    /// Writes never return: a crash between dispatch and result.
+    stall_writes: bool,
 }
 
 impl MemEnv {
@@ -72,10 +72,10 @@ impl MemEnv {
         Arc::new(Self::holding(path, text, false))
     }
 
-    /// An env with one file, whose staging stalls if `stall`.
+    /// An env with one file, whose writes stall if `stall`.
     fn holding(path: &str, text: &str, stall: bool) -> Self {
         let env = Self {
-            stall_staging: stall,
+            stall_writes: stall,
             ..Self::default()
         };
         env.files
@@ -97,38 +97,14 @@ impl MemEnv {
         self.commands.lock().expect("unpoisoned").clone()
     }
 
-    fn marker_keys(&self) -> Vec<MarkerKey> {
-        self.markers
-            .lock()
-            .expect("unpoisoned")
-            .keys()
-            .copied()
-            .collect()
-    }
-
-    fn files(&self) -> Vec<String> {
-        self.files
-            .lock()
-            .expect("unpoisoned")
-            .keys()
-            .cloned()
-            .collect()
+    /// The paths of the writes that landed, in order.
+    fn writes(&self) -> Vec<String> {
+        self.writes.lock().expect("unpoisoned").clone()
     }
 }
 
 #[async_trait]
 impl Env for MemEnv {
-    async fn stat(&self, path: &ProjectPath) -> Result<Stat, EnvError> {
-        Ok(self
-            .files
-            .lock()
-            .expect("unpoisoned")
-            .get(path.as_str())
-            .map_or(Stat::Missing, |bytes| Stat::File {
-                bytes: u64::try_from(bytes.len()).expect("small"),
-            }))
-    }
-
     async fn read(&self, path: &ProjectPath, _limit: u64) -> Result<Vec<u8>, EnvError> {
         self.files
             .lock()
@@ -157,70 +133,17 @@ impl Env for MemEnv {
             .collect())
     }
 
-    async fn stage(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<(), EnvError> {
-        if self.stall_staging {
+    async fn write(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<Written, EnvError> {
+        if self.stall_writes {
             core::future::pending::<()>().await;
         }
+        let path = edit.path().as_str().to_owned();
         self.files
             .lock()
             .expect("unpoisoned")
-            .insert(edit.staged().as_str().to_owned(), contents.to_vec());
-        Ok(())
-    }
-
-    async fn marked(&self, edit: &EditGrant<'_>) -> Result<Option<Fingerprint>, EnvError> {
-        Ok(self
-            .markers
-            .lock()
-            .expect("unpoisoned")
-            .get(&edit.marker())
-            .copied())
-    }
-
-    async fn mark(&self, edit: &EditGrant<'_>, original: Fingerprint) -> Result<(), EnvError> {
-        self.markers
-            .lock()
-            .expect("unpoisoned")
-            .insert(edit.marker(), original);
-        Ok(())
-    }
-
-    async fn discard(&self, edit: &EditGrant<'_>) -> Result<(), EnvError> {
-        self.files
-            .lock()
-            .expect("unpoisoned")
-            .remove(edit.staged().as_str());
-        Ok(())
-    }
-
-    async fn markers(&self, session: SessionId, _limit: usize) -> Result<Vec<MarkerKey>, EnvError> {
-        Ok(self
-            .marker_keys()
-            .into_iter()
-            .filter(|key| key.session == session)
-            .collect())
-    }
-
-    async fn unmark(&self, key: MarkerKey, staged: &ProjectPath) -> Result<(), EnvError> {
-        self.files
-            .lock()
-            .expect("unpoisoned")
-            .remove(staged.as_str());
-        self.markers.lock().expect("unpoisoned").remove(&key);
-        Ok(())
-    }
-
-    async fn commit(&self, edit: &EditGrant<'_>) -> Result<(), EnvError> {
-        let (from, to) = (edit.staged(), edit.path());
-        let mut files = self.files.lock().expect("unpoisoned");
-        let bytes = files
-            .remove(from.as_str())
-            .ok_or_else(|| EnvError::NotFound {
-                path: from.as_str().to_owned(),
-            })?;
-        files.insert(to.as_str().to_owned(), bytes);
-        drop(files);
-        Ok(())
+            .insert(path.clone(), contents.to_vec());
+        self.writes.lock().expect("unpoisoned").push(path);
+        Ok(Written::Synced)
     }
 
     async fn exec(
@@ -248,7 +171,7 @@ impl Env for MemEnv {
             .push((command.as_str().to_owned(), call));
         if command.as_str() == "block" {
             cancel.cancelled().await;
-            return Ok(ExitStatus::Killed(Stopped::Cancelled));
+            return Ok(ExitStatus::Stopped(Stopped::Cancelled));
         }
         output
             .send(format!("ran {}\n", command.as_str()).into_bytes())
@@ -935,94 +858,14 @@ async fn eventually<F: Fn() -> bool>(ready: F) -> bool {
     ready()
 }
 
-/// An approved edit of the longest path the tools accept runs, and so does
-/// its rerun after a restart. A path whose staged sibling could not be named
-/// once panicked inside the tool task, crashing the daemon, and the rerun on
-/// boot crashed it again, for good.
+/// A crash while an approved edit runs (dispatched, its write not yet
+/// landed) resolves it `Unknown` after the restart, and it is never rerun:
+/// an edit is `Unsafe`.
 #[tokio::test]
-async fn the_longest_path_edits_and_reruns_without_a_crash() {
-    let path = format!(
-        "{}/{}",
-        "d".repeat(64),
-        "n".repeat(ProjectPath::MAX_BYTES - 65)
-    );
+async fn a_crash_during_an_edit_leaves_unknown_and_never_reruns() {
     let disk = MemDisk::new();
-    let stalled = Arc::new(MemEnv::holding(&path, "alpha", true));
+    let stalled = Arc::new(MemEnv::holding("lib.rs", "fn mian() {}", true));
     let first = boot(&disk, Arc::<MemEnv>::clone(&stalled)).await;
-    let (_, handle) = first.registry.create(session_id()).await.expect("created");
-    let reply = handle
-        .send_message(send(1, &format!("edit {path} alpha beta")))
-        .await
-        .expect("accepted");
-    let chunks = until(&handle, |chunks| approval_requested(chunks).is_some()).await;
-    let call_id = approval_requested(&chunks).expect("asked");
-    handle
-        .approve(Approve {
-            call_id,
-            verdict: Verdict::Grant,
-        })
-        .await
-        .expect("granted");
-    // The edit is dispatched and stuck staging: "crash" the daemon there.
-    let dispatched = eventually(|| {
-        disk.bytes(session_id())
-            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains("\"Dispatched\""))
-    })
-    .await;
-    assert!(dispatched, "the edit was dispatched");
-    first.world.shutdown().cancel();
-    drop(handle);
-
-    let env = MemEnv::with_file(&path, "alpha");
-    let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
-    let handle = second
-        .registry
-        .lookup(session_id())
-        .await
-        .expect("recovered");
-    until(&handle, ended(reply.turn_id)).await;
-    assert_eq!(
-        env.file(&path).as_deref(),
-        Some("beta"),
-        "the rerun edited it"
-    );
-    let log = records(&handle).await;
-    assert!(
-        log.iter().any(|record| matches!(
-            record,
-            Record::ToolResult {
-                exit: Exit::Ok,
-                output: Some(_),
-                ..
-            }
-        )),
-        "the rerun's result is durable"
-    );
-
-    // One byte longer and the path is refused at the model boundary: the
-    // call fails as invalid, the turn goes on.
-    let too_long = "n".repeat(ProjectPath::MAX_BYTES + 1);
-    let invalid = handle
-        .send_message(send(2, &format!("edit {too_long} alpha beta")))
-        .await
-        .expect("accepted");
-    until(&handle, ended(invalid.turn_id)).await;
-    let transcript = fold(&handle).await;
-    assert!(
-        reply_text(&transcript, 1).contains("Invalid tool call"),
-        "{}",
-        reply_text(&transcript, 1)
-    );
-    second.world.shutdown().cancel();
-}
-
-/// Once an edit's result is durable its marker (and any staged copy) is
-/// removed; a marker left by a crash before that is swept at the next boot.
-#[tokio::test]
-async fn edit_markers_go_once_results_are_durable() {
-    let env = MemEnv::with_file("lib.rs", "fn mian() {}");
-    let disk = MemDisk::new();
-    let first = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
     let (_, handle) = first.registry.create(session_id()).await.expect("created");
     let reply = handle
         .send_message(send(1, "edit lib.rs mian main"))
@@ -1037,54 +880,145 @@ async fn edit_markers_go_once_results_are_durable() {
         })
         .await
         .expect("granted");
-    until(&handle, ended(reply.turn_id)).await;
-    assert!(
-        eventually(|| env.marker_keys().is_empty()).await,
-        "the marker is removed: {:?}",
-        env.marker_keys()
-    );
-    assert_eq!(
-        env.files(),
-        vec!["lib.rs".to_owned()],
-        "nothing staged is left"
-    );
-
-    // A crash between the result and the cleanup leaves both behind.
-    let log = records(&handle).await;
-    let seq = log
-        .iter()
-        .position(|record| matches!(record, Record::Dispatched { .. }))
-        .and_then(|at| u64::try_from(at).ok())
-        .expect("a dispatch");
-    let key = MarkerKey {
-        session: session_id(),
-        seq,
-    };
-    env.markers
-        .lock()
-        .expect("unpoisoned")
-        .insert(key, Fingerprint::of(b"fn mian() {}"));
-    let staged = ProjectPath::parse("lib.rs")
-        .expect("a path")
-        .sibling(&Sibling::staged(session_id(), seq));
-    env.files
-        .lock()
-        .expect("unpoisoned")
-        .insert(staged.as_str().to_owned(), b"stale".to_vec());
+    // The edit is dispatched and stuck writing: "crash" the daemon there.
+    let dispatched = eventually(|| {
+        disk.bytes(session_id())
+            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains("\"Dispatched\""))
+    })
+    .await;
+    assert!(dispatched, "the edit was dispatched");
     first.world.shutdown().cancel();
     drop(handle);
+
+    let env = MemEnv::with_file("lib.rs", "fn mian() {}");
     let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
+    let handle = second
+        .registry
+        .lookup(session_id())
+        .await
+        .expect("recovered");
+    until(&handle, ended(reply.turn_id)).await;
+    assert!(env.writes().is_empty(), "the edit is not rerun");
+    assert_eq!(env.file("lib.rs").as_deref(), Some("fn mian() {}"));
+    let log = records(&handle).await;
     assert!(
-        eventually(|| env.marker_keys().is_empty()).await,
-        "the boot sweep removes it: {:?}",
-        env.marker_keys()
+        log.iter().any(|record| matches!(
+            record,
+            Record::ToolResult {
+                exit: Exit::Err(Cause::Unknown),
+                output: None,
+                ..
+            }
+        )),
+        "its outcome is unknown"
     );
-    assert_eq!(
-        env.files(),
-        vec!["lib.rs".to_owned()],
-        "and the staged copy"
+    let transcript = fold(&handle).await;
+    assert!(
+        reply_text(&transcript, 0).contains("Unknown outcome"),
+        "the model heard: {}",
+        reply_text(&transcript, 0)
     );
     second.world.shutdown().cancel();
+}
+
+/// An approved edit of the longest path the tools accept runs without
+/// crashing the daemon (a path whose staged sibling could not be named once
+/// panicked inside the tool task); one byte longer and the path is refused
+/// at the model boundary.
+#[tokio::test]
+async fn the_longest_path_edits_without_a_crash() {
+    let path = format!(
+        "{}/{}",
+        "d".repeat(64),
+        "n".repeat(ProjectPath::MAX_BYTES - 65)
+    );
+    let env = MemEnv::with_file(&path, "alpha");
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let reply = handle
+        .send_message(send(1, &format!("edit {path} alpha beta")))
+        .await
+        .expect("accepted");
+    let chunks = until(&handle, |chunks| approval_requested(chunks).is_some()).await;
+    let call_id = approval_requested(&chunks).expect("asked");
+    handle
+        .approve(Approve {
+            call_id,
+            verdict: Verdict::Grant,
+        })
+        .await
+        .expect("granted");
+    until(&handle, ended(reply.turn_id)).await;
+    assert_eq!(env.file(&path).as_deref(), Some("beta"), "edited");
+
+    let too_long = "n".repeat(ProjectPath::MAX_BYTES + 1);
+    let invalid = handle
+        .send_message(send(2, &format!("edit {too_long} alpha beta")))
+        .await
+        .expect("accepted");
+    until(&handle, ended(invalid.turn_id)).await;
+    let transcript = fold(&handle).await;
+    assert!(
+        reply_text(&transcript, 1).contains("Invalid tool call"),
+        "{}",
+        reply_text(&transcript, 1)
+    );
+    daemon.world.shutdown().cancel();
+}
+
+/// Cancelling a turn while its approved `bash` runs stops the command, and
+/// the model hears one honest message: stopped, and what it started may
+/// still be running.
+#[tokio::test]
+async fn cancelling_bash_reports_the_honest_message() {
+    let env = Arc::new(MemEnv::default());
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let reply = handle
+        .send_message(send(1, "bash block"))
+        .await
+        .expect("accepted");
+    let chunks = until(&handle, |chunks| approval_requested(chunks).is_some()).await;
+    let call_id = approval_requested(&chunks).expect("asked");
+    handle
+        .approve(Approve {
+            call_id,
+            verdict: Verdict::Grant,
+        })
+        .await
+        .expect("granted");
+    assert!(
+        eventually(|| !env.commands().is_empty()).await,
+        "bash started"
+    );
+    handle
+        .cancel(Cancel {
+            turn_id: reply.turn_id,
+        })
+        .await
+        .expect("cancelling");
+    until(&handle, ended(reply.turn_id)).await;
+    let log = records(&handle).await;
+    let output = log.iter().find_map(|record| {
+        if let Record::ToolResult {
+            exit: Exit::Err(Cause::Interrupted),
+            output: Some(output),
+            ..
+        } = record
+        {
+            Some(output.body.text.clone())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        output.as_deref(),
+        Some("[stopped (cancelled); processes it started may still be running]"),
+        "{log:?}"
+    );
+    assert_eq!(env.commands().len(), 1, "ran once");
+    fold(&handle).await;
+    daemon.world.shutdown().cancel();
 }
 
 /// A log that reaches its file bound refuses the append that would pass it:

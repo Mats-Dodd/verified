@@ -56,13 +56,9 @@ pub struct ServerLimits {
     /// How long `bash` may run before its process group is killed.
     pub exec_timeout: Millis,
     /// How long a stopped command's output is still read: past it, a
-    /// process that left the group and holds the output makes the call's
-    /// outcome unknown rather than hanging it.
+    /// process that left the group and holds the output cannot hang the
+    /// call.
     pub exec_drain: Millis,
-    /// Waits, in turn, for the stray members of a finished command's group
-    /// to be reaped by init when they cannot be signalled (macOS answers
-    /// EPERM for a group of zombies). Spent, the group may still run.
-    pub exec_reap_schedule: Vec<Millis>,
     /// How long one live SSE response stays open before the client reconnects.
     pub sse_lifetime: Millis,
     /// Idle time before a live SSE response sends a keep-alive comment.
@@ -182,14 +178,6 @@ impl ServerLimits {
             exec_output_queue: 64,
             exec_timeout: Millis::new(120_000),
             exec_drain: Millis::new(1_000),
-            exec_reap_schedule: vec![
-                Millis::new(5),
-                Millis::new(10),
-                Millis::new(20),
-                Millis::new(50),
-                Millis::new(100),
-                Millis::new(200),
-            ],
             sse_lifetime: Millis::new(60_000),
             sse_keep_alive: Millis::new(15_000),
             sse_queue: 16,

@@ -15,7 +15,7 @@ use verified_domain::{
     SessionId, TurnId, UnixMillis,
 };
 use verified_server::daemon::{self, DaemonError, Layout};
-use verified_server::env::{Fingerprint, LocalEnv};
+use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
 use verified_server::log::{FileLog, Log as _};
 use verified_server::model::fake::FakeModel;
@@ -152,8 +152,10 @@ async fn bash_reports_status_output_and_call_id() {
     assert!(output.text.ends_with("[exit status 3]"), "{}", output.text);
 }
 
+/// Cancelling a running command kills its whole process group, and the
+/// model hears one honest message.
 #[tokio::test]
-async fn cancel_kills_the_whole_process_group() {
+async fn cancelling_bash_kills_its_group_and_reports_the_honest_message() {
     let root = scratch("cancel").await;
     let env = local(root.clone());
     let limits = ServerLimits::v0();
@@ -171,6 +173,75 @@ async fn cancel_kills_the_whole_process_group() {
     assert_eq!(exit, Exit::Err(Cause::Interrupted), "interrupted");
     assert!(output.text.contains("started"), "{}", output.text);
     assert!(!output.text.contains("never"), "{}", output.text);
+    assert!(
+        output
+            .text
+            .ends_with("[stopped (cancelled); processes it started may still be running]"),
+        "{}",
+        output.text
+    );
+}
+
+/// A command whose leader closes its output keeps running until it exits:
+/// v sends no signal to a command nobody stopped, so its own status is
+/// what the model hears.
+#[tokio::test]
+async fn a_leader_that_closes_its_output_still_runs_to_its_exit() {
+    let root = scratch("closed").await;
+    let env = local(root);
+    let limits = ServerLimits::v0();
+    let (exit, output) = tool::run(
+        &env,
+        session(),
+        &bash("echo hi; exec >/dev/null 2>&1; sleep 0.3; exit 4"),
+        &CancellationToken::new(),
+        &limits,
+    )
+    .await;
+    assert_eq!(
+        exit,
+        Exit::Err(Cause::Failed(Fault::Other)),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("hi"), "{}", output.text);
+    assert!(output.text.ends_with("[exit status 4]"), "{}", output.text);
+}
+
+/// A leader the stopping kill cannot reach (here: it moved itself out of
+/// its group into the test's own, as an `EPERM` would leave it) does not
+/// hang the call: the reap is bounded by the drain, like the output.
+#[tokio::test]
+async fn a_leader_the_kill_cannot_reach_does_not_hang_a_stopped_command() {
+    let root = scratch("unreachable").await;
+    let env = local(root);
+    let mut limits = ServerLimits::v0();
+    limits.exec_drain = Millis::new(200);
+    // Holding its output, and having closed it.
+    for closes in ["", "close STDOUT; close STDERR; "] {
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        let call = bash(&format!(
+            "exec perl -e '$| = 1; setpgrp(0, getpgrp(getppid())) or die qq(setpgrp: $!); \
+             print qq(moved\\n); {closes}sleep 5'"
+        ));
+        let stop = async move {
+            SystemClock.sleep(Millis::new(500)).await;
+            stopper.cancel();
+        };
+        let ((exit, output), ()) = within(Duration::from_secs(3), async {
+            tokio::join!(tool::run(&env, session(), &call, &cancel, &limits), stop)
+        })
+        .await
+        .expect("the reap is bounded although the leader outlives the kill");
+        assert_eq!(exit, Exit::Err(Cause::Interrupted), "{}", output.text);
+        assert!(output.text.contains("moved"), "{}", output.text);
+        assert!(
+            output.text.contains("may still be running"),
+            "{}",
+            output.text
+        );
+    }
 }
 
 #[tokio::test]
@@ -188,7 +259,13 @@ async fn timeout_kills_and_output_is_bounded() {
     )
     .await;
     assert_eq!(exit, Exit::Err(Cause::Failed(Fault::Other)), "timed out");
-    assert!(output.text.contains("timed out"), "{}", output.text);
+    assert!(
+        output
+            .text
+            .ends_with("[stopped (timed out); processes it started may still be running]"),
+        "{}",
+        output.text
+    );
 
     limits.tool_output_bytes = 1000;
     let (exit, output) = tool::run(
@@ -209,7 +286,7 @@ async fn timeout_kills_and_output_is_bounded() {
 }
 
 #[tokio::test]
-async fn edit_is_compare_and_swap_and_keyed() {
+async fn edit_is_compare_and_swap() {
     let root = scratch("edit").await;
     fs::write_synced(&root.join("lib.rs"), b"fn mian() {}\n")
         .await
@@ -226,22 +303,22 @@ async fn edit_is_compare_and_swap_and_keyed() {
     assert_eq!(exit, Exit::Ok, "{}", output.text);
     let text = fs::read(&root.join("lib.rs")).await.expect("read back");
     assert_eq!(text, b"fn main() {}\n", "edited");
-    // Rerun after a crash: same call id, new text already in place.
+    let entries = fs::list(&root, 10).await.expect("listing");
+    let names: Vec<_> = entries.iter().map(|entry| entry.name.clone()).collect();
+    assert_eq!(names, vec!["lib.rs"], "no staged file is left behind");
+    // The same edit again: `old` is gone, so it fails rather than applying
+    // twice.
     let (exit, output) =
         tool::run(&env, session(), &call, &CancellationToken::new(), &limits).await;
-    assert_eq!(exit, Exit::Ok, "{}", output.text);
-    assert!(
-        output.text.starts_with("Already applied"),
+    assert_eq!(
+        exit,
+        Exit::Err(Cause::Failed(Fault::Other)),
         "{}",
         output.text
     );
-    let entries = fs::list(&root, 10).await.expect("listing");
-    let names: Vec<_> = entries.iter().map(|entry| entry.name.clone()).collect();
-    assert_eq!(
-        names,
-        vec![".verified", "lib.rs"],
-        "no staged file is left behind; the marker is in the daemon's directory"
-    );
+    assert!(output.text.contains("not found"), "{}", output.text);
+    let text = fs::read(&root.join("lib.rs")).await.expect("read back");
+    assert_eq!(text, b"fn main() {}\n", "unchanged");
 
     let read = approved(ToolArgs::Read {
         path: ProjectPath::parse("missing.rs").expect("a path"),
@@ -351,120 +428,6 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
     );
     let again = FileLock.lock(&layout.lock_file()).await;
     assert!(again.is_ok(), "the lock is released when the daemon stops");
-}
-
-/// An edit that deletes (empty `new`) or whose `new` contains `old`: the
-/// file's text cannot say whether a rerun already applied it, the marker
-/// can. Neither a false "already applied" nor a double apply.
-#[tokio::test]
-async fn edit_reruns_are_decided_by_the_marker_not_the_text() {
-    let root = scratch("edit-marker").await;
-    fs::write_synced(&root.join("a.txt"), b"keep drop keep\n")
-        .await
-        .expect("a file");
-    fs::write_synced(&root.join("b.txt"), b"x = 1\n")
-        .await
-        .expect("a file");
-    let env = local(root.clone());
-    let limits = ServerLimits::v0();
-    let delete = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("a.txt").expect("a path"),
-        old: "drop ".to_owned(),
-        new: String::new(),
-    });
-    let none = CancellationToken::new();
-    let (exit, output) = tool::run(&env, session(), &delete, &none, &limits).await;
-    assert_eq!(exit, Exit::Ok, "{}", output.text);
-    let (exit, output) = tool::run(&env, session(), &delete, &none, &limits).await;
-    assert_eq!(exit, Exit::Ok, "{}", output.text);
-    assert!(
-        output.text.starts_with("Already applied"),
-        "{}",
-        output.text
-    );
-    let text = fs::read(&root.join("a.txt")).await.expect("read back");
-    assert_eq!(text, b"keep keep\n", "deleted once");
-
-    // A deletion whose text was never there fails, rather than claiming an
-    // empty `new` is "already in place".
-    let absent = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("b.txt").expect("a path"),
-        old: "nowhere".to_owned(),
-        new: String::new(),
-    });
-    let (exit, output) = tool::run(
-        &env,
-        SessionId::from_parts(at(), &[4; 10]),
-        &absent,
-        &CancellationToken::new(),
-        &limits,
-    )
-    .await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
-
-    // `new` contains `old`: a text check would apply it again.
-    let grow = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("b.txt").expect("a path"),
-        old: "1".to_owned(),
-        new: "12".to_owned(),
-    });
-    let other = SessionId::from_parts(at(), &[5; 10]);
-    for _ in 0..2u8 {
-        let (exit, output) =
-            tool::run(&env, other, &grow, &CancellationToken::new(), &limits).await;
-        assert_eq!(exit, Exit::Ok, "{}", output.text);
-    }
-    let text = fs::read(&root.join("b.txt")).await.expect("read back");
-    assert_eq!(text, b"x = 12\n", "applied exactly once");
-}
-
-/// A crash after the marker and before the rename: the rerun finishes the
-/// rename with the staged text.
-#[tokio::test]
-async fn edit_rerun_finishes_a_marked_rename() {
-    use verified_server::env::{Env as _, Grant};
-
-    let root = scratch("edit-finish").await;
-    fs::write_synced(&root.join("c.txt"), b"old\n")
-        .await
-        .expect("a file");
-    let env = local(root.clone());
-    let call = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("c.txt").expect("a path"),
-        old: "old".to_owned(),
-        new: "new".to_owned(),
-    });
-    let grant = match Grant::of(&call, session()) {
-        Grant::Edit(grant) => Some(grant),
-        Grant::Read(_) | Grant::Bash(_) => None,
-    };
-    let grant = grant.expect("an edit call grants an edit");
-    env.stage(&grant, b"new\n").await.expect("staged");
-    env.mark(&grant, Fingerprint::of(b"old\n"))
-        .await
-        .expect("marked");
-    assert_eq!(
-        env.marked(&grant).await.expect("readable"),
-        Some(Fingerprint::of(b"old\n")),
-        "marked with the original's fingerprint"
-    );
-    let (exit, output) = tool::run(
-        &env,
-        session(),
-        &call,
-        &CancellationToken::new(),
-        &ServerLimits::v0(),
-    )
-    .await;
-    assert_eq!(exit, Exit::Ok, "{}", output.text);
-    assert!(output.text.starts_with("Edited"), "{}", output.text);
-    let text = fs::read(&root.join("c.txt")).await.expect("read back");
-    assert_eq!(text, b"new\n", "the staged text landed");
 }
 
 /// The model of the crash test: its stream panics, in a world task.
@@ -612,7 +575,8 @@ fn unreachable_pid() -> i32 {
 
 /// A command that daemonizes a child holding its output (it leaves the
 /// group with `setsid`) cannot hang the call: once the group is stopped the
-/// output is drained for a bounded time, and the outcome is unknown.
+/// output is drained for a bounded time, and the message says the child may
+/// still run.
 #[tokio::test]
 async fn a_daemonized_child_cannot_hang_bash() {
     let root = scratch("escape").await;
@@ -639,7 +603,12 @@ async fn a_daemonized_child_cannot_hang_bash() {
             rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
     assert!(alive, "the child escaped the group and outlived the call");
-    assert_eq!(exit, Exit::Err(Cause::Unknown), "{}", output.text);
+    assert_eq!(
+        exit,
+        Exit::Err(Cause::Failed(Fault::Other)),
+        "{}",
+        output.text
+    );
     assert!(output.text.contains("leader-done"), "{}", output.text);
     assert!(
         output.text.contains("may still be running"),
@@ -662,8 +631,12 @@ async fn a_daemonized_child_cannot_hang_bash() {
     })
     .await
     .expect("cancel returns while the escaped child holds the output");
-    assert_eq!(exit, Exit::Err(Cause::Unknown), "{}", output.text);
-    assert!(output.text.contains("interrupted"), "{}", output.text);
+    assert_eq!(exit, Exit::Err(Cause::Interrupted), "{}", output.text);
+    assert!(
+        output.text.contains("may still be running"),
+        "{}",
+        output.text
+    );
 }
 
 /// The daemon stopping (the call's future dropped) or crashing (an abort,
@@ -715,99 +688,55 @@ async fn a_stopping_daemon_kills_whole_process_groups() {
     assert!(groups.is_empty(), "a reaped group is unregistered");
 }
 
-/// Symlinks are never followed, on the path or at its end: an auto-approved
-/// read cannot leave the project through one, and neither can an edit.
+/// Symlinks are followed, on the path and at its end: `LocalEnv` contains
+/// nothing. An edit through a link replaces the file it names, and the link
+/// stays a link.
 #[tokio::test]
-async fn symlinks_never_lead_out_of_the_project() {
+async fn symlinks_are_followed() {
     let root = scratch("links").await;
     let outside = scratch("outside").await;
-    fs::write_synced(&outside.join("secret.txt"), b"secret old\n")
+    fs::write_synced(&outside.join("shared.txt"), b"shared old\n")
         .await
         .expect("a file outside");
     std::os::unix::fs::symlink(&outside, root.join("link")).expect("a dir link");
-    std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("file-link"))
+    std::os::unix::fs::symlink(outside.join("shared.txt"), root.join("file-link"))
         .expect("a file link");
     let env = local(root.clone());
     let limits = ServerLimits::v0();
-    for path in ["link/secret.txt", "file-link", "link"] {
+    for path in ["link/shared.txt", "file-link"] {
         let read = approved(ToolArgs::Read {
             path: ProjectPath::parse(path).expect("a path"),
         });
         let (exit, output) =
             tool::run(&env, session(), &read, &CancellationToken::new(), &limits).await;
-        assert_eq!(exit, Exit::Err(Cause::Failed(Fault::Other)), "{path}");
-        assert!(output.text.contains("symlink"), "{path}: {}", output.text);
-        assert!(!output.text.contains("secret"), "{path}: {}", output.text);
+        assert_eq!(exit, Exit::Ok, "{path}: {}", output.text);
+        assert_eq!(output.text, "shared old\n", "{path}");
     }
-    let outside_edit = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("link/secret.txt").expect("a path"),
+    let through_link = approved(ToolArgs::Edit {
+        path: ProjectPath::parse("file-link").expect("a path"),
         old: "old".to_owned(),
         new: "new".to_owned(),
     });
     let (exit, output) = tool::run(
         &env,
         session(),
-        &outside_edit,
+        &through_link,
         &CancellationToken::new(),
         &limits,
     )
     .await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
+    assert_eq!(exit, Exit::Ok, "{}", output.text);
+    let text = fs::read(&outside.join("shared.txt")).await.expect("read");
+    assert_eq!(text, b"shared new\n", "the linked file changed");
+    let links = fs::list(&root, 10).await.expect("listing");
+    assert!(
+        links
+            .iter()
+            .any(|entry| entry.name == "file-link" && entry.kind == fs::Kind::Symlink),
+        "the link stays a link: {links:?}"
     );
-    let text = fs::read(&outside.join("secret.txt")).await.expect("read");
-    assert_eq!(text, b"secret old\n", "untouched");
-}
-
-/// A rerun of a marked edit renames its staged copy only over the text it
-/// was made from: if the file changed meanwhile, the edit fails and says so.
-#[tokio::test]
-async fn a_rerun_never_overwrites_a_file_changed_since_staging() {
-    use verified_server::env::{Env as _, Grant};
-
-    let root = scratch("edit-changed").await;
-    fs::write_synced(&root.join("d.txt"), b"old\n")
-        .await
-        .expect("a file");
-    let env = local(root.clone());
-    let call = approved(ToolArgs::Edit {
-        path: ProjectPath::parse("d.txt").expect("a path"),
-        old: "old".to_owned(),
-        new: "new".to_owned(),
-    });
-    let grant = match Grant::of(&call, session()) {
-        Grant::Edit(grant) => Some(grant),
-        Grant::Read(_) | Grant::Bash(_) => None,
-    };
-    let grant = grant.expect("an edit call grants an edit");
-    env.stage(&grant, b"new\n").await.expect("staged");
-    env.mark(&grant, Fingerprint::of(b"old\n"))
-        .await
-        .expect("marked");
-    // Someone changes the file before the restarted daemon reruns the edit.
-    fs::write_synced(&root.join("d.txt"), b"someone else's\n")
-        .await
-        .expect("changed");
-    let (exit, output) = tool::run(
-        &env,
-        session(),
-        &call,
-        &CancellationToken::new(),
-        &ServerLimits::v0(),
-    )
-    .await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
-    assert!(output.text.contains("changed"), "{}", output.text);
-    let text = fs::read(&root.join("d.txt")).await.expect("read back");
-    assert_eq!(text, b"someone else's\n", "not overwritten");
+    let entries = fs::list(&outside, 10).await.expect("listing");
+    assert_eq!(entries.len(), 1, "no staged file is left beside it");
 }
 
 /// On a real disk: an append longer than a replayable line is refused and

@@ -9,10 +9,9 @@
 //! - `false`: exits 1
 //! - anything else: echoes the command, exits 0
 //!
-//! `edit`'s marker ([`Env::mark`]) is the daemon's own bookkeeping, not a
-//! change to the project, so it is no ledger mutation; but once it is durable
-//! the env stops at [`Point::EditMarked`], a barrier the harness may crash
-//! the daemon at, between the marker and the rename.
+//! An `edit`'s write is ledgered with the text it writes when it starts, and
+//! again when it returns: the checks judge each edit by what it wrote, and
+//! the file after the final crash by the writes that finished.
 
 use core::fmt;
 use std::sync::Arc;
@@ -20,24 +19,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use verified_domain::id::SessionId;
 use verified_domain::{EffectId, Millis};
 use verified_server::env::{
-    BashGrant, DirEntry, EditGrant, Env, EnvError, ExecOptions, ExitStatus, Fingerprint, LocalEnv,
-    MarkerKey, Stat, Stopped,
+    BashGrant, DirEntry, EditGrant, Env, EnvError, ExecOptions, ExitStatus, LocalEnv, Stopped,
+    Written,
 };
 use verified_server::payload::ProjectPath;
 use verified_server::seam::Clock;
 
 use crate::ledger::{Entry, Ledger, Op};
-
-/// Points in the simulated environment a crash may be aimed at
-/// (`turmoil::barriers`), next to the daemon's own `shim::Barrier`s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Point {
-    /// An `edit`'s marker is durable; its staged file is not renamed yet.
-    EditMarked,
-}
 
 /// File tools on the simulated disk, a fake shell, and the ledger.
 #[derive(Clone)]
@@ -70,10 +60,6 @@ impl SimEnv {
 
 #[async_trait]
 impl Env for SimEnv {
-    async fn stat(&self, path: &ProjectPath) -> Result<Stat, EnvError> {
-        self.files.stat(path).await
-    }
-
     async fn read(&self, path: &ProjectPath, limit: u64) -> Result<Vec<u8>, EnvError> {
         self.files.read(path, limit).await
     }
@@ -86,60 +72,22 @@ impl Env for SimEnv {
         self.files.list(path, limit).await
     }
 
-    async fn stage(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<(), EnvError> {
+    /// Ledgered with the text it writes, then written; ledgered again once
+    /// the write returns.
+    async fn write(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<Written, EnvError> {
         self.mutated(
             Some(edit.id().as_str().to_owned()),
             edit.effect(),
             Op::Write {
-                path: edit.staged().as_str().to_owned(),
+                path: edit.path().as_str().to_owned(),
+                text: String::from_utf8_lossy(contents).into_owned(),
             },
         );
-        self.files.stage(edit, contents).await
-    }
-
-    async fn marked(&self, edit: &EditGrant<'_>) -> Result<Option<Fingerprint>, EnvError> {
-        self.files.marked(edit).await
-    }
-
-    /// The daemon's own bookkeeping (under `.verified/`), not a change to
-    /// the project: not a ledger mutation. Durable, it is a barrier.
-    async fn mark(&self, edit: &EditGrant<'_>, original: Fingerprint) -> Result<(), EnvError> {
-        self.files.mark(edit, original).await?;
-        turmoil::barriers::trigger(Point::EditMarked).await;
-        Ok(())
-    }
-
-    async fn commit(&self, edit: &EditGrant<'_>) -> Result<(), EnvError> {
-        self.mutated(
-            Some(edit.id().as_str().to_owned()),
-            edit.effect(),
-            Op::Rename {
-                from: edit.staged().as_str().to_owned(),
-                to: edit.path().as_str().to_owned(),
-            },
-        );
-        self.files.commit(edit).await
-    }
-
-    async fn discard(&self, edit: &EditGrant<'_>) -> Result<(), EnvError> {
-        self.mutated(
-            Some(edit.id().as_str().to_owned()),
-            edit.effect(),
-            Op::Remove {
-                path: edit.staged().as_str().to_owned(),
-            },
-        );
-        self.files.discard(edit).await
-    }
-
-    async fn markers(&self, session: SessionId, limit: usize) -> Result<Vec<MarkerKey>, EnvError> {
-        self.files.markers(session, limit).await
-    }
-
-    /// Cleanup of a resolved call's bookkeeping (its marker, and a staged
-    /// copy nothing will rename): no change the user's files see.
-    async fn unmark(&self, key: MarkerKey, staged: &ProjectPath) -> Result<(), EnvError> {
-        self.files.unmark(key, staged).await
+        let written = self.files.write(edit, contents).await?;
+        self.ledger.record(Entry::Wrote {
+            effect: edit.effect(),
+        });
+        Ok(written)
     }
 
     async fn exec(
@@ -166,12 +114,12 @@ impl Env for SimEnv {
                 biased;
                 () = self.clock.sleep(wait) => {
                     if millis > options.timeout.get() {
-                        (ExitStatus::Killed(Stopped::TimedOut), String::new())
+                        (ExitStatus::Stopped(Stopped::TimedOut), String::new())
                     } else {
                         (ExitStatus::Code(0), format!("slept {millis}ms\n"))
                     }
                 }
-                () = cancel.cancelled() => (ExitStatus::Killed(Stopped::Cancelled), String::new()),
+                () = cancel.cancelled() => (ExitStatus::Stopped(Stopped::Cancelled), String::new()),
             }
         } else if script == "false" {
             (ExitStatus::Code(1), String::new())

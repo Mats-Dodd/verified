@@ -8,6 +8,8 @@ The project follows the traditional RFC process and this contains the record of 
 
 Prefer straightforward designs and delete accidental complexity rather than preserving it.
 
+v controls **dispatch**: what runs, when, with whose approval, at most once, with exactly one recorded result. It does not control the filesystem or the OS. Tools act on the world best-effort and report honestly. Containment is a future sandbox `Env`.
+
 This repository is a Rust workspace. Each crate under `crates/` sits on a real architectural boundary:
 
 - `verified-domain`: the domain types every other crate shares: ids, records, exits and causes, tools, limits and the payload trait. It holds only types and pure helpers, written inside `verus!{}`, so the core's proofs can talk about them.

@@ -24,37 +24,36 @@ pub enum Tool {
     Bash,
 }
 
-/// What may happen when a call is run again after a crash.
+/// Whether a call may run again after a crash. v controls dispatch, not the
+/// world: a call is either free of side effects or it is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
-pub enum Replay {
+pub enum Rerun {
     /// No side effect: run it again.
     Safe,
-    /// Deduplicated by its `CallId`: a rerun sees "already applied".
-    Keyed,
-    /// Neither: a dispatched call without a result becomes `Unknown`.
-    Never,
+    /// It may act on the world: a dispatched call without a result becomes
+    /// `Unknown`, and only the user approves it.
+    Unsafe,
 }
 
-/// The replay class of `tool`, as the proofs see it.
-pub open spec fn replay_of(tool: Tool) -> Replay {
+/// The rerun class of `tool`, as the proofs see it. A new tool is `Unsafe`
+/// unless it is known to have no side effect.
+pub open spec fn rerun_of(tool: Tool) -> Rerun {
     match tool {
-        Tool::Read => Replay::Safe,
-        Tool::Edit => Replay::Keyed,
-        Tool::Bash => Replay::Never,
+        Tool::Read => Rerun::Safe,
+        Tool::Edit | Tool::Bash => Rerun::Unsafe,
     }
 }
 
 impl Tool {
     #[must_use]
-    pub const fn replay(self) -> (replay: Replay)
+    pub const fn rerun(self) -> (rerun: Rerun)
         ensures
-            replay == replay_of(self),
+            rerun == rerun_of(self),
     {
         match self {
-            Tool::Read => Replay::Safe,
-            Tool::Edit => Replay::Keyed,
-            Tool::Bash => Replay::Never,
+            Tool::Read => Rerun::Safe,
+            Tool::Edit | Tool::Bash => Rerun::Unsafe,
         }
     }
 }
@@ -123,7 +122,7 @@ pub enum Exit {
 pub enum Approver {
     /// The user, through an approve command.
     User,
-    /// Policy: `Replay::Safe` tools are approved without asking.
+    /// Policy: `Rerun::Safe` tools are approved without asking.
     Policy,
 }
 

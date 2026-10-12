@@ -57,26 +57,34 @@ seeds! {
     seed_5 = 5;
     seed_6 = 6;
     seed_7 = 7;
+    // The daemon crashes while a command runs: it resolves Unknown, and a
+    // core that reran it would be caught here by I3.
+    seed_37 = 37;
     // A reconnect resumes mid-turn: only the read-by-read I6 catches a
     // follower that skips a record there.
     seed_50 = 50;
     // The daemon is down from the start: the TUI's create gives up and the
     // user retries it by hand.
     seed_51 = 51;
-    // The daemon crashes between an edit's marker and its rename, and the
-    // rerun finishes the rename (I7); then the TUI link stays down past the
-    // follower's reconnect schedule, so it stops following and the user
-    // reconnects by hand.
+    // The daemon crashes after an edit is dispatched and before it writes:
+    // the edit resolves Unknown. (A rerun edit would miss `old` and write
+    // nothing, so I3 sees reruns through seed 37's command and the
+    // Stateright model.) Later two edits and a command are proposed in one
+    // step.
+    seed_53 = 53;
+    // The daemon crashes after a command is dispatched, so it resolves
+    // Unknown; then the TUI link stays down past the follower's reconnect
+    // schedule, so it stops following and the user reconnects by hand.
     seed_818 = 818;
 }
 
 /// The seeds the suite runs, each in its own test above.
-const FIXED: [u64; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 50, 51, 818];
+const FIXED: [u64; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 818];
 
 /// Fault paths the fixed seeds must reach, each as text its trace shows
 /// (every needle on some line): a path nobody reaches is a path nobody
 /// checks.
-const PATHS: [(&str, &[&str]); 4] = [
+const PATHS: [(&str, &[&str]); 6] = [
     (
         "the TUI stops following (Down) and the user reconnects",
         &["User(\"reconnect\")"],
@@ -90,8 +98,28 @@ const PATHS: [(&str, &[&str]); 4] = [
         &["the model link partitions", "Retry { fault: Network"],
     ),
     (
-        "the daemon crashes between an edit's marker and its rename",
-        &["daemon crashes at EditMarked"],
+        "the daemon crashes after an edit is dispatched, and the edit resolves Unknown",
+        &[
+            ": edit notes.txt",
+            "daemon crashes at Dispatched",
+            "exit: Err(Unknown)",
+        ],
+    ),
+    (
+        "the daemon crashes while a command runs, and the command resolves Unknown",
+        &[
+            "Exec { command: \"sleep",
+            "daemon crashes for",
+            "exit: Err(Unknown)",
+        ],
+    ),
+    (
+        "two edits and a command proposed in one step all act",
+        &[
+            "Exec { command: \"touch m",
+            "_1\"), effect",
+            "_2\"), effect",
+        ],
     ),
 ];
 

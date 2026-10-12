@@ -179,8 +179,8 @@ impl StepId {
     }
 }
 
-/// A tool call, as the model provider names it (Anthropic's `tool_use` id):
-/// the idempotency key of the core-to-tool hop, reused on retry.
+/// A tool call, as the model provider names it (Anthropic's `tool_use` id).
+/// A `Safe` call rerun after a crash keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[verifier::external_derive]
 pub struct CallId(String);

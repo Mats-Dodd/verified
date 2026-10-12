@@ -6,13 +6,12 @@ use std::collections::VecDeque;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use turmoil::barriers::{Barrier as SimBarrier, Reaction, Triggered};
+use turmoil::barriers::{Barrier as SimBarrier, Reaction};
 use verified_server::shell::Planted;
 use verified_server::shim::Barrier;
 
 use crate::check::{self, Violation};
 use crate::driver;
-use crate::env::Point;
 use crate::hosts::{self, ANTHROPIC, DAEMON, TUI};
 use crate::ledger::{Entry, Ledger};
 use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
@@ -52,61 +51,10 @@ enum Undo {
     RepairModel,
 }
 
-/// The barrier a crash is aimed at: one of the daemon's or one of the
-/// simulated environment's.
-enum Waiting {
-    Daemon(SimBarrier<Barrier>),
-    Env(SimBarrier<Point>),
-}
-
-/// A barrier reached, holding its task suspended until dropped.
-enum Hit {
-    Daemon(Triggered<Barrier>),
-    Env(Triggered<Point>),
-}
-
-impl Waiting {
-    fn new(aim: Aim) -> Self {
-        match aim {
-            Aim::Dispatched | Aim::ToolRan | Aim::GroupWritten => Self::Daemon(SimBarrier::build(
-                Reaction::Suspend,
-                move |point: &Barrier| aimed_at(aim, point),
-            )),
-            Aim::EditMarked => Self::Env(SimBarrier::build(Reaction::Suspend, |point: &Point| {
-                matches!(point, Point::EditMarked)
-            })),
-        }
-    }
-
-    /// The barrier reached since the last poll, if any.
-    fn poll(&mut self) -> Option<Hit> {
-        match self {
-            Self::Daemon(barrier) => poll_once(barrier.wait()).flatten().map(Hit::Daemon),
-            Self::Env(barrier) => poll_once(barrier.wait()).flatten().map(Hit::Env),
-        }
-    }
-}
-
-impl Hit {
-    fn describe(&self) -> String {
-        match self {
-            Self::Daemon(point) => format!("{:?}", **point),
-            Self::Env(point) => format!("{:?}", **point),
-        }
-    }
-
-    fn release(self) {
-        match self {
-            Self::Daemon(triggered) => drop(triggered),
-            Self::Env(triggered) => drop(triggered),
-        }
-    }
-}
-
 /// The crash aimed at a barrier, while it waits to fire.
 struct Aimed {
     plan: AimedCrash,
-    barrier: Waiting,
+    barrier: SimBarrier<Barrier>,
     passed: u32,
 }
 
@@ -145,7 +93,9 @@ impl Faults {
     fn new(scenario: &Scenario) -> Self {
         let aimed = scenario.aimed.map(|plan| Aimed {
             plan,
-            barrier: Waiting::new(plan.aim),
+            barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| {
+                aimed_at(plan.aim, point)
+            }),
             passed: 0,
         });
         Self {
@@ -257,12 +207,12 @@ impl Faults {
             let Some(aimed) = self.aimed.as_mut() else {
                 return;
             };
-            let Some(hit) = aimed.barrier.poll() else {
+            let Some(hit) = poll_once(aimed.barrier.wait()).flatten() else {
                 return;
             };
             if aimed.passed < aimed.plan.occurrence || !self.daemon_up {
                 aimed.passed = aimed.passed.saturating_add(1);
-                hit.release();
+                drop(hit);
                 continue;
             }
             let plan = aimed.plan;
@@ -271,10 +221,10 @@ impl Faults {
             self.crash(
                 sim,
                 ledger,
-                format!("daemon crashes at {} for {:?}", hit.describe(), plan.down),
+                format!("daemon crashes at {:?} for {:?}", *hit, plan.down),
                 plan.down,
             );
-            hit.release();
+            drop(hit);
             self.aimed = None;
         }
     }

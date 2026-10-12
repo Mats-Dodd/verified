@@ -143,7 +143,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "bash",
-            "description": "Run a shell command in the project root and return its combined output and exit status. Asks the user first; runs alone.",
+            "description": "Run a shell command in the project root and return its combined output and exit status. Asks the user first.",
             "input_schema": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},

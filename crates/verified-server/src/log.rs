@@ -181,6 +181,14 @@ fn frame(line: &[u8]) -> Option<Frame<'_>> {
     if line.get(CRC_WIDTH) != Some(&b' ') {
         return None;
     }
+    // Only the spelling the writer makes (lowercase): `from_str_radix` alone
+    // would also read `A`..`F`, so a flipped case bit would go unnoticed.
+    if !crc_text
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
     let crc = u32::from_str_radix(core::str::from_utf8(crc_text).ok()?, 16).ok()?;
     if crc != crc32c(body) {
         return None;

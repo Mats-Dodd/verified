@@ -126,10 +126,6 @@ impl ToolInput {
 /// A path inside the project: relative, normalized, with no `..`, valid
 /// UTF-8, and outside the daemon's own state. The only kind of path the
 /// tools accept.
-///
-/// Its length leaves room for a [`Sibling`] suffix, so the staged sibling
-/// of any parsed path is itself a valid path by construction
-/// ([`ProjectPath::sibling`] cannot fail).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectPath(String);
@@ -153,40 +149,15 @@ pub enum PathError {
     Reserved,
 }
 
-/// What follows a path's name in a sibling's: `[A-Za-z0-9_-]`, at most
-/// [`Sibling::MAX_BYTES`].
+/// What follows a file's name in the name of the file an `edit` writes
+/// before renaming it over the file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Sibling(String);
 
 impl Sibling {
-    /// The longest suffix.
-    pub const MAX_BYTES: usize = 128;
-
-    /// # Errors
-    /// Empty, longer than [`Sibling::MAX_BYTES`], or a character outside
-    /// `[A-Za-z0-9_-]`.
-    pub fn parse(text: &str) -> Result<Self, PathError> {
-        if text.is_empty() {
-            return Err(PathError::Empty);
-        }
-        if text.len() > Self::MAX_BYTES {
-            return Err(PathError::TooLong {
-                limit: Self::MAX_BYTES,
-            });
-        }
-        if !text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err(PathError::NotNormal);
-        }
-        Ok(Self(text.to_owned()))
-    }
-
     /// The suffix of the staged file of the edit dispatched by record `seq`
-    /// of `session`: `verified-<session>-<seq>`. Infallible: a session id's
-    /// text is lowercase hex and `-`, a seq is decimal digits, and together
-    /// with the prefix they take at most 9 + 36 + 1 + 20 = 66 bytes.
+    /// of `session`: `verified-<session>-<seq>`, unique to that call. A
+    /// session id's text is lowercase hex and `-`, a seq is decimal digits.
     #[must_use]
     pub fn staged(session: SessionId, seq: u64) -> Self {
         Self(format!("verified-{session}-{seq}"))
@@ -213,13 +184,8 @@ fn reserved(component: &str) -> bool {
 }
 
 impl ProjectPath {
-    /// The longest path accepted, in bytes: room is left below
-    /// [`ProjectPath::SIBLING_MAX_BYTES`] for a sibling's `.` + name + `.` +
-    /// [`Sibling`].
+    /// The longest path accepted, in bytes.
     pub const MAX_BYTES: usize = 3840;
-
-    /// The longest a sibling of a parsed path can be.
-    pub const SIBLING_MAX_BYTES: usize = 4096;
 
     /// # Errors
     /// Empty, too long, absolute, not normalized, containing NUL, or naming
@@ -272,30 +238,6 @@ impl ProjectPath {
     #[must_use]
     pub fn under(&self, root: &Path) -> PathBuf {
         root.join(&self.0)
-    }
-
-    /// The sibling of this path named `.{name}.{suffix}`: same directory, so
-    /// a rename onto this path is atomic.
-    ///
-    /// Infallible by construction: this path is at most
-    /// [`ProjectPath::MAX_BYTES`] and `suffix` at most [`Sibling::MAX_BYTES`],
-    /// so the sibling fits [`ProjectPath::SIBLING_MAX_BYTES`]; its directory
-    /// is this path's, and its last component (`.`, a non-empty name, `.`, a
-    /// non-empty suffix of `[A-Za-z0-9_-]`) is neither empty, `.`, `..`, the
-    /// state directory, nor anything with a `/` or NUL. Staged names are
-    /// reserved, so it never names a path the tools accept.
-    #[must_use]
-    pub fn sibling(&self, suffix: &Sibling) -> Self {
-        let (dir, name) = self
-            .0
-            .rsplit_once('/')
-            .map_or(("", self.0.as_str()), |(dir, name)| (dir, name));
-        let suffix = suffix.as_str();
-        Self(if dir.is_empty() {
-            format!(".{name}.{suffix}")
-        } else {
-            format!("{dir}/.{name}.{suffix}")
-        })
     }
 }
 
@@ -496,8 +438,6 @@ pub fn proposal(id: &CallId, name: &ToolName, input: &ToolInput) -> Proposal<Par
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-
     use super::{ModelPart, Parsed, PathError, ProjectPath, Sibling, ToolArgs, ToolInput, measure};
     use verified_domain::Record;
     use verified_domain::id::{CallId, SessionId, ToolName};
@@ -527,13 +467,6 @@ mod tests {
             ProjectPath::parse("verified-x").is_ok(),
             "only the dotted marker is reserved"
         );
-        let path = ProjectPath::parse("src/lib.rs").expect("a path");
-        let suffix = Sibling::parse("tmp").expect("a suffix");
-        assert_eq!(
-            path.sibling(&suffix).as_str(),
-            "src/.lib.rs.tmp",
-            "same directory"
-        );
         assert_eq!(
             ProjectPath::parse(&"a".repeat(ProjectPath::MAX_BYTES + 1)),
             Err(PathError::TooLong {
@@ -543,64 +476,14 @@ mod tests {
         );
     }
 
-    /// Any path that parses has a sibling for any suffix that parses: the
-    /// staged name of an approved edit never fails to exist (it used to
-    /// panic for a long path, and a panic in a rerun after recovery is a
-    /// crash loop).
+    /// No tool may name the file an edit stages: its name holds the
+    /// reserved marker.
     #[test]
-    fn the_longest_path_has_a_sibling() {
-        let longest = format!(
-            "{}/{}",
-            "d".repeat(100),
-            "n".repeat(ProjectPath::MAX_BYTES - 101)
-        );
-        let path = ProjectPath::parse(&longest).expect("the longest path parses");
-        let suffix = Sibling::parse(&"s".repeat(Sibling::MAX_BYTES)).expect("the longest suffix");
-        let sibling = path.sibling(&suffix);
-        assert!(
-            sibling.as_str().len() <= ProjectPath::SIBLING_MAX_BYTES,
-            "it fits"
-        );
-        assert!(
-            sibling.as_str().starts_with(&"d".repeat(100)),
-            "same directory"
-        );
+    fn staged_names_are_reserved() {
         let session = SessionId::parse("01900000-0000-7000-8000-000000000001").expect("a v7");
         let staged = Sibling::staged(session, u64::MAX);
-        assert_eq!(
-            Sibling::parse(staged.as_str()),
-            Ok(staged.clone()),
-            "a valid suffix"
-        );
-        let short = ProjectPath::parse("src/lib.rs").expect("a path");
-        assert_eq!(
-            ProjectPath::parse(short.sibling(&staged).as_str()),
-            Err(PathError::Reserved),
-            "no tool may name a staged file"
-        );
-    }
-
-    proptest! {
-        #[test]
-        fn siblings_stay_beside_their_path(
-            dirs in prop::collection::vec("[a-z]{1,8}", 0..4),
-            name in "[a-zA-Z0-9_.-]{1,40}",
-            suffix in "[a-zA-Z0-9_-]{1,128}",
-        ) {
-            let mut text = dirs.join("/");
-            if !text.is_empty() {
-                text.push('/');
-            }
-            text.push_str(&name);
-            if let (Ok(path), Ok(suffix)) = (ProjectPath::parse(&text), Sibling::parse(&suffix)) {
-                let sibling = path.sibling(&suffix);
-                let expected = format!(".{name}.{}", suffix.as_str());
-                prop_assert_eq!(sibling.as_str().rsplit('/').next(), Some(expected.as_str()));
-                prop_assert!(sibling.as_str().len() <= ProjectPath::SIBLING_MAX_BYTES);
-                prop_assert!(!sibling.as_str().contains('\0'));
-                prop_assert!(sibling.as_str().split('/').all(|part| !part.is_empty() && part != "." && part != ".."));
-            }
-        }
+        let name = format!("src/.lib.rs.{}", staged.as_str());
+        assert_eq!(ProjectPath::parse(&name), Err(PathError::Reserved));
     }
 
     #[test]

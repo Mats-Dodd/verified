@@ -200,7 +200,7 @@ pub mod net {
 pub mod fs {
     use std::ffi::OsString;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[cfg(not(feature = "sim"))]
     use tokio::fs as backend;
@@ -256,12 +256,13 @@ pub mod fs {
         }
     }
 
-    /// The kind and length of `path`, or `None` when nothing is there.
+    /// The kind and length of what `path` names, symlinks followed, or
+    /// `None` when nothing is there (a dangling link included).
     ///
     /// # Errors
     /// Any OS error but not-found.
     pub async fn stat(path: &Path) -> io::Result<Option<(Kind, u64)>> {
-        match backend::symlink_metadata(path).await {
+        match backend::metadata(path).await {
             Ok(metadata) => Ok(Some((
                 kind_of(
                     metadata.is_file(),
@@ -273,6 +274,14 @@ pub mod fs {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// The absolute path `path` names, every symlink resolved.
+    ///
+    /// # Errors
+    /// Any OS error, including not-found.
+    pub async fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+        backend::canonicalize(path).await
     }
 
     /// Reads all of `path`.

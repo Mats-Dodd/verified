@@ -17,15 +17,10 @@ use verified_wire::chunk::UiChunk;
 /// What a fake tool did to the world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// A file was written (an `edit`'s staged copy).
-    Write { path: String },
-    /// A file was renamed over another (an `edit` landing).
-    Rename { from: String, to: String },
+    /// An `edit` replaced the contents of `path` with `text`.
+    Write { path: String, text: String },
     /// A command ran (fake `bash`); its side effects are this entry.
     Exec { command: String },
-    /// A staged copy that was never vouched for was removed (an `edit`
-    /// whose staging failed).
-    Remove { path: String },
 }
 
 /// One thing that happened.
@@ -53,6 +48,9 @@ pub enum Entry {
         effect: EffectId,
         op: Op,
     },
+    /// The write of `effect` (an `edit`'s [`Op::Write`]) returned: its text
+    /// is in place and durable.
+    Wrote { effect: EffectId },
     /// The harness injected a fault.
     Fault(String),
     /// The scripted user did something.
@@ -189,6 +187,7 @@ impl Ledger {
                 }
                 Entry::Boot { .. }
                 | Entry::Mutation { .. }
+                | Entry::Wrote { .. }
                 | Entry::Fault(_)
                 | Entry::User(_)
                 | Entry::Read { .. }

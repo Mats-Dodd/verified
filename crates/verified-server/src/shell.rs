@@ -59,12 +59,12 @@ use verified_wire::command::{
 use verified_wire::stream::{Freshness, Offset, ReadFrom, encode_chunks};
 
 use crate::defect;
-use crate::env::{Env, MarkerKey};
+use crate::env::Env;
 use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
 use crate::model::Model;
-use crate::payload::{ModelPart, Parsed, ProjectPath, Sibling, ToolArgs, measure, proposal};
+use crate::payload::{ModelPart, Parsed, measure, proposal};
 use crate::projection::Projector;
 use crate::seam::{Clock, Entropy, World, id_entropy};
 use crate::shim::{Barrier, barrier};
@@ -373,9 +373,6 @@ pub struct Session {
     inbox: mpsc::Sender<Input>,
     tail: TailWriter,
     cancels: BTreeMap<EffectId, CancellationToken>,
-    /// The staged path of each running `edit`, by its `Dispatched` seq: once
-    /// its result is durable, its staged copy and marker are removed.
-    edits: BTreeMap<u64, ProjectPath>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
     /// Why the log stopped taking records, once it has.
@@ -450,7 +447,6 @@ impl Session {
             inbox,
             tail,
             cancels: BTreeMap::new(),
-            edits: BTreeMap::new(),
             held_bytes,
             full: None,
         };
@@ -462,7 +458,6 @@ impl Session {
         if let Persisted::Done(_, effects) = self.persist(resumed).await? {
             self.start_effects(effects).await;
         }
-        self.sweep_markers();
         let shutdown = self.seams.world.shutdown().clone();
         loop {
             let input = tokio::select! {
@@ -558,53 +553,12 @@ impl Session {
         }
     }
 
-    /// Removes what each `edit` left for a rerun (its marker, and a staged
-    /// copy it did not rename) once its result is durable, in the
-    /// background and best effort: a leftover belongs to a resolved call,
-    /// is never read again, and the next start sweeps it.
-    fn unmark(&self, seq: u64, staged: ProjectPath) {
-        let env = Arc::clone(&self.seams.env);
-        let key = MarkerKey {
-            session: self.id,
-            seq,
-        };
-        self.seams.world.spawn(async move {
-            drop(env.unmark(key, &staged).await);
-        });
-    }
-
-    /// At start: removes the markers of edits whose results are durable
-    /// (left by a crash between a result and its cleanup).
-    fn sweep_markers(&self) {
-        let resolved = resolved_edits(self.id, &self.records);
-        if resolved.is_empty() {
-            return;
-        }
-        let env = Arc::clone(&self.seams.env);
-        let (session, limit) = (self.id, self.config.limits.dir_entries);
-        self.seams.world.spawn(async move {
-            let Ok(markers) = env.markers(session, limit).await else {
-                return;
-            };
-            for key in markers {
-                if let Some(staged) = resolved.get(&key.seq) {
-                    drop(env.unmark(key, staged).await);
-                }
-            }
-        });
-    }
-
     async fn handle(&mut self, input: Input) -> Result<(), ShellError> {
         match input {
             Input::Done(event) => {
-                let mut finished_edit = None;
                 match &event {
-                    Event::ModelDone { id, .. } => {
+                    Event::ModelDone { id, .. } | Event::ToolDone { id, .. } => {
                         self.cancels.remove(id);
-                    }
-                    Event::ToolDone { id, .. } => {
-                        self.cancels.remove(id);
-                        finished_edit = Some(id.seq);
                     }
                     Event::Message { .. }
                     | Event::Approve { .. }
@@ -612,14 +566,7 @@ impl Session {
                     | Event::ModelParts { .. }
                     | Event::Woke { .. } => {}
                 }
-                if let Persisted::Done(outcome, effects) = self.decide(event).await? {
-                    // The edit's result is durable: what it kept for a rerun
-                    // can go.
-                    if let (Outcome::Accepted, Some(seq)) = (outcome, finished_edit)
-                        && let Some(staged) = self.edits.remove(&seq)
-                    {
-                        self.unmark(seq, staged);
-                    }
+                if let Persisted::Done(_, effects) = self.decide(event).await? {
                     self.start_effects(effects).await;
                 }
             }
@@ -897,10 +844,6 @@ impl Session {
             }
             Effect::RunTool { call } => {
                 let id = call.effect();
-                if let ToolArgs::Edit { path, .. } = call.args() {
-                    self.edits
-                        .insert(id.seq, path.sibling(&Sibling::staged(self.id, id.seq)));
-                }
                 barrier(Barrier::Dispatched {
                     epoch: id.epoch.0,
                     seq: id.seq,
@@ -1172,54 +1115,6 @@ impl ModelTask {
 /// keys.
 fn held(record: &Record<Parsed>, chunks: &[UiChunk]) -> usize {
     json_len(record).saturating_add(encode_chunks(chunks).len())
-}
-
-/// The staged path of each `edit` of `session` whose result is durable in
-/// `records`, by its `Dispatched` seq.
-fn resolved_edits(session: SessionId, records: &[Record<Parsed>]) -> BTreeMap<u64, ProjectPath> {
-    // The calls of the current turn: an edit's path, and its dispatch seq.
-    let mut calls: Vec<(Option<&ProjectPath>, Option<u64>)> = Vec::new();
-    let mut resolved = BTreeMap::new();
-    for (seq, record) in (0u64..).zip(records) {
-        match record {
-            Record::TurnStarted { .. } => calls.clear(),
-            Record::StepFinished {
-                calls: proposed, ..
-            } => calls.extend(proposed.iter().map(|proposal| {
-                let path = match &proposal.request {
-                    verified_domain::Request::Run {
-                        args: ToolArgs::Edit { path, .. },
-                    } => Some(path),
-                    verified_domain::Request::Run {
-                        args: ToolArgs::Read { .. } | ToolArgs::Bash { .. },
-                    }
-                    | verified_domain::Request::Invalid { .. } => None,
-                };
-                (path, None)
-            })),
-            Record::Dispatched { call } => {
-                if let Some(entry) = calls.get_mut(call.0) {
-                    entry.1 = Some(seq);
-                }
-            }
-            Record::ToolResult { call, .. } => {
-                if let Some((Some(path), Some(dispatched))) = calls.get(call.0) {
-                    resolved.insert(
-                        *dispatched,
-                        path.sibling(&Sibling::staged(session, *dispatched)),
-                    );
-                }
-            }
-            Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::Approved { .. }
-            | Record::CancelRequested { .. }
-            | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
-        }
-    }
-    resolved
 }
 
 /// The verdict the user gave `call` in any turn, if any.

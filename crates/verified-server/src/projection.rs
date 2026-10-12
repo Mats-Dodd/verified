@@ -8,7 +8,7 @@
 use serde_json::json;
 use verified_domain::id::{ApprovalId, CallId, PartId, ToolName, TurnId};
 use verified_domain::{
-    Approver, Cause, Exit, Failure, Fault, Limit, Record, Replay, Request, TurnOutcome,
+    Approver, Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, TurnOutcome,
 };
 use verified_wire::chunk::{
     FinishReason, TurnEndReason, TurnEndedData, TurnStartedData, UiChunk, UserMessageData,
@@ -161,7 +161,7 @@ impl Projector {
                         let id = proposal.id.clone();
                         let (reason, asks) = match &proposal.request {
                             Request::Run { args } => {
-                                (None, !matches!(args.tool().replay(), Replay::Safe))
+                                (None, matches!(args.tool().rerun(), Rerun::Unsafe))
                             }
                             Request::Invalid { reason } => (Some(reason.clone()), false),
                         };

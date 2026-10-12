@@ -19,10 +19,7 @@
 //!   is approved at most once, dispatched at most once and only after it was
 //!   approved, and only a valid request is ever approved.
 //! - approval policy: `Approved { by: Policy }` applies only to a `Safe`
-//!   call; an `edit` or `bash` needs the user (`approver_fits`).
-//! - concurrency: a `Dispatched` applies only if the call may run beside
-//!   every call already dispatched and unresolved: reads beside reads and
-//!   one edit, edits one at a time, `bash` alone (`may_dispatch`).
+//!   call; an `Unsafe` one (`edit`, `bash`) needs the user (`approver_fits`).
 //! - one message, one turn: a `TurnStarted` for a message that already
 //!   started one does not apply (recovery refuses such a log).
 //! - `decide` and `resume` return records that apply, one after another,
@@ -31,10 +28,18 @@
 //!   dispatched by the very record its effect id names, in the current epoch.
 //!   For `decide` that record is one of the decision's own (`decided`): a
 //!   call is never started twice by later decisions. Only `resume` may rerun
-//!   a call dispatched before it, and only a `Safe` or `Keyed` one, in the
-//!   new epoch (`resumed`).
+//!   a call dispatched before it, and only a `Safe` one, in the new epoch
+//!   (`resumed`).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
+//!
+//! Model-checked, not proved (Stateright, `tests/model.rs`, and the scenario
+//! tests in `tests/turns.rs`):
+//!
+//! - the core has no concurrency rules: every approved call is dispatched
+//!   at once, in proposal order, beside whatever already runs.
+//! - after a crash, a dispatched `Unsafe` call without a result is resolved
+//!   `Unknown`, never rerun or reported otherwise.
 
 #![expect(
     clippy::indexing_slicing,
@@ -56,10 +61,10 @@ use vstd::prelude::*;
 #[cfg(verus_only)]
 use verified_domain::id::same_step;
 #[cfg(verus_only)]
-use verified_domain::record::replay_of;
+use verified_domain::record::rerun_of;
 use verified_domain::{
     Approver, CallId, CallIx, Cause, EffectId, Epoch, Exit, Failure, Fault, Limit, Limits,
-    Measured, MessageId, Millis, Payload, Proposal, Record, Replay, Request, Reset, StepId, TurnId,
+    Measured, MessageId, Millis, Payload, Proposal, Record, Request, Rerun, Reset, StepId, TurnId,
     TurnOutcome,
 };
 
@@ -139,9 +144,9 @@ pub enum Turn {
 #[expect(missing_debug_implementations, reason = "spec-only type: it holds ghost `nat` values that exist only while verifying")]
 pub struct CallView {
     pub phase: Phase,
-    /// The replay class of the call's tool; `None` for a request that did
+    /// The rerun class of the call's tool; `None` for a request that did
     /// not parse into a known tool's arguments.
-    pub replay: Option<Replay>,
+    pub rerun: Option<Rerun>,
     pub approvals: nat,
     pub dispatches: nat,
 }
@@ -164,7 +169,7 @@ pub open spec fn call_ok(call: CallView) -> bool {
     &&& (call.phase is Proposed ==> call.approvals == 0)
     &&& (call.phase is Approved ==> call.approvals == 1 && call.dispatches == 0)
     &&& (call.phase is Dispatched ==> call.dispatches == 1)
-    &&& (call.replay is None ==> call.approvals == 0)
+    &&& (call.rerun is None ==> call.approvals == 0)
 }
 
 /// Whether `message` already started a turn.
@@ -173,26 +178,8 @@ pub open spec fn seen_message(messages: Seq<MessageId>, message: MessageId) -> b
 }
 
 /// Policy approves only `Safe` calls; the user may approve any valid one.
-pub open spec fn approver_fits(by: Approver, replay: Option<Replay>) -> bool {
-    by is User || replay == Some(Replay::Safe)
-}
-
-/// Whether a call of class `starting` may start while one of class
-/// `running` runs: reads run beside reads and one edit; edits one at a
-/// time; `bash` alone.
-pub open spec fn runs_together(running: Option<Replay>, starting: Option<Replay>) -> bool {
-    &&& running is Some
-    &&& starting is Some
-    &&& running != Some(Replay::Never)
-    &&& starting != Some(Replay::Never)
-    &&& !(running == Some(Replay::Keyed) && starting == Some(Replay::Keyed))
-}
-
-/// Call `index` may be dispatched beside every other dispatched call.
-pub open spec fn may_dispatch(calls: Seq<CallView>, index: int) -> bool {
-    forall|other: int|
-        0 <= other < calls.len() && other != index && (#[trigger] calls[other]).phase is Dispatched
-            ==> runs_together(calls[other].replay, calls[index].replay)
+pub open spec fn approver_fits(by: Approver, rerun: Option<Rerun>) -> bool {
+    by is User || rerun == Some(Rerun::Safe)
 }
 
 pub open spec fn ledger_ok(calls: Seq<CallView>) -> bool {
@@ -225,25 +212,25 @@ pub open spec fn state_ok(view: CoreView) -> bool {
     }
 }
 
-pub open spec fn fresh_call(replay: Option<Replay>) -> CallView {
-    CallView { phase: Phase::Proposed, replay, approvals: 0, dispatches: 0 }
+pub open spec fn fresh_call(rerun: Option<Rerun>) -> CallView {
+    CallView { phase: Phase::Proposed, rerun, approvals: 0, dispatches: 0 }
 }
 
 pub open spec fn initial() -> CoreView {
     CoreView { epoch: 0, seq: 0, messages: Seq::empty(), turn: Turn::Idle, calls: Seq::empty() }
 }
 
-/// The replay class a proposed request asks for; `None` when it is invalid.
-pub open spec fn request_replay<P: Payload>(request: Request<P>) -> Option<Replay> {
+/// The rerun class a proposed request asks for; `None` when it is invalid.
+pub open spec fn request_rerun<P: Payload>(request: Request<P>) -> Option<Rerun> {
     match request {
-        Request::Run { args } => Some(replay_of(P::spec_tool(&args))),
+        Request::Run { args } => Some(rerun_of(P::spec_tool(&args))),
         Request::Invalid { .. } => None,
     }
 }
 
 /// The calls a `StepFinished` adds.
 pub open spec fn proposed<P: Payload>(calls: Seq<Proposal<P>>) -> Seq<CallView> {
-    Seq::new(calls.len(), |index: int| fresh_call(request_replay(calls[index].request)))
+    Seq::new(calls.len(), |index: int| fresh_call(request_rerun(calls[index].request)))
 }
 
 /// A turn ends `Cancelled` exactly when the user asked it to stop.
@@ -389,7 +376,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                 let index = call.0 as int;
                 if open.stage is Tools && open.intent is Proceed && open.first_call <= index
                     < view.calls.len() && view.calls[index].phase is Proposed
-                    && view.calls[index].replay is Some && approver_fits(by, view.calls[index].replay) {
+                    && view.calls[index].rerun is Some && approver_fits(by, view.calls[index].rerun) {
                     Some(
                         CoreView {
                             seq,
@@ -414,10 +401,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             Turn::Open(open) => {
                 let index = call.0 as int;
                 if open.stage is Tools && open.intent is Proceed && open.first_call <= index
-                    < view.calls.len() && view.calls[index].phase is Approved && may_dispatch(
-                    view.calls,
-                    index,
-                ) {
+                    < view.calls.len() && view.calls[index].phase is Approved {
                     Some(
                         CoreView {
                             seq,
@@ -526,15 +510,13 @@ pub open spec fn fresh<P: Payload>(start: CoreView, call: ToolCall<Approved, P>)
 }
 
 /// A rerun after recovery: the call was dispatched before the decision, it
-/// may safely run again (`Safe`, or `Keyed` and deduplicated), and it runs
-/// in a new epoch, so its effect id differs from the run it repeats.
+/// is `Safe` (no side effect), and it runs in a new epoch, so its effect id
+/// differs from the run it repeats. An `Unsafe` call never reruns.
 pub open spec fn rerun<P: Payload>(start: CoreView, end: CoreView, call: ToolCall<Approved, P>) -> bool {
     let index = call.spec_call().0 as int;
     &&& call.spec_effect().seq < start.seq
     &&& end.epoch > start.epoch
-    &&& (end.calls[index].replay == Some(Replay::Safe) || end.calls[index].replay == Some(
-        Replay::Keyed,
-    ))
+    &&& end.calls[index].rerun == Some(Rerun::Safe)
 }
 
 /// Every `RunTool` in `effects` is licensed by `end` and dispatched by the
@@ -565,8 +547,7 @@ pub open spec fn decided<P: Payload>(start: CoreView, decision: Decision<P>) -> 
 }
 
 /// What `resume` promises: as `decided`, except that a call dispatched
-/// before the crash may run again if it is `Safe` or `Keyed`, in the new
-/// epoch.
+/// before the crash may run again if it is `Safe`, in the new epoch.
 pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> bool {
     match applies(start, decision.records@) {
         Some(end) => state_ok(end) && runs_ok(start, end, decision.effects@, true),
@@ -574,13 +555,11 @@ pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> 
     }
 }
 
-/// Every call dispatched before `from` may safely run again.
+/// Every call dispatched before `from` (and still unresolved) is `Safe`.
 pub open spec fn rerunnable(view: CoreView, from: u64) -> bool {
     forall|index: int|
         0 <= index < view.calls.len() && dispatched_before((#[trigger] view.calls[index]).phase, from)
-            ==> (view.calls[index].replay == Some(Replay::Safe) || view.calls[index].replay == Some(
-            Replay::Keyed,
-        ))
+            ==> view.calls[index].rerun == Some(Rerun::Safe)
 }
 
 pub open spec fn dispatched_before(phase: Phase, from: u64) -> bool {
@@ -640,9 +619,9 @@ struct Call<P: Payload> {
     id: CallId,
     /// `None` for a request that did not parse.
     args: Option<P::Args>,
-    /// The replay class of the call's tool, read from the arguments the
+    /// The rerun class of the call's tool, read from the arguments the
     /// record carried; `None` for an invalid request.
-    replay: Option<Replay>,
+    rerun: Option<Rerun>,
     phase: Phase,
 }
 
@@ -651,106 +630,22 @@ impl<P: Payload> Call<P> {
     fn copy(&self) -> (copy: Call<P>)
         ensures
             copy.phase == self.phase,
-            copy.replay == self.replay,
+            copy.rerun == self.rerun,
             copy.args is Some == self.args is Some,
     {
         let args = match &self.args {
             Some(args) => Some(args.clone()),
             None => None,
         };
-        Call { id: self.id.clone(), args, replay: self.replay, phase: self.phase }
+        Call { id: self.id.clone(), args, rerun: self.rerun, phase: self.phase }
     }
 
-    /// The replay class of the call's tool; `None` for an invalid request.
-    const fn replay(&self) -> (replay: Option<Replay>)
+    /// The rerun class of the call's tool; `None` for an invalid request.
+    const fn rerun(&self) -> (rerun: Option<Rerun>)
         ensures
-            replay == self.replay,
+            rerun == self.rerun,
     {
-        self.replay
-    }
-}
-
-/// Whether a call of class `starting` may start beside one of class
-/// `running` (`runs_together`).
-const fn together(running: Option<Replay>, starting: Option<Replay>) -> (together: bool)
-    ensures
-        together == runs_together(running, starting),
-{
-    match (running, starting) {
-        (Some(Replay::Safe), Some(Replay::Safe | Replay::Keyed))
-        | (Some(Replay::Keyed), Some(Replay::Safe)) => true,
-        (Some(Replay::Keyed), Some(Replay::Keyed))
-        | (Some(Replay::Never), Some(Replay::Safe | Replay::Keyed | Replay::Never))
-        | (Some(Replay::Safe | Replay::Keyed), Some(Replay::Never))
-        | (None, None | Some(Replay::Safe | Replay::Keyed | Replay::Never))
-        | (Some(Replay::Safe | Replay::Keyed | Replay::Never), None) => false,
-    }
-}
-
-/// Which tools are running: `read` beside anything but `bash`, `edit`
-/// (Keyed: it mutates) one at a time, `bash` alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[verifier::external_derive]
-enum Busy {
-    Free,
-    /// Only `Safe` calls.
-    Reading,
-    /// One `Keyed` call, perhaps beside `Safe` ones.
-    Writing,
-    /// A `Never` call, which runs alone.
-    Alone,
-}
-
-/// A running call of class `replay` is accounted for by `busy`.
-spec fn fits(busy: Busy, replay: Option<Replay>) -> bool {
-    match busy {
-        Busy::Free => false,
-        Busy::Reading => replay == Some(Replay::Safe),
-        Busy::Writing => replay == Some(Replay::Safe) || replay == Some(Replay::Keyed),
-        Busy::Alone => true,
-    }
-}
-
-/// `busy` accounts for every dispatched call in `calls`.
-spec fn busy_sound(busy: Busy, calls: Seq<CallView>) -> bool {
-    forall|index: int|
-        0 <= index < calls.len() && (#[trigger] calls[index]).phase is Dispatched ==> fits(
-            busy,
-            calls[index].replay,
-        )
-}
-
-impl Busy {
-    /// Whether a call of class `replay` may start now: if so, it runs
-    /// together with every call `self` accounts for.
-    const fn admits(self, replay: Replay) -> (admits: bool)
-        ensures
-            admits ==> forall|running: Option<Replay>|
-                fits(self, running) ==> #[trigger] runs_together(running, Some(replay)),
-    {
-        match (replay, self) {
-            (Replay::Safe, Busy::Free | Busy::Reading | Busy::Writing)
-            | (Replay::Keyed, Busy::Free | Busy::Reading)
-            | (Replay::Never, Busy::Free) => true,
-            (Replay::Safe, Busy::Alone)
-            | (Replay::Keyed, Busy::Writing | Busy::Alone)
-            | (Replay::Never, Busy::Reading | Busy::Writing | Busy::Alone) => false,
-        }
-    }
-
-    /// What is running once a call of class `replay` runs too.
-    const fn with(self, replay: Replay) -> (busy: Busy)
-        ensures
-            fits(busy, Some(replay)),
-            forall|running: Option<Replay>| fits(self, running) ==> #[trigger] fits(busy, running),
-    {
-        match (replay, self) {
-            (Replay::Never, Busy::Free | Busy::Reading | Busy::Writing | Busy::Alone)
-            | (Replay::Safe | Replay::Keyed, Busy::Alone) => Busy::Alone,
-            (Replay::Keyed, Busy::Free | Busy::Reading | Busy::Writing)
-            | (Replay::Safe, Busy::Writing) => Busy::Writing,
-            (Replay::Safe, Busy::Free | Busy::Reading) => Busy::Reading,
-        }
+        self.rerun
     }
 }
 
@@ -769,7 +664,7 @@ enum Runs {
     /// Those it dispatched itself.
     New,
     /// Every dispatched call without a result: after a crash, the ones
-    /// still unresolved are reruns of `Safe` or `Keyed` calls.
+    /// still unresolved are reruns of `Safe` calls.
     All,
 }
 
@@ -797,8 +692,6 @@ pub enum Violation {
     DuplicateMessage,
     /// Policy approved a call that only the user may approve.
     WrongApprover,
-    /// A call is dispatched while one it may not run beside is running.
-    Concurrent,
 }
 
 /// A record `apply` refused, and its position in the log.
@@ -878,8 +771,8 @@ const fn quiet<P: Payload>(outcome: Outcome) -> (decision: Decision<P>)
 /// Mirrors exec call `call` in ghost call `view`.
 spec fn mirrors<P: Payload>(call: Call<P>, view: CallView) -> bool {
     &&& call.phase == view.phase
-    &&& call.replay == view.replay
-    &&& (call.args is Some) == (call.replay is Some)
+    &&& call.rerun == view.rerun
+    &&& (call.args is Some) == (call.rerun is Some)
 }
 
 /// Where a plan started: the state the decision applies to, and whether it
@@ -918,9 +811,7 @@ proof fn lemma_apply_keeps_reruns<P: Payload>(view: CoreView, record: Record<P>,
     }
     assert forall|index: int|
         0 <= index < next.calls.len() && dispatched_before((#[trigger] next.calls[index]).phase, from)
-        implies (next.calls[index].replay == Some(Replay::Safe) || next.calls[index].replay == Some(
-        Replay::Keyed,
-    )) by {
+        implies next.calls[index].rerun == Some(Rerun::Safe) by {
         match record {
             Record::StepFinished { calls, .. } => {
                 if index >= view.calls.len() {
@@ -1131,8 +1022,8 @@ impl<P: Payload> Plan<P> {
                     {
                         if matches!(plan.scratch.calls[index].phase, Phase::Proposed) {
                             if let Some(args) = &plan.scratch.calls[index].args {
-                                match P::tool(args).replay() {
-                                    Replay::Keyed | Replay::Never => {
+                                match P::tool(args).rerun() {
+                                    Rerun::Unsafe => {
                                         let request = effect::pending(
                                             CallIx(index),
                                             plan.scratch.calls[index].id.clone(),
@@ -1154,7 +1045,7 @@ impl<P: Payload> Plan<P> {
                                             }
                                         };
                                     },
-                                    Replay::Safe => {},
+                                    Rerun::Safe => {},
                                 }
                             }
                         }
@@ -1245,7 +1136,7 @@ impl<P: Payload> Core<P> {
                 calls@.len() == index,
                 forall|at: int|
                     0 <= at < index ==> (#[trigger] calls@[at]).phase == self.calls@[at].phase
-                        && calls@[at].replay == self.calls@[at].replay && (calls@[at].args is Some) == (
+                        && calls@[at].rerun == self.calls@[at].rerun && (calls@[at].args is Some) == (
                     self.calls@[at].args is Some),
             decreases self.calls@.len() - index,
         {
@@ -1317,40 +1208,6 @@ impl<P: Payload> Core<P> {
             index += 1;
         }
         all
-    }
-
-    /// Whether call `index` may be dispatched beside every other
-    /// dispatched call (`may_dispatch`).
-    fn may_dispatch(&self, index: usize) -> (may: bool)
-        requires
-            self.wf(),
-            index < self@.calls.len(),
-        ensures
-            may == may_dispatch(self@.calls, index as int),
-    {
-        assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
-        let starting = self.calls[index].replay;
-        let mut other: usize = 0;
-        while other < self.calls.len()
-            invariant
-                self.wf(),
-                index < self@.calls.len(),
-                starting == self@.calls[index as int].replay,
-                other <= self@.calls.len(),
-                forall|at: int|
-                    0 <= at < other && at != index && (#[trigger] self@.calls[at]).phase is Dispatched
-                        ==> runs_together(self@.calls[at].replay, starting),
-            decreases self.calls@.len() - other,
-        {
-            assert(mirrors(self.calls@[other as int], self.ledger@[other as int]));
-            if other != index && matches!(self.calls[other].phase, Phase::Dispatched { .. })
-                && !together(self.calls[other].replay, starting) {
-                assert(self@.calls[other as int].phase is Dispatched);
-                return false;
-            }
-            other += 1;
-        }
-        true
     }
 
     /// Applies one durable record. The only way state changes; runs only
@@ -1506,17 +1363,17 @@ impl<P: Payload> Core<P> {
                     decreases calls@.len() - index,
                 {
                     let proposal = &calls[index];
-                    let (args, replay) = match &proposal.request {
-                        Request::Run { args } => (Some(args.clone()), Some(P::tool(args).replay())),
+                    let (args, rerun) = match &proposal.request {
+                        Request::Run { args } => (Some(args.clone()), Some(P::tool(args).rerun())),
                         Request::Invalid { .. } => (None, None),
                     };
                     proof {
-                        assert(replay == request_replay(calls@[index as int].request));
+                        assert(rerun == request_rerun(calls@[index as int].request));
                     };
-                    self.calls.push(Call { id: proposal.id.clone(), args, replay, phase: Phase::Proposed });
-                    self.ledger = Ghost(self.ledger@.push(fresh_call(replay)));
+                    self.calls.push(Call { id: proposal.id.clone(), args, rerun, phase: Phase::Proposed });
+                    self.ledger = Ghost(self.ledger@.push(fresh_call(rerun)));
                     assert(calls@.take(index + 1).drop_last() == calls@.take(index as int));
-                    assert(proposed(calls@.take(index + 1)) =~= proposed(calls@.take(index as int)).push(fresh_call(replay)));
+                    assert(proposed(calls@.take(index + 1)) =~= proposed(calls@.take(index as int)).push(fresh_call(rerun)));
                     index += 1;
                 }
                 assert(calls@.take(calls@.len() as int) == calls@);
@@ -1557,12 +1414,12 @@ impl<P: Payload> Core<P> {
                 if !(matches!(self.calls[index].phase, Phase::Proposed)) {
                     return self.refuse(Violation::WrongPhase);
                 }
-                if self.calls[index].replay.is_none() {
+                if self.calls[index].rerun.is_none() {
                     return self.refuse(Violation::WrongPhase);
                 }
                 let fits = match by {
                     Approver::User => true,
-                    Approver::Policy => matches!(self.calls[index].replay, Some(Replay::Safe)),
+                    Approver::Policy => matches!(self.calls[index].rerun, Some(Rerun::Safe)),
                 };
                 if !fits {
                     return self.refuse(Violation::WrongApprover);
@@ -1597,9 +1454,6 @@ impl<P: Payload> Core<P> {
                 assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
                 if !(matches!(self.calls[index].phase, Phase::Approved)) {
                     return self.refuse(Violation::WrongPhase);
-                }
-                if !self.may_dispatch(index) {
-                    return self.refuse(Violation::Concurrent);
                 }
                 let ghost was = self.ledger@[index as int];
                 self.calls[index].phase = Phase::Dispatched { seq: self.seq };
@@ -1805,9 +1659,9 @@ impl<P: Payload> Core<P> {
     }
 
     /// Moves the current step's calls forward: interrupts, calls past a
-    /// bound, invalid requests, policy approvals, dispatch (`edit`s one at a
-    /// time, `bash` alone), and once every call is resolved, the next step
-    /// or the end of the turn.
+    /// bound, invalid requests, policy approvals, dispatch of every approved
+    /// call, and once every call is resolved, the next step or the end of
+    /// the turn.
     #[verifier::loop_isolation(false)]
     fn settle(&self, plan: &mut Plan<P>)
         requires
@@ -1844,14 +1698,14 @@ impl<P: Payload> Core<P> {
                             >= self.limits.calls_per_turn() {
                             plan.resolve(index, Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))));
                         } else {
-                            match plan.scratch.calls[index].replay() {
+                            match plan.scratch.calls[index].rerun() {
                                 None => plan.resolve(index, Exit::Err(Cause::Failed(Fault::Other))),
-                                Some(Replay::Safe) => {
+                                Some(Rerun::Safe) => {
                                     plan.emit(
                                         Record::Approved { call: CallIx(index), by: Approver::Policy },
                                     );
                                 },
-                                Some(Replay::Keyed | Replay::Never) => {},
+                                Some(Rerun::Unsafe) => {},
                             }
                         }
                     },
@@ -1864,34 +1718,9 @@ impl<P: Payload> Core<P> {
             }
             index += 1;
         }
-        // Dispatch approved calls in order. A call that must wait holds back
-        // every call after it.
+        // Dispatch every approved call, in proposal order. The core has no
+        // concurrency rules: what runs together is the tools' business.
         if matches!(open.intent, Intent::Proceed) {
-            // What runs now: every dispatched call (those of earlier steps
-            // are all resolved).
-            let mut busy = Busy::Free;
-            let mut index: usize = 0;
-            while index < count
-                invariant
-                    plan.inv(),
-                    plan.scratch@.turn == Turn::Open(open),
-                    plan.scratch@.calls.len() == count,
-                    index <= count,
-                    forall|at: int|
-                        0 <= at < index && (#[trigger] plan.scratch@.calls[at]).phase is Dispatched
-                            ==> fits(busy, plan.scratch@.calls[at].replay),
-                decreases count - index,
-            {
-                assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-                assert(call_ok(plan.scratch@.calls[index as int]));
-                if let (Phase::Dispatched { .. }, Some(replay)) = (
-                    plan.scratch.calls[index].phase,
-                    plan.scratch.calls[index].replay(),
-                ) {
-                    busy = busy.with(replay);
-                }
-                index += 1;
-            }
             let mut index = open.first_call;
             while index < count
                 invariant
@@ -1902,48 +1731,13 @@ impl<P: Payload> Core<P> {
                     plan.scratch@.calls.len() == count,
                     open.first_call <= index,
                     open.intent is Proceed,
-                    busy_sound(busy, plan.scratch@.calls),
                 decreases count - index,
             {
                 assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-                let mut next = index + 1;
-                if let (Phase::Approved, Some(replay)) = (
-                    plan.scratch.calls[index].phase,
-                    plan.scratch.calls[index].replay(),
-                ) {
-                    if busy.admits(replay) {
-                        let ghost before = plan.scratch@.calls;
-                        proof {
-                            assert forall|other: int|
-                                0 <= other < before.len() && other != index && (
-                                #[trigger] before[other]).phase is Dispatched implies runs_together(
-                                before[other].replay,
-                                before[index as int].replay,
-                            ) by {
-                                assert(fits(busy, before[other].replay));
-                            }
-                        };
-                        plan.emit(Record::Dispatched { call: CallIx(index) });
-                        let ghost was = busy;
-                        busy = busy.with(replay);
-                        proof {
-                            let after = plan.scratch@.calls;
-                            assert forall|at: int|
-                                0 <= at < after.len() && (#[trigger] after[at]).phase is Dispatched implies fits(
-                                busy,
-                                after[at].replay,
-                            ) by {
-                                if at != index {
-                                    assert(after[at] == before[at]);
-                                    assert(fits(was, before[at].replay));
-                                }
-                            }
-                        };
-                    } else {
-                        next = count;
-                    }
+                if matches!(plan.scratch.calls[index].phase, Phase::Approved) {
+                    plan.emit(Record::Dispatched { call: CallIx(index) });
                 }
-                index = next;
+                index += 1;
             }
         }
         // Once every call is resolved: the turn ends or the next step starts.
@@ -2320,8 +2114,8 @@ impl<P: Payload> Core<P> {
 
     /// What to do after `recover`: bump the epoch so replies to effects from
     /// before the crash are stale, then pick up where the log stops. A
-    /// dispatched call with no result is rerun if it is `Safe` or `Keyed`
-    /// (same key) and becomes `Unknown` if it is `Never`; a model call in
+    /// dispatched call with no result is rerun if it is `Safe` and becomes
+    /// `Unknown` if it is `Unsafe`; a model call in
     /// flight restarts its step; a backoff sleeps again. Like `decide`, the
     /// records apply and every tool run is licensed by them.
     pub fn resume(&self) -> (decision: Decision<P>)
@@ -2372,8 +2166,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// Resolves each dispatched call with no result that cannot be rerun:
-    /// `Never` calls become `Unknown`; when the turn is being cancelled,
-    /// `Keyed` ones become `Unknown` and `Safe` ones `Interrupted`.
+    /// `Unsafe` calls become `Unknown`; when the turn is being cancelled,
+    /// `Safe` ones become `Interrupted`.
     #[verifier::loop_isolation(false)]
     fn resume_tools(plan: &mut Plan<P>)
         requires
@@ -2388,9 +2182,8 @@ impl<P: Payload> Core<P> {
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             forall|index: int|
                 0 <= index < final(plan).scratch@.calls.len() && (
-                #[trigger] final(plan).scratch@.calls[index]).phase is Dispatched ==> (
-                final(plan).scratch@.calls[index].replay == Some(Replay::Safe)
-                    || final(plan).scratch@.calls[index].replay == Some(Replay::Keyed)),
+                #[trigger] final(plan).scratch@.calls[index]).phase is Dispatched
+                    ==> final(plan).scratch@.calls[index].rerun == Some(Rerun::Safe),
     {
         let Some(open) = plan.open() else {
             return;
@@ -2407,22 +2200,20 @@ impl<P: Payload> Core<P> {
                 plan.scratch@.calls.len() == count,
                 open.first_call <= index <= count,
                 forall|at: int|
-                    0 <= at < index && (#[trigger] plan.scratch@.calls[at]).phase is Dispatched ==> (
-                    plan.scratch@.calls[at].replay == Some(Replay::Safe)
-                        || plan.scratch@.calls[at].replay == Some(Replay::Keyed)),
+                    0 <= at < index && (#[trigger] plan.scratch@.calls[at]).phase is Dispatched
+                        ==> plan.scratch@.calls[at].rerun == Some(Rerun::Safe),
             decreases count - index,
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
-                match (plan.scratch.calls[index].replay(), open.intent) {
-                    (None | Some(Replay::Never), Intent::Proceed | Intent::Cancel)
-                    | (Some(Replay::Keyed), Intent::Cancel) => {
+                match (plan.scratch.calls[index].rerun(), open.intent) {
+                    (None | Some(Rerun::Unsafe), Intent::Proceed | Intent::Cancel) => {
                         plan.resolve(index, Exit::Err(Cause::Unknown));
                     },
-                    (Some(Replay::Safe), Intent::Cancel) => {
+                    (Some(Rerun::Safe), Intent::Cancel) => {
                         plan.resolve(index, Exit::Err(Cause::Interrupted));
                     },
-                    (Some(Replay::Safe | Replay::Keyed), Intent::Proceed) => {},
+                    (Some(Rerun::Safe), Intent::Proceed) => {},
                 }
             }
             index += 1;
@@ -2456,7 +2247,7 @@ impl<P: Payload> fmt::Debug for Call<P> {
         f.debug_struct("Call")
             .field("id", &self.id)
             .field("args", &self.args)
-            .field("replay", &self.replay)
+            .field("rerun", &self.rerun)
             .field("phase", &self.phase)
             .finish()
     }
@@ -2466,7 +2257,7 @@ impl<P: Payload> PartialEq for Call<P> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && self.args == other.args
-            && self.replay == other.replay
+            && self.rerun == other.rerun
             && self.phase == other.phase
     }
 }
@@ -2517,7 +2308,6 @@ impl fmt::Display for Violation {
             Self::Overflow => "a counter would overflow",
             Self::DuplicateMessage => "the message already started a turn",
             Self::WrongApprover => "policy approved a call only the user may approve",
-            Self::Concurrent => "the call is dispatched beside one it may not run with",
         })
     }
 }

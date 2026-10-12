@@ -18,7 +18,7 @@ use stateright::{Checker as _, Model, Property};
 use verified_core::{Core, Decision, Effect, Event, ModelExit, Outcome, Verdict};
 use verified_domain::{
     Abstract, Approver, CallId, CallIx, Cause, EffectId, Epoch, Exit, Fault, Limit, Limits,
-    LimitsConfig, Measured, MessageId, Millis, Proposal, Record, Replay, Request, Reset, Tool,
+    LimitsConfig, Measured, MessageId, Millis, Proposal, Record, Request, Rerun, Reset, Tool,
     TurnId, TurnOutcome, Unit, UnixMillis,
 };
 
@@ -72,6 +72,9 @@ struct World {
     asks: BTreeSet<CallId>,
     /// Times each call's side effect happened, with its tool.
     runs: BTreeMap<CallId, (Tool, u8)>,
+    /// Times a run of each call was started (a `RunTool` reached the world),
+    /// with its tool.
+    starts: BTreeMap<CallId, (Tool, u8)>,
     sent: u8,
     crashes: u8,
     interrupts: u8,
@@ -93,6 +96,7 @@ impl Default for World {
             orphans: BTreeMap::new(),
             asks: BTreeSet::new(),
             runs: BTreeMap::new(),
+            starts: BTreeMap::new(),
             sent: 0,
             crashes: 0,
             interrupts: 0,
@@ -141,8 +145,11 @@ enum Action {
 /// A deliberately broken shell, to show the properties can fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bug {
-    /// After a crash, rerun dispatched bash calls as if they were `Keyed`.
-    RerunBash,
+    /// After a crash, rerun dispatched `Unsafe` calls as if they were `Safe`.
+    RerunUnsafe,
+    /// After a crash, resolve dispatched `Unsafe` calls `Interrupted`, as
+    /// if the shell knew they never ran.
+    UnsafeResolvedInterrupted,
     /// The stream serves records that are decided but not yet durable.
     ServePending,
     /// A reconnecting client resumes one record past its offset.
@@ -237,10 +244,11 @@ enum Breach {
     CancelLost,
     /// A call past `calls_per_step` or `calls_per_turn` was dispatched.
     OverBoundDispatched,
-    /// Two `Keyed` calls were dispatched and unresolved at once.
-    EditsOverlap,
     /// Policy approved a call that only the user may approve.
     PolicyApprovedMutation,
+    /// An `Unsafe` call dispatched before a crash was resolved after it
+    /// other than `Unknown`.
+    UnsafeKnownAfterCrash,
 }
 
 fn audit(log: &[Rec], limits: &Limits) -> Audit {
@@ -248,7 +256,10 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
     let mut names: Vec<CallId> = Vec::new();
     let mut tools: Vec<Tool> = Vec::new();
     let mut over: BTreeSet<usize> = BTreeSet::new();
-    let mut writing: BTreeSet<usize> = BTreeSet::new();
+    // Unsafe calls dispatched and unresolved, and those of them a crash
+    // (an `EpochBumped`) came between dispatch and result for.
+    let mut unsafe_live: BTreeSet<usize> = BTreeSet::new();
+    let mut crossed: BTreeSet<usize> = BTreeSet::new();
     let mut stopping: BTreeSet<TurnId> = BTreeSet::new();
     for record in log {
         match record {
@@ -256,7 +267,8 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
                 names.clear();
                 tools.clear();
                 over.clear();
-                writing.clear();
+                unsafe_live.clear();
+                crossed.clear();
             }
             Record::StepFinished { calls, step } => {
                 if stopping.contains(&step.turn) {
@@ -289,7 +301,7 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
                     audit.approved.insert(name.clone(), *by);
                 }
                 if *by == Approver::Policy
-                    && tools.get(*index).map(|tool| tool.replay()) != Some(Replay::Safe)
+                    && tools.get(*index).map(|tool| tool.rerun()) != Some(Rerun::Safe)
                 {
                     audit.breaches.insert(Breach::PolicyApprovedMutation);
                 }
@@ -306,11 +318,8 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
                 if over.contains(index) {
                     audit.breaches.insert(Breach::OverBoundDispatched);
                 }
-                if tools.get(*index).map(|tool| tool.replay()) == Some(Replay::Keyed) {
-                    if !writing.is_empty() {
-                        audit.breaches.insert(Breach::EditsOverlap);
-                    }
-                    writing.insert(*index);
+                if tools.get(*index).map(|tool| tool.rerun()) == Some(Rerun::Unsafe) {
+                    unsafe_live.insert(*index);
                 }
             }
             Record::ToolResult {
@@ -325,7 +334,10 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
                 if *exit == Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))) {
                     audit.limited = audit.limited.saturating_add(1);
                 }
-                writing.remove(index);
+                unsafe_live.remove(index);
+                if crossed.remove(index) && *exit != Exit::Err(Cause::Unknown) {
+                    audit.breaches.insert(Breach::UnsafeKnownAfterCrash);
+                }
             }
             Record::TurnEnded { turn, outcome } => {
                 let count = audit.turn_ends.entry(*turn).or_default();
@@ -334,10 +346,10 @@ fn audit(log: &[Rec], limits: &Limits) -> Audit {
                     audit.breaches.insert(Breach::CancelLost);
                 }
             }
-            Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::EpochBumped { .. } => {}
+            Record::EpochBumped { .. } => {
+                crossed.extend(unsafe_live.iter().copied());
+            }
+            Record::StepStarted { .. } | Record::ModelOutput { .. } | Record::StepReset { .. } => {}
         }
     }
     audit
@@ -424,7 +436,7 @@ impl Harness {
             let facts = self.audit(world);
             let approved = match facts.approved.get(call) {
                 Some(Approver::User) => true,
-                Some(Approver::Policy) => tool.replay() == Replay::Safe,
+                Some(Approver::Policy) => tool.rerun() == Rerun::Safe,
                 None => false,
             };
             if !(approved && facts.dispatched.contains(call)) {
@@ -575,6 +587,10 @@ impl Model for Harness {
                 for staged in std::mem::take(&mut world.staged) {
                     match staged {
                         Staged::Start(id, job) => {
+                            if let Job::Tool { call, tool } = &job {
+                                let entry = world.starts.entry(call.clone()).or_insert((*tool, 0));
+                                entry.1 = entry.1.saturating_add(1);
+                            }
                             let executed = !matches!(job, Job::Tool { .. });
                             world.flights.insert(
                                 id,
@@ -618,16 +634,21 @@ impl Model for Harness {
                     return Some(world);
                 };
                 self.stage(&mut world, core.resume());
-                if self.bug == Some(Bug::RerunBash) {
+                if self.bug == Some(Bug::UnsafeResolvedInterrupted) {
+                    for record in &mut world.pending {
+                        if let Record::ToolResult { exit, .. } = record
+                            && *exit == Exit::Err(Cause::Unknown)
+                        {
+                            *exit = Exit::Err(Cause::Interrupted);
+                        }
+                    }
+                }
+                if self.bug == Some(Bug::RerunUnsafe) {
                     let epoch = core.epoch().0.saturating_add(1);
                     for (id, flight) in &world.orphans {
-                        if matches!(
-                            flight.job,
-                            Job::Tool {
-                                tool: Tool::Bash,
-                                ..
-                            }
-                        ) {
+                        if let Job::Tool { tool, .. } = flight.job
+                            && tool.rerun() == Rerun::Unsafe
+                        {
                             world.staged.push(Staged::Start(
                                 EffectId {
                                     epoch: Epoch(epoch),
@@ -766,12 +787,29 @@ impl Model for Harness {
                         && !breaches.contains(&Breach::PolicyApprovedMutation)
                 },
             ),
-            Property::always("bash runs at most once", |_, world: &World| {
-                world
-                    .runs
-                    .values()
-                    .all(|(tool, count)| *tool != Tool::Bash || *count <= 1)
-            }),
+            Property::always(
+                "an Unsafe call is dispatched at most once across crashes",
+                |_, world: &World| {
+                    world
+                        .starts
+                        .values()
+                        .chain(world.runs.values())
+                        .all(|(tool, count)| tool.rerun() == Rerun::Safe || *count <= 1)
+                },
+            ),
+            Property::always(
+                "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
+                |model: &Self, world: &World| {
+                    !model
+                        .audit(world)
+                        .breaches
+                        .contains(&Breach::UnsafeKnownAfterCrash)
+                        && world
+                            .starts
+                            .values()
+                            .all(|(tool, count)| tool.rerun() == Rerun::Safe || *count <= 1)
+                },
+            ),
             Property::always(
                 "each call has at most one result",
                 |model: &Self, world: &World| {
@@ -803,22 +841,6 @@ impl Model for Harness {
                         .contains(&Breach::OverBoundDispatched)
                 },
             ),
-            Property::always("edits never overlap", |model: &Self, world: &World| {
-                let live_edits = world
-                    .flights
-                    .values()
-                    .filter(|flight| {
-                        matches!(
-                            flight.job,
-                            Job::Tool {
-                                tool: Tool::Edit,
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                !model.audit(world).breaches.contains(&Breach::EditsOverlap) && live_edits <= 1
-            }),
             Property::always(
                 "the client sees a prefix of the durable log",
                 |_, world: &World| {
@@ -904,15 +926,25 @@ impl Model for Harness {
             Property::sometimes("a call fails by a limit", |model: &Self, world: &World| {
                 model.audit(world).limited > 0
             }),
-            Property::sometimes("two edits both run", |model: &Self, world: &World| {
-                let facts = model.audit(world);
+            Property::sometimes("two Unsafe calls run at once", |_, world: &World| {
                 world
-                    .runs
+                    .flights
                     .values()
-                    .filter(|(tool, _)| *tool == Tool::Edit)
+                    .filter(|flight| {
+                        flight.executed
+                            && matches!(
+                                flight.job,
+                                Job::Tool { tool, .. } if tool.rerun() == Rerun::Unsafe
+                            )
+                    })
                     .count()
                     >= 2
-                    && facts.dispatched.len() >= 2
+            }),
+            Property::sometimes("a Safe call reruns after a crash", |_, world: &World| {
+                world
+                    .starts
+                    .values()
+                    .any(|(tool, count)| tool.rerun() == Rerun::Safe && *count >= 2)
             }),
             Property::sometimes("the client catches up", |_, world: &World| {
                 Self::quiescent(world)
@@ -961,7 +993,8 @@ fn with_crashes(scripts: Vec<Vec<Tool>>, steps: u32) -> Harness {
 
 const SAFETY: [&str; 11] = [
     "tools run only after durable approval",
-    "bash runs at most once",
+    "an Unsafe call is dispatched at most once across crashes",
+    "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
     "each call has at most one result",
     "each turn ends at most once",
     "stale completions change nothing",
@@ -969,7 +1002,6 @@ const SAFETY: [&str; 11] = [
     "quiescent implies every call resolved and the turn ended",
     "an interrupted turn ends cancelled",
     "calls past a bound never run",
-    "edits never overlap",
     "the client sees a prefix of the durable log",
 ];
 
@@ -1046,18 +1078,56 @@ fn crashes_while_cancelling() {
 }
 
 #[test]
-fn rerunning_bash_after_a_crash_is_caught() {
-    let checker = Harness {
-        bug: Some(Bug::RerunBash),
-        ..with_crashes(vec![vec![Tool::Bash]], 1)
+fn rerunning_an_unsafe_call_after_a_crash_is_caught() {
+    for tool in [Tool::Edit, Tool::Bash] {
+        let checker = Harness {
+            bug: Some(Bug::RerunUnsafe),
+            ..with_crashes(vec![vec![tool]], 1)
+        }
+        .checker()
+        .spawn_bfs()
+        .join();
+        for name in [
+            "an Unsafe call is dispatched at most once across crashes",
+            "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
+        ] {
+            assert!(
+                checker.discovery(name).is_some(),
+                "the checker finds the second {tool:?} run: {name}"
+            );
+        }
     }
-    .checker()
-    .spawn_bfs()
-    .join();
-    assert!(
-        checker.discovery("bash runs at most once").is_some(),
-        "the checker finds the double run"
-    );
+}
+
+#[test]
+fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
+    for tool in [Tool::Edit, Tool::Bash] {
+        let checker = Harness {
+            bug: Some(Bug::UnsafeResolvedInterrupted),
+            ..with_crashes(vec![vec![tool]], 1)
+        }
+        .checker()
+        .spawn_bfs()
+        .join();
+        assert!(
+            checker
+                .discovery(
+                    "after a crash a dispatched Unsafe call resolves Unknown and never reruns"
+                )
+                .is_some(),
+            "the checker sees the {tool:?} call resolved as if it never ran"
+        );
+        for name in [
+            "an Unsafe call is dispatched at most once across crashes",
+            "every durable prefix recovers",
+        ] {
+            assert_eq!(
+                checker.discovery(name).map(stateright::Path::into_actions),
+                None,
+                "only the Unknown audit fires for {tool:?}: {name}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1095,12 +1165,13 @@ fn calls_past_the_bounds() {
 }
 
 #[test]
-fn edits_one_at_a_time() {
+fn unsafe_calls_run_together() {
     let states = check(
-        with_crashes(vec![vec![Tool::Edit, Tool::Edit, Tool::Read]], 1),
+        with_crashes(vec![vec![Tool::Edit, Tool::Bash, Tool::Read]], 1),
         &[
-            "two edits both run",
-            "a tool runs",
+            "two Unsafe calls run at once",
+            "a Safe call reruns after a crash",
+            "an outcome is unknown",
             "a stale completion is refused",
         ],
     );

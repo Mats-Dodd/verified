@@ -61,8 +61,6 @@ pub enum Aim {
     ToolRan,
     /// In a group commit: written, not yet synced.
     GroupWritten,
-    /// An `edit` made its marker durable and has not renamed its staged file.
-    EditMarked,
 }
 
 /// A crash at the `occurrence`th time the daemon reaches `aim`.
@@ -103,6 +101,12 @@ fn turn(rng: &mut ChaCha8Rng, seed: u64, index: usize) -> TurnPlan {
         .get(rng.random_range(0..WORDS.len()))
         .copied()
         .unwrap_or("alpha");
+    let other = index
+        .wrapping_add(1)
+        .checked_rem(WORDS.len())
+        .and_then(|at| WORDS.get(at))
+        .copied()
+        .unwrap_or("beta");
     let fresh = format!("w{index}s{seed:x}");
     let (text, cancel) = match rng.random_range(0..14u32) {
         0..=2 => (format!("hello {index}"), None),
@@ -115,8 +119,13 @@ fn turn(rng: &mut ChaCha8Rng, seed: u64, index: usize) -> TurnPlan {
         9 => (format!("bash touch t{index}"), None),
         10 => ("bash sleep 3000".to_owned(), Some(CancelAt::ToolRunning)),
         11 => ("read notes.txt ; read other.txt".to_owned(), None),
+        // Approved calls all run at once: two edits of one file run in one
+        // step and may race, and a command runs beside them.
         12 => (
-            format!("bash touch m{index} ; edit notes.txt {word} {fresh} ; read other.txt"),
+            format!(
+                "bash touch m{index} ; edit notes.txt {word} {fresh} ; \
+                 edit notes.txt {other} {fresh}b ; read other.txt"
+            ),
             None,
         ),
         _ => ("call nope {}".to_owned(), None),
@@ -187,11 +196,12 @@ impl Scenario {
         }
         faults.sort_by_key(|(at, _)| *at);
         let aimed = rng.random_bool(0.5).then(|| AimedCrash {
+            // A crash before a tool starts is the one that leaves an
+            // Unsafe call Unknown: aim there twice as often.
             aim: match rng.random_range(0..4u32) {
-                0 => Aim::Dispatched,
                 1 => Aim::ToolRan,
                 2 => Aim::GroupWritten,
-                _ => Aim::EditMarked,
+                _ => Aim::Dispatched,
             },
             occurrence: rng.random_range(0..4),
             down: Duration::from_millis(rng.random_range(0..2_000)),

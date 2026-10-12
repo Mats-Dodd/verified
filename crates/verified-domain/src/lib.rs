@@ -23,6 +23,6 @@ pub use id::{
 pub use limits::{Limits, LimitsConfig, LimitsError, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit};
 pub use record::{
-    Approver, Cause, Exit, Failure, Fault, Limit, Proposal, Record, Replay, Request, Reset, Tool,
+    Approver, Cause, Exit, Failure, Fault, Limit, Proposal, Record, Request, Rerun, Reset, Tool,
     TurnOutcome,
 };

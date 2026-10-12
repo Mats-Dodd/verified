@@ -58,7 +58,7 @@ impl<S, P: Payload> ToolCall<S, P> {
         self.call
     }
 
-    /// The model's `tool_use` id: the idempotency key for `Keyed` tools.
+    /// The model's `tool_use` id.
     #[must_use]
     pub const fn id(&self) -> &CallId {
         &self.id
