@@ -8,7 +8,7 @@ The project follows the traditional RFC process and this contains the record of 
 
 Prefer straightforward designs and delete accidental complexity rather than preserving it.
 
-v controls **dispatch**: what runs, when, with whose approval, at most once, with exactly one recorded result. It does not control the filesystem or the OS. Tools act on the world best-effort and report honestly. Containment is a future sandbox `Env`.
+v controls **dispatch**: what runs, when, with whose approval, at most once, with exactly one recorded result. It does not control the filesystem or the OS. Tools act on the world best-effort and report honestly. Containment is a future sandbox `Env`. `PRINCIPLES.md` sets out what v upholds and what it doesn't, and the admission rule a new promise must pass. Read it before adding or changing any guarantee.
 
 This repository is a Rust workspace. Each crate under `crates/` sits on a real architectural boundary:
 
