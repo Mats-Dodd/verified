@@ -21,6 +21,14 @@ leak-timeout = "500ms"
 filter = "package(verified-sim)"
 leak-timeout = { period = "3s", result = "pass" }
 
+# The model-checking tests exhaustively explore state spaces in an unoptimized
+# build: `edits_one_at_a_time` takes ~34s on a 16-core laptop and exceeded the
+# default 60s on a shared 4-core CI runner. They are slow by construction, not
+# hung, so give them a longer leash (up to 10 minutes) instead of the default.
+[[profile.default.overrides]]
+filter = "package(verified-core) and binary(model)"
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [profile.ci]
 fail-fast = true
 final-status-level = "flaky"
