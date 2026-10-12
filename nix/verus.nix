@@ -49,6 +49,8 @@ stdenvNoCC.mkDerivation {
     mkdir -p "$out/libexec" "$out/bin"
     unzip -q "$src" -d "$out/libexec"
     mv "$out/libexec/verus-${asset.platform}" "$out/libexec/verus"
+    # Maintainer-only tool; it links libssl/libcrypto, which nothing else needs.
+    rm -f "$out/libexec/verus/bump_crate_versions" "$out"/libexec/verus/deps/bump_crate_versions-*
     # `cargo-verus` invokes its sibling `verus` as RUSTC_WRAPPER, so both
     # wrappers carry the same environment and the inner calls inherit it.
     for exe in verus cargo-verus; do
