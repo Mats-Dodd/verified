@@ -1,0 +1,34 @@
+---
+source: crates/verified-tui/src/app/tests.rs
+expression: "screen(&mut app, 80, 30)"
+---
+ › hello
+
+ Hi there, friend.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│Say something…                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+ verified  000000f1 claude-haiku-4-5 ● live   ⏎ send · ⇧⏎ newline · esc cancel ·

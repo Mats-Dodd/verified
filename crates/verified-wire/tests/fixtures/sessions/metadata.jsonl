@@ -1,0 +1,20 @@
+{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000001","data":{"text":"cite it"}}
+{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000001","data":{"model":"claude-sonnet-4-5"}}
+{"type":"start"}
+{"type":"start-step"}
+{"type":"message-metadata","messageMetadata":{"a":{"b":1,"c":[1]}}}
+{"type":"reasoning-start","id":"r0","providerMetadata":{"anthropic":{"signature":"s0"}}}
+{"type":"reasoning-delta","id":"r0","delta":"Hmm."}
+{"type":"reasoning-end","id":"r0","providerMetadata":{"anthropic":{"signature":"s1"}}}
+{"type":"source-url","sourceId":"s1","url":"https://example.com","title":"Example"}
+{"type":"source-document","sourceId":"s2","mediaType":"text/plain","title":"Notes","filename":"notes.txt"}
+{"type":"file","url":"data:text/plain;base64,aGk=","mediaType":"text/plain"}
+{"type":"reasoning-file","url":"data:text/plain;base64,aGk=","mediaType":"text/plain","providerMetadata":{"anthropic":{}}}
+{"type":"custom","kind":"anthropic.compaction"}
+{"type":"text-start","id":"t0","providerMetadata":{"anthropic":{"k":"v0"}}}
+{"type":"text-delta","id":"t0","delta":"See [1].","providerMetadata":{"anthropic":{"k":"v1"}}}
+{"type":"text-end","id":"t0"}
+{"type":"finish-step"}
+{"type":"start-step"}
+{"type":"finish","finishReason":"stop","messageMetadata":{"a":{"c":[2]},"d":null}}
+{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000001","data":{"reason":"completed"}}

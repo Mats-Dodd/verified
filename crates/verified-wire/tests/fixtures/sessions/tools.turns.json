@@ -1,0 +1,203 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "fix the typo in lib.rs",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Let me look.",
+          "state": "done"
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_1",
+          "state": "output-available",
+          "input": {
+            "path": "src/lib.rs"
+          },
+          "output": {
+            "text": "fn mian() {}"
+          },
+          "toolMetadata": {
+            "class": "safe"
+          },
+          "callProviderMetadata": {
+            "anthropic": {
+              "caller": "direct"
+            }
+          },
+          "approval": {
+            "id": "toolu_1",
+            "requestReason": "read-only",
+            "isAutomatic": true,
+            "approved": true
+          },
+          "resultProviderMetadata": {
+            "anthropic": {
+              "cached": false
+            }
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-edit",
+          "toolCallId": "toolu_2",
+          "state": "output-error",
+          "title": "Edit src/lib.rs",
+          "input": {
+            "path": "src/lib.rs",
+            "old": "mian",
+            "new": "main"
+          },
+          "errorText": "old text not found",
+          "approval": {
+            "id": "toolu_2",
+            "descriptor": {
+              "summary": "replace 1 line"
+            },
+            "inputSchemaInput": null,
+            "signature": "sig-2",
+            "approved": true,
+            "reason": "looks right"
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "The edit failed.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000002",
+    "text": "run the tests",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000002",
+      "metadata": {
+        "usage": {
+          "input": 10,
+          "output": 3
+        }
+      },
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-bash",
+          "toolCallId": "toolu_3",
+          "state": "output-denied",
+          "input": {
+            "command": "cargo test"
+          },
+          "approval": {
+            "id": "toolu_3",
+            "requestReason": "runs a shell command",
+            "approved": false,
+            "reason": "not now"
+          }
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000003",
+    "text": "search for it",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000003",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_5",
+          "state": "output-error",
+          "input": "{\"path\": [1, tr",
+          "errorText": "invalid input",
+          "providerExecuted": false
+        },
+        {
+          "type": "dynamic-tool",
+          "toolName": "grep",
+          "toolCallId": "toolu_9",
+          "state": "output-error",
+          "input": {
+            "q": 1
+          },
+          "errorText": "no such tool"
+        },
+        {
+          "type": "dynamic-tool",
+          "toolName": "search",
+          "toolCallId": "toolu_6",
+          "state": "output-available",
+          "input": {
+            "q": "mian"
+          },
+          "output": {
+            "hits": 2
+          },
+          "title": "Search",
+          "toolMetadata": {
+            "source": "index"
+          }
+        },
+        {
+          "type": "dynamic-tool",
+          "toolName": "search",
+          "toolCallId": "toolu_7",
+          "state": "output-error",
+          "input": {},
+          "errorText": "interrupted"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "cancelled"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000004",
+    "text": "delete the build dir",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000004",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-bash",
+          "toolCallId": "toolu_8",
+          "state": "approval-requested",
+          "input": {
+            "command": "rm -rf target"
+          },
+          "approval": {
+            "id": "toolu_8"
+          }
+        }
+      ]
+    },
+    "errors": [],
+    "end": null
+  }
+]

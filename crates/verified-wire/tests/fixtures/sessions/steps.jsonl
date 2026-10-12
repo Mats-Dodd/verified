@@ -1,0 +1,23 @@
+{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000001","data":{"text":"think first"}}
+{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000001","data":{"model":"claude-haiku-4-5"}}
+{"type":"start","messageId":"01a10400-0000-7000-8000-000000000001"}
+{"type":"start-step"}
+{"type":"reasoning-start","id":"r0"}
+{"type":"reasoning-delta","id":"r0","delta":"Let me "}
+{"type":"reasoning-delta","id":"r0","delta":"think."}
+{"type":"reasoning-end","id":"r0"}
+{"type":"text-start","id":"t0"}
+{"type":"text-delta","id":"t0","delta":"First step."}
+{"type":"text-end","id":"t0"}
+{"type":"finish-step"}
+{"type":"start-step"}
+{"type":"text-start","id":"t1"}
+{"type":"text-delta","id":"t1","delta":"Abandoned"}
+{"type":"reset-step"}
+{"type":"text-start","id":"t2"}
+{"type":"text-delta","id":"t2","delta":"Second step, "}
+{"type":"text-delta","id":"t2","delta":"retried."}
+{"type":"text-end","id":"t2"}
+{"type":"finish-step"}
+{"type":"finish","finishReason":"stop"}
+{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000001","data":{"reason":"completed"}}

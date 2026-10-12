@@ -1,0 +1,36 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "think first",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "reasoning",
+          "id": "r0",
+          "text": "Let me think.",
+          "state": "done"
+        },
+        {
+          "type": "text",
+          "text": "First step.",
+          "state": "done"
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Second step, retried.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]

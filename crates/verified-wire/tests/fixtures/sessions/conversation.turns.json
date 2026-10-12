@@ -1,0 +1,42 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "one",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Echo: one",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000002",
+    "text": "two",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000002",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Echo: two",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]

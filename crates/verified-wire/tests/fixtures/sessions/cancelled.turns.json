@@ -1,0 +1,42 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "slow please",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "...",
+          "state": "streaming"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "cancelled"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000002",
+    "text": "again",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000002",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Echo: again",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]

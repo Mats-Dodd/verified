@@ -1,0 +1,18 @@
+{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000001","data":{"text":"overloaded"}}
+{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000001","data":{"model":"claude-haiku-4-5"}}
+{"type":"start","messageId":"01a10400-0000-7000-8000-000000000001"}
+{"type":"start-step"}
+{"type":"error","errorText":"Overloaded"}
+{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000001","data":{"reason":"failed"}}
+{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000002","data":{"text":"fail midway"}}
+{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000002","data":{"model":"claude-haiku-4-5"}}
+{"type":"start","messageId":"01a10400-0000-7000-8000-000000000002"}
+{"type":"start-step"}
+{"type":"text-start","id":"t0"}
+{"type":"text-delta","id":"t0","delta":"Partial"}
+{"type":"error","errorText":"The model reported an error"}
+{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000002","data":{"reason":"failed"}}
+{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000003","data":{"text":"server died"}}
+{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000003","data":{"model":"claude-haiku-4-5"}}
+{"type":"error","errorText":"The turn failed unexpectedly"}
+{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000003","data":{"reason":"failed"}}

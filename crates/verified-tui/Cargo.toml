@@ -1,0 +1,38 @@
+[package]
+name = "verified-tui"
+description = "The verified terminal client: Elm loop, transcript view, stream follower"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Swaps the IO shim to turmoil's simulated network.
+# Enabled by verified-sim; never by the shipped binary.
+sim = ["dep:turmoil"]
+
+[dependencies]
+async-trait.workspace = true
+crossterm.workspace = true
+futures-core.workspace = true
+getrandom.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+# Paragraph::line_count, for paging the wrapped transcript.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tui-markdown.workspace = true
+turmoil = { workspace = true, optional = true }
+verified-domain.workspace = true
+verified-wire.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+
+[lints]
+workspace = true

@@ -77,6 +77,21 @@ disallowed-methods = [
   { path = "std::env::var_os", reason = "configuration is parsed at the boundary and passed in as data" },
   { path = "std::env::vars", reason = "configuration is parsed at the boundary and passed in as data" },
   { path = "std::env::vars_os", reason = "configuration is parsed at the boundary and passed in as data" },
+  { path = "uuid::Uuid::now_v7", allow-invalid = true, reason = "ids are built from Clock and Entropy seam data via uuid::Builder" },
+  { path = "uuid::Uuid::new_v4", allow-invalid = true, reason = "ids are built from Clock and Entropy seam data via uuid::Builder" },
+  { path = "uuid::Uuid::new_v7", allow-invalid = true, reason = "ids are built from Clock and Entropy seam data via uuid::Builder" },
+  { path = "tokio::sync::mpsc::unbounded_channel", allow-invalid = true, reason = "every queue has a bound from Limits; use tokio::sync::mpsc::channel" },
+  { path = "std::sync::mpsc::channel", reason = "every queue has a bound from Limits; use std::sync::mpsc::sync_channel" },
+  { path = "std::process::Command::new", reason = "processes start only inside the Env seam, which owns sandboxing and process groups" },
+  { path = "tokio::process::Command::new", allow-invalid = true, reason = "processes start only inside the Env seam, which owns sandboxing and process groups" },
+  { path = "tokio::spawn", allow-invalid = true, reason = "tasks start only through the world layer (World::spawn), which supervises them: a panic is the daemon's crash" },
+  { path = "tokio::task::spawn", allow-invalid = true, reason = "tasks start only through the world layer (World::spawn), which supervises them: a panic is the daemon's crash" },
+  { path = "tokio::task::spawn_blocking", allow-invalid = true, reason = "blocking work is a seam's concern; an unsupervised pool thread outlives a crash" },
+  { path = "std::thread::spawn", reason = "threads start only at a boundary that owns them; an unsupervised thread outlives a crash" },
+  { path = "tokio::time::Instant::now", allow-invalid = true, reason = "monotonic time enters through an explicit Clock seam" },
+  { path = "tokio::time::timeout", allow-invalid = true, reason = "a timeout is a sleep on the Clock seam raced against the work, with the outcome stated" },
+  { path = "getrandom::fill", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "getrandom::getrandom", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
 ]
 
 disallowed-types = [

@@ -1,0 +1,18 @@
+---
+source: crates/verified-tui/src/app/tests.rs
+expression: "screen(&mut app, 100, 14)"
+---
+ › hello
+
+ Hi there, friend.
+
+
+
+
+
+
+
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Say something…                                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ verified  000000f1 claude-haiku-4-5 ✗ the daemon closed the stream before any read (^r)  not sent:

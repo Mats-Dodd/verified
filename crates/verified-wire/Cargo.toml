@@ -1,0 +1,19 @@
+[package]
+name = "verified-wire"
+description = "Wire types for verified: commands, ids, AI SDK UI chunks, Durable Streams, SSE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+verified-domain.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

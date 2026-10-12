@@ -1,0 +1,46 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "overloaded",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": []
+    },
+    "errors": [
+      "Overloaded"
+    ],
+    "end": "failed"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000002",
+    "text": "fail midway",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000002",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Partial",
+          "state": "streaming"
+        }
+      ]
+    },
+    "errors": [
+      "The model reported an error"
+    ],
+    "end": "failed"
+  },
+  {
+    "id": "01a10400-0000-7000-8000-000000000003",
+    "text": "server died",
+    "reply": null,
+    "errors": [
+      "The turn failed unexpectedly"
+    ],
+    "end": "failed"
+  }
+]

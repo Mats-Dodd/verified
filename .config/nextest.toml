@@ -4,6 +4,23 @@ fail-fast = false
 slow-timeout = { period = "20s", terminate-after = 3 }
 leak-timeout = "500ms"
 
+# The simulation's tests spawn no subprocesses, yet under load nextest on
+# macOS reported LEAK on any of them, even the two-host `hello` test, past a
+# 3s window. The cause is the runner, not our teardown: macOS has no
+# `pipe2`, so a test's output pipe is created and only then marked
+# close-on-exec, and a sibling test that nextest spawns from another thread
+# in between inherits the pipe's write end. That pipe then stays open until
+# the sibling exits, seconds later for a simulation test. Caught in the act
+# with `lsof` during a loaded run: a `dst` test process holding, at fd 23, a
+# PIPE that was another test's output; serially (`--test-threads 1`) under
+# the same load, no LEAK in any run. No wider window fixes a sibling that
+# runs for 10s, so for verified-sim a leak is reported (LEAK) but not
+# failed. Its tests spawn no processes at all; a real leak would still show
+# in the output.
+[[profile.default.overrides]]
+filter = "package(verified-sim)"
+leak-timeout = { period = "3s", result = "pass" }
+
 [profile.ci]
 fail-fast = true
 final-status-level = "flaky"

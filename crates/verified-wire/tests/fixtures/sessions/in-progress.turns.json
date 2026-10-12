@@ -1,0 +1,22 @@
+[
+  {
+    "id": "01a10400-0000-7000-8000-000000000001",
+    "text": "still going",
+    "reply": {
+      "id": "01a10400-0000-7000-8000-000000000001",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Half a th",
+          "state": "streaming"
+        }
+      ]
+    },
+    "errors": [],
+    "end": null
+  }
+]
