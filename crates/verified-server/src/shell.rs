@@ -1259,7 +1259,6 @@ impl ModelTask {
                     return Ok(batcher.proposals);
                 }
                 Next::Part(Some(part)) => {
-                    let held = batcher.holding();
                     let Ok(ready) = batcher.push(part) else {
                         stop.cancel();
                         while receiver.recv().await.is_some() {}
@@ -1270,7 +1269,7 @@ impl ModelTask {
                     }
                     if !batcher.holding() {
                         window = None;
-                    } else if !held || window.is_none() {
+                    } else if window.is_none() {
                         window = Some(self.clock.sleep(limits.core.batch_window()));
                     }
                 }

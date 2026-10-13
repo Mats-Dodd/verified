@@ -109,21 +109,16 @@ pub enum LockError {
 /// A held lock; dropping it (or the process dying) releases it.
 #[derive(Debug)]
 pub struct LockGuard {
-    /// The flocked file, for the real lock; nothing for a simulated one.
-    file: Option<std::fs::File>,
+    /// The flocked file, for the real lock (closing it releases the lock);
+    /// nothing for a simulated one.
+    _file: Option<std::fs::File>,
 }
 
 impl LockGuard {
     /// A guard that holds nothing, for locks that need no handle.
     #[must_use]
     pub const fn unheld() -> Self {
-        Self { file: None }
-    }
-
-    /// Whether this guard holds an OS lock.
-    #[must_use]
-    pub const fn holds_file(&self) -> bool {
-        self.file.is_some()
+        Self { _file: None }
     }
 }
 
@@ -161,7 +156,7 @@ impl Lock for FileLock {
                 source,
             })?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(LockGuard { file: Some(file) }),
+            Ok(()) => Ok(LockGuard { _file: Some(file) }),
             Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => {
                 Err(LockError::Held { path: shown })
             }
