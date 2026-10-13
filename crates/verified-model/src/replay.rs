@@ -268,16 +268,18 @@ fn means(
         Observed::Booted(records) => {
             // The crash is named by what it kept, so a boot means one; a
             // model that gains a second way to it stays visible here.
-            assert!(
-                enabled(harness, world)
-                    .into_iter()
-                    .filter(|action| matches!(action, Action::Crash(_)))
-                    .filter_map(|crash| harness.next_state(world, crash))
-                    .filter(|next| next.log == *records)
-                    .count()
-                    <= 1,
-                "at most one crash leaves the log a boot found"
-            );
+            let crashes = enabled(harness, world)
+                .into_iter()
+                .filter(|action| matches!(action, Action::Crash(_)))
+                .filter_map(|crash| harness.next_state(world, crash))
+                .filter(|next| next.log == *records)
+                .count();
+            if crashes > 1 {
+                return Err(format!(
+                    "{crashes} crashes leave the {} records booted on",
+                    records.len()
+                ));
+            }
             let kept = records.len().checked_sub(world.log.len()).ok_or_else(|| {
                 format!(
                     "no crash leaves the {} records booted on (log {})",
