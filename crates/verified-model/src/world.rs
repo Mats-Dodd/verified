@@ -79,8 +79,10 @@ pub struct World {
     /// The last completion delivered, for late-duplicate redelivery.
     pub last: Option<Event<Abstract>>,
     pub client: Client,
-    pub broken: Broken,
+    /// A reply that matched nothing live was refused, as it must be.
     pub stale_refused: bool,
+    /// A reply that matched nothing live changed something.
+    pub stale_changed: bool,
     /// A full log refused the boot's resume: the shell owes it, and decides
     /// it again once the running turn is interrupted. Only a replay sets
     /// it ([`crate::Observed::Refused`]); BFS never fills the log.
@@ -123,17 +125,9 @@ impl Default for World {
                 cursor: Some(0),
                 ..Client::default()
             },
-            broken: Broken::default(),
-            stale_refused: bool::default(),
+            stale_refused: false,
+            stale_changed: false,
             refused: false,
         }
     }
-}
-
-/// Safety violations seen while stepping the world.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Default)]
-pub struct Broken {
-    pub unapproved_run: bool,
-    pub stale_changed: bool,
-    pub unrecoverable: bool,
 }

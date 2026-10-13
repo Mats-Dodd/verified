@@ -325,9 +325,11 @@ impl Harness {
         }
     }
 
+    /// Delivers `event` to the core and stages its decision; nothing, on a
+    /// log that does not recover (every durable prefix recovers is a
+    /// property).
     fn deliver(&self, world: &mut World, event: Event<Abstract>) {
         let Some(core) = self.core(world) else {
-            world.broken.unrecoverable = true;
             return;
         };
         let completion = matches!(
@@ -343,7 +345,6 @@ impl Harness {
     /// Delivers a reply that matches nothing live; it must change nothing.
     fn deliver_stale(&self, world: &mut World, event: Event<Abstract>) {
         let Some(core) = self.core(world) else {
-            world.broken.unrecoverable = true;
             return;
         };
         let decision = core.decide(event);
@@ -353,24 +354,13 @@ impl Harness {
         {
             world.stale_refused = true;
         } else {
-            world.broken.stale_changed = true;
+            world.stale_changed = true;
         }
     }
 
-    /// A tool's side effect happens in the world: only after a durable
-    /// approval by someone allowed to give it (policy for `Safe` tools, the
-    /// user for the rest) and a durable dispatch.
-    fn run(&self, world: &mut World, job: &Job) {
+    /// A tool's side effect happens in the world.
+    fn run(world: &mut World, job: &Job) {
         if let Job::Tool { call, tool } = job {
-            let facts = self.audit(world);
-            let approved = match facts.approved.get(call) {
-                Some(Approver::User) => true,
-                Some(Approver::Policy) => tool.rerun() == Rerun::Safe,
-                None => false,
-            };
-            if !(approved && facts.dispatched.contains(call)) {
-                world.broken.unapproved_run = true;
-            }
             let entry = world.runs.entry(call.clone()).or_insert((*tool, 0));
             entry.1 = entry.1.saturating_add(1);
         }
@@ -605,7 +595,6 @@ impl Model for Harness {
                         .filter(|(_, flight)| matches!(flight.job, Job::Tool { .. })),
                 );
                 let Some(core) = self.core(&world) else {
-                    world.broken.unrecoverable = true;
                     return Some(world);
                 };
                 let mut resumed = core.resume();
@@ -675,7 +664,7 @@ impl Model for Harness {
                 let flight = world.flights.get_mut(&id)?;
                 flight.executed = true;
                 let job = flight.job.clone();
-                self.run(&mut world, &job);
+                Self::run(&mut world, &job);
             }
             Action::Parts(id, bytes) => {
                 let Job::Model { batches } = &mut world.flights.get_mut(&id)?.job else {
@@ -729,7 +718,7 @@ impl Model for Harness {
                 let flight = world.orphans.get_mut(&id)?;
                 flight.executed = true;
                 let job = flight.job.clone();
-                self.run(&mut world, &job);
+                Self::run(&mut world, &job);
             }
             Action::OrphanComplete(id) => {
                 let flight = world.orphans.remove(&id)?;
@@ -768,60 +757,44 @@ impl Model for Harness {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            Property::always(
-                "tools run only after durable approval",
-                |model: &Self, world: &World| {
-                    let breaches = model.audit(world).breaches;
-                    !world.broken.unapproved_run
-                        && !breaches.contains(&Breach::DispatchBeforeApproval)
-                        && !breaches.contains(&Breach::PolicyApprovedMutation)
-                },
-            ),
+            // U3. Runs are no more than starts: a run acts only in a flight.
             Property::always(
                 "an Unsafe call is dispatched at most once across crashes",
                 |_, world: &World| {
                     world
                         .starts
                         .values()
-                        .chain(world.runs.values())
                         .all(|(tool, count)| tool.rerun() == Rerun::Safe || *count <= 1)
                 },
             ),
+            // U4.
             Property::always(
-                "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
+                "after a crash a dispatched Unsafe call resolves Unknown",
                 |model: &Self, world: &World| {
                     !model
                         .audit(world)
                         .breaches
                         .contains(&Breach::UnsafeKnownAfterCrash)
-                        && world
-                            .starts
-                            .values()
-                            .all(|(tool, count)| tool.rerun() == Rerun::Safe || *count <= 1)
                 },
             ),
+            // U5. Every log shape the core refuses (`spec_apply`) is caught
+            // here.
             Property::always(
-                "each call has at most one result",
-                |model: &Self, world: &World| {
-                    model.audit(world).results.values().all(|count| *count <= 1)
-                },
+                "every durable prefix recovers",
+                |model: &Self, world: &World| model.core(world).is_some(),
             ),
+            // U6.
             Property::always(
-                "each turn ends at most once",
-                |model: &Self, world: &World| {
-                    model
-                        .audit(world)
-                        .turn_ends
-                        .values()
-                        .all(|count| *count <= 1)
+                "the client sees a prefix of the durable log",
+                |_, world: &World| {
+                    world.client.next == world.client.seen.len()
+                        && world.log.get(..world.client.seen.len())
+                            == Some(world.client.seen.as_slice())
                 },
             ),
-            Property::always(
-                "an interrupted turn ends cancelled",
-                |model: &Self, world: &World| {
-                    !model.audit(world).breaches.contains(&Breach::CancelLost)
-                },
-            ),
+            Property::always("stale completions change nothing", |_, world: &World| {
+                !world.stale_changed
+            }),
             Property::always(
                 "calls past a bound never run",
                 |model: &Self, world: &World| {
@@ -832,34 +805,12 @@ impl Model for Harness {
                 },
             ),
             Property::always(
-                "the client sees a prefix of the durable log",
-                |_, world: &World| {
-                    world.client.next == world.client.seen.len()
-                        && world.log.get(..world.client.seen.len())
-                            == Some(world.client.seen.as_slice())
-                },
-            ),
-            Property::always("stale completions change nothing", |_, world: &World| {
-                !world.broken.stale_changed
-            }),
-            Property::always("every durable prefix recovers", |_, world: &World| {
-                !world.broken.unrecoverable
-            }),
-            Property::always(
-                "quiescent implies every call resolved and the turn ended",
+                "quiescent implies the turn ended",
                 |model: &Self, world: &World| {
-                    if !world.quiescent() {
-                        return true;
-                    }
-                    let facts = model.audit(world);
-                    let resolved = facts
-                        .proposed
-                        .iter()
-                        .all(|call| facts.results.contains_key(call));
-                    let idle = model
-                        .core(world)
-                        .is_some_and(|core| core.running().is_none());
-                    resolved && idle
+                    !world.quiescent()
+                        || model
+                            .core(world)
+                            .is_some_and(|core| core.running().is_none())
                 },
             ),
             Property::sometimes("a tool runs", |_, world: &World| !world.runs.is_empty()),
@@ -971,18 +922,3 @@ impl Model for Harness {
         ]
     }
 }
-
-/// Every `always` property: none may ever be violated.
-pub const SAFETY: [&str; 11] = [
-    "tools run only after durable approval",
-    "an Unsafe call is dispatched at most once across crashes",
-    "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
-    "each call has at most one result",
-    "each turn ends at most once",
-    "stale completions change nothing",
-    "every durable prefix recovers",
-    "quiescent implies every call resolved and the turn ended",
-    "an interrupted turn ends cancelled",
-    "calls past a bound never run",
-    "the client sees a prefix of the durable log",
-];

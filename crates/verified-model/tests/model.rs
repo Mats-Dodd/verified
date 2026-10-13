@@ -11,17 +11,22 @@ use verified_domain::{
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::{Divergence, harness};
 use verified_model::{
-    Action, Bounded, Bug, Domain, Harness, Job, Message, Mismatch, Observed, Offers, SAFETY, World,
-    replay, suite,
+    Action, Bounded, Bug, Domain, Harness, Job, Message, Mismatch, Observed, Offers, World, replay,
+    suite,
 };
 
-/// Checks every safety property, and that each `reachable` example occurs
-/// (so the safety checks are not vacuous). Returns the states explored.
+/// Checks every `always` property, and that each `reachable` example
+/// occurs (so the `always` checks are not vacuous). Returns the states
+/// explored.
 fn check(harness: Harness, reachable: &[&'static str]) -> usize {
+    let properties = harness.properties();
     let checker = harness.checker().spawn_bfs().join();
-    for name in SAFETY {
-        let counterexample = checker.discovery(name).map(stateright::Path::into_actions);
-        assert_eq!(counterexample, None, "{name} is violated");
+    for property in properties {
+        if property.expectation == Expectation::Always {
+            let name = property.name;
+            let counterexample = checker.discovery(name).map(stateright::Path::into_actions);
+            assert_eq!(counterexample, None, "{name} is violated");
+        }
     }
     for name in reachable {
         assert!(checker.discovery(name).is_some(), "never reached: {name}");
@@ -99,15 +104,12 @@ fn rerunning_an_unsafe_call_after_a_crash_is_caught() {
         .checker()
         .spawn_bfs()
         .join();
-        for name in [
-            "an Unsafe call is dispatched at most once across crashes",
-            "after a crash a dispatched Unsafe call resolves Unknown and never reruns",
-        ] {
-            assert!(
-                checker.discovery(name).is_some(),
-                "the checker finds the second {tool:?} run: {name}"
-            );
-        }
+        assert!(
+            checker
+                .discovery("an Unsafe call is dispatched at most once across crashes")
+                .is_some(),
+            "the checker finds the second {tool:?} run"
+        );
     }
 }
 
@@ -123,9 +125,7 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
         .join();
         assert!(
             checker
-                .discovery(
-                    "after a crash a dispatched Unsafe call resolves Unknown and never reruns"
-                )
+                .discovery("after a crash a dispatched Unsafe call resolves Unknown")
                 .is_some(),
             "the checker sees the {tool:?} call resolved as if it never ran"
         );
@@ -154,7 +154,7 @@ fn leaving_an_unsafe_call_dispatched_after_a_crash_is_caught() {
         .join();
         assert!(
             checker
-                .discovery("quiescent implies every call resolved and the turn ended")
+                .discovery("quiescent implies the turn ended")
                 .is_some(),
             "the checker sees the {tool:?} call never resolved"
         );
@@ -178,10 +178,8 @@ fn approval_by_policy_of_an_edit_is_caught() {
     .spawn_bfs()
     .join();
     assert!(
-        checker
-            .discovery("tools run only after durable approval")
-            .is_some(),
-        "the checker sees who approved the edit"
+        checker.discovery("every durable prefix recovers").is_some(),
+        "the core refuses a log in which policy approved the edit"
     );
 }
 

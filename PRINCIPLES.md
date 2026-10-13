@@ -77,7 +77,7 @@ Every entry passes all four parts of the admission rule.
 | # | Invariant | Strongest check | Planted bug |
 |---|---|---|---|
 | U1 | **Approval before dispatch.** A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. Only the replay judges a run's acts, against the model's world: a model wrong about the world in a way that licenses an early act would pass a shell that acts early (see "the model's world" in the trusted base). | replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
-| U2 | **Policy approves only `Safe` calls.** An `Unsafe` call needs an approval command; it is never approved automatically. | Proved (`approver_fits`). Model-checked. | Stateright `approval_by_policy_of_an_edit_is_caught` |
+| U2 | **Policy approves only `Safe` calls.** An `Unsafe` call needs an approval command; it is never approved automatically. | Proved (`approver_fits`). Model-checked: `spec_apply` refuses a policy approval of an `Unsafe` call, so a log holding one does not recover. | Stateright `approval_by_policy_of_an_edit_is_caught`, which shows the proved grammar refusing it ("every durable prefix recovers" fails) |
 | U3 | **An `Unsafe` call is dispatched at most once, ever, and acts at most once.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Trace-checked (a dispatched run acts at most once). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
 | U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_interrupted_fails_the_replay` |
 | U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). Model-checked. | Mutation recorded in the commit that added this file |
@@ -87,9 +87,9 @@ Every entry passes all four parts of the admission rule.
 
 A deterministic layer checks each of these today, but none has a committed
 planted bug. Until one exists, they are not promises. Every DST run now
-also checks the model's properties among them ("each call has at most one
-result", "quiescent implies every call resolved"), but no planted shell bug
-has been seen to fail those checks, so none has moved up.
+also checks the model's properties among them (a log with a second result
+for a call does not recover; "quiescent implies the turn ended"), but no
+planted shell bug has been seen to fail those checks, so none has moved up.
 
 | Property | Current check | Missing |
 |---|---|---|
