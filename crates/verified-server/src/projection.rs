@@ -59,16 +59,12 @@ fn approval_id(call: &CallId) -> ApprovalId {
 fn failure_text(failure: Failure) -> String {
     match failure {
         Failure::Limit(Limit::Steps) => "The turn used every model step it may take.".to_owned(),
-        Failure::Limit(Limit::Calls) => {
-            "The model proposed more tool calls than allowed.".to_owned()
-        }
-        Failure::Model(Cause::Failed(Fault::Limit(Limit::Record)))
-        | Failure::Limit(Limit::Record) => {
+        Failure::Model(Cause::Failed(Fault::TooLarge)) => {
             "The model's response is too large to record.".to_owned()
         }
-        Failure::Model(Cause::Failed(Fault::Limit(
-            Limit::Steps | Limit::Calls | Limit::Context,
-        ))) => "A limit stopped the model call.".to_owned(),
+        Failure::Model(Cause::Failed(Fault::TooManyCalls)) => {
+            "The model proposed more tool calls than allowed.".to_owned()
+        }
         Failure::Limit(Limit::Context) => {
             "The conversation is larger than the context limit.".to_owned()
         }

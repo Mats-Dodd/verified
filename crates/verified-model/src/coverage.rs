@@ -66,8 +66,10 @@ impl Resolved {
     const fn of(exit: Exit) -> Self {
         match exit {
             Exit::Ok => Self::Ok,
-            Exit::Err(Cause::Failed(Fault::Limit(_))) => Self::Limited,
-            Exit::Err(Cause::Failed(_)) => Self::Failed,
+            Exit::Err(Cause::Failed(Fault::TooManyCalls)) => Self::Limited,
+            Exit::Err(Cause::Failed(
+                Fault::Overloaded | Fault::Network | Fault::Other | Fault::TooLarge,
+            )) => Self::Failed,
             Exit::Err(Cause::Interrupted) => Self::Interrupted,
             Exit::Err(Cause::Unknown) => Self::Unknown,
             Exit::Err(Cause::Denied) => Self::Denied,
@@ -80,12 +82,9 @@ impl Resolved {
 pub enum Ended {
     Completed,
     Cancelled,
-    /// A bound from `Limits` ended it: steps, calls, context, a record's
-    /// size.
+    /// A bound from `Limits` ended it: steps or context.
     Steps,
-    Calls,
     Context,
-    Record,
     /// The model call failed for good.
     Model,
 }
@@ -96,9 +95,7 @@ impl Ended {
             TurnOutcome::Completed => Self::Completed,
             TurnOutcome::Cancelled => Self::Cancelled,
             TurnOutcome::Failed(Failure::Limit(Limit::Steps)) => Self::Steps,
-            TurnOutcome::Failed(Failure::Limit(Limit::Calls)) => Self::Calls,
             TurnOutcome::Failed(Failure::Limit(Limit::Context)) => Self::Context,
-            TurnOutcome::Failed(Failure::Limit(Limit::Record)) => Self::Record,
             TurnOutcome::Failed(Failure::Model(_)) => Self::Model,
         }
     }

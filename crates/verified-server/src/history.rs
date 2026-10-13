@@ -9,7 +9,7 @@
 //! guesses or substitutes.
 
 use verified_domain::id::{CallId, ToolName};
-use verified_domain::{Cause, Exit, Fault, Limit, Record, Request};
+use verified_domain::{Cause, Exit, Fault, Record, Request};
 
 use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
 use crate::payload::{ModelPart, Parsed, ToolInput};
@@ -45,13 +45,10 @@ pub fn synthesized_text(exit: Exit, reason: Option<&str>) -> String {
             "Interrupted: the user stopped the turn before this call finished.".to_owned()
         }
         Exit::Err(Cause::Unknown) => "Unknown outcome: the agent restarted while this call was running; it may or may not have taken effect.".to_owned(),
-        Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))) => {
+        Exit::Err(Cause::Failed(Fault::TooManyCalls)) => {
             "Not run: the response proposed more tool calls than one step or turn may make.".to_owned()
         }
-        Exit::Err(Cause::Failed(Fault::Limit(Limit::Steps | Limit::Context | Limit::Record))) => {
-            "Not run: a limit was reached.".to_owned()
-        }
-        Exit::Err(Cause::Failed(Fault::Overloaded | Fault::Network | Fault::Other)) => reason.map_or_else(
+        Exit::Err(Cause::Failed(Fault::Overloaded | Fault::Network | Fault::Other | Fault::TooLarge)) => reason.map_or_else(
             || "The tool call failed.".to_owned(),
             |reason| format!("Invalid tool call: {reason}"),
         ),

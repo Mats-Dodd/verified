@@ -846,7 +846,7 @@ fn the_turn_budget_counts_proposals() {
     assert!(
         driver.since(from).contains(&result(
             2,
-            Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))),
+            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
             None
         )),
         "step 2's read fails by the limit"
@@ -873,7 +873,7 @@ fn calls_past_the_step_bound_are_recorded_and_fail() {
     assert!(
         driver.since(from).contains(&result(
             4,
-            Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))),
+            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
             None
         )),
         "the call past calls_per_step fails by the limit"
@@ -902,7 +902,7 @@ fn calls_past_the_turn_bound_fail() {
     assert!(
         driver.log.contains(&result(
             1,
-            Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))),
+            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
             None
         )),
         "the second call is past calls_per_turn"
@@ -1265,7 +1265,7 @@ fn record_json_shape() {
         },
         Record::ToolResult {
             call: CallIx(0),
-            exit: Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))),
+            exit: Exit::Err(Cause::Failed(Fault::TooManyCalls)),
             output: None,
         },
         Record::StepReset {
@@ -1291,7 +1291,7 @@ fn record_json_shape() {
             r#"{"type":"TurnStarted","turn":"01900000-0000-7000-8000-000000000001","message":"0190a8e2-7c3b-7d4e-8f00-0123456789ab","text":{"body":"hi","bytes":2}}"#,
             r#"{"type":"StepFinished","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"calls":[{"id":"toolu_01","request":{"Run":{"args":"Edit"}}}]}"#,
             r#"{"type":"Approved","call":0,"by":"User"}"#,
-            r#"{"type":"ToolResult","call":0,"exit":{"Err":{"Failed":{"Limit":"Calls"}}},"output":null}"#,
+            r#"{"type":"ToolResult","call":0,"exit":{"Err":{"Failed":"TooManyCalls"}},"output":null}"#,
             r#"{"type":"StepReset","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"reason":{"Retry":{"fault":"Overloaded","delay":500}}}"#,
             r#"{"type":"TurnEnded","turn":"01900000-0000-7000-8000-000000000001","outcome":{"Failed":{"Limit":"Context"}}}"#,
             r#"{"type":"EpochBumped","epoch":2}"#,

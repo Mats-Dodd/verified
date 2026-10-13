@@ -717,8 +717,8 @@ const fn retryable(cause: Cause) -> Option<Fault> {
     match cause {
         Cause::Failed(Fault::Overloaded) => Some(Fault::Overloaded),
         Cause::Failed(Fault::Network) => Some(Fault::Network),
-        Cause::Failed(Fault::Other | Fault::Limit(_)) | Cause::Interrupted | Cause::Unknown
-        | Cause::Denied => None,
+        Cause::Failed(Fault::Other | Fault::TooManyCalls | Fault::TooLarge)
+        | Cause::Interrupted | Cause::Unknown | Cause::Denied => None,
     }
 }
 
@@ -1607,7 +1607,7 @@ impl<P: Payload> Core<P> {
                     Intent::Proceed => {
                         if index - open.first_call >= self.limits.calls_per_step() || index
                             >= self.limits.calls_per_turn() {
-                            plan.resolve(index, Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))));
+                            plan.resolve(index, Exit::Err(Cause::Failed(Fault::TooManyCalls)));
                         } else {
                             match plan.scratch.calls[index].rerun {
                                 None => plan.resolve(index, Exit::Err(Cause::Failed(Fault::Other))),

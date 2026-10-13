@@ -3,8 +3,7 @@
 use std::collections::BTreeSet;
 
 use verified_domain::{
-    Abstract, CallId, CallIx, Cause, Exit, Fault, Limit, Limits, Record, Request, Rerun, Tool,
-    TurnId,
+    Abstract, CallId, CallIx, Cause, Exit, Fault, Limits, Record, Request, Rerun, Tool, TurnId,
 };
 
 /// Facts read back from the log.
@@ -82,7 +81,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 exit,
                 ..
             } => {
-                if *exit == Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))) {
+                if *exit == Exit::Err(Cause::Failed(Fault::TooManyCalls)) {
                     audit.limited = audit.limited.saturating_add(1);
                 }
                 unsafe_live.remove(index);

@@ -89,9 +89,12 @@ pub enum Fault {
     Network,
     /// Anything else: not retried.
     Other,
-    /// A bound from `Limits` stopped it before it ran (a call past
-    /// `calls_per_step` or `calls_per_turn`): not retried.
-    Limit(Limit),
+    /// A call past `calls_per_step` or `calls_per_turn`: it fails without
+    /// running.
+    TooManyCalls,
+    /// The model's response (or a batch of it) is longer than the log's line
+    /// bound: it is too large to record.
+    TooLarge,
 }
 
 /// Why something did not run to success.
@@ -136,16 +139,14 @@ pub enum Reset {
     Restart,
 }
 
-/// A bound from `Limits` that ended a turn.
+/// A bound from `Limits` that ended a turn before its next step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Limit {
+    /// The turn used `steps_per_turn`.
     Steps,
-    Calls,
+    /// The conversation outgrew `context_bytes`.
     Context,
-    /// A record would be longer than the log's line bound: the model's
-    /// response (or a batch of it) is too large to record.
-    Record,
 }
 
 /// Why a turn failed.

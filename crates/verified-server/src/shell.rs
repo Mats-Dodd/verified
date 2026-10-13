@@ -17,7 +17,7 @@
 //! `Limits::batch_window`, on the Clock seam), and every batch reaches the
 //! inbox before the call's `ModelDone`. A response whose single part, or
 //! whose tool calls together, would not fit one log line fails the call
-//! (`Limit::Record`): no record the shell makes is one the log refuses.
+//! (`Fault::TooLarge`): no record the shell makes is one the log refuses.
 //! Effects are cancelled with tokens at safe points, never by dropping them.
 //!
 //! Should the log refuse an append anyway (its file is full), nothing was
@@ -52,7 +52,7 @@ use verified_core::{
 };
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
 use verified_domain::{
-    Approver, Cause, EffectId, Exit, Fault, Limit, Measured, Proposal, Record, TurnOutcome,
+    Approver, Cause, EffectId, Exit, Fault, Measured, Proposal, Record, TurnOutcome,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -1184,7 +1184,7 @@ impl ModelTask {
             self.batch(receiver, &stop),
         );
         let result = match (batched, streamed) {
-            (Err(TooLarge), _) => ModelExit::Failed(Cause::Failed(Fault::Limit(Limit::Record))),
+            (Err(TooLarge), _) => ModelExit::Failed(Cause::Failed(Fault::TooLarge)),
             (Ok(proposals), Ok(())) => ModelExit::Finished(proposals),
             (Ok(_), Err(error)) => ModelExit::Failed(error.core_cause()),
         };
