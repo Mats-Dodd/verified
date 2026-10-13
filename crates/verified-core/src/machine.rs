@@ -555,20 +555,6 @@ pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> 
     }
 }
 
-/// Every call dispatched before `from` (and still unresolved) is `Safe`.
-pub open spec fn rerunnable(view: CoreView, from: u64) -> bool {
-    forall|index: int|
-        0 <= index < view.calls.len() && dispatched_before((#[trigger] view.calls[index]).phase, from)
-            ==> view.calls[index].rerun == Some(Rerun::Safe)
-}
-
-pub open spec fn dispatched_before(phase: Phase, from: u64) -> bool {
-    match phase {
-        Phase::Dispatched { seq } => seq < from,
-        Phase::Proposed | Phase::Approved | Phase::Resolved => false,
-    }
-}
-
 proof fn lemma_refusal_sticks<P: Payload>(view: CoreView, log: Seq<Record<P>>, at: int)
     requires
         0 <= at <= log.len(),
@@ -663,8 +649,8 @@ enum Ask {
 enum Runs {
     /// Those it dispatched itself.
     New,
-    /// Every dispatched call without a result: after a crash, the ones
-    /// still unresolved are reruns of `Safe` calls.
+    /// Those too, and every `Safe` call dispatched before it: after a
+    /// crash, its rerun in the new epoch.
     All,
 }
 
@@ -778,19 +764,12 @@ spec fn mirrors<P: Payload>(call: Call<P>, view: CallView) -> bool {
     &&& (call.args is Some) == (call.rerun is Some)
 }
 
-/// Where a plan started: the state the decision applies to, and whether it
-/// may rerun calls dispatched before it (only `resume`, once it has bumped
-/// the epoch and resolved every dispatched call that may not run again).
-#[cfg_attr(not(verus_keep_ghost), expect(dead_code, reason = "ghost state: read only by the proofs, erased in plain builds"))]
-struct Origin {
-    view: CoreView,
-    reruns: bool,
-}
-
 /// A decision being drafted on a scratch copy of the core: the records so
 /// far (each already applied to the copy) and the effects.
 struct Plan<P: Payload> {
-    start: Ghost<Origin>,
+    /// The state the decision applies to.
+    #[cfg_attr(not(verus_keep_ghost), expect(dead_code, reason = "ghost state: read only by the proofs, erased in plain builds"))]
+    start: Ghost<CoreView>,
     /// The sequence number of the decision's first record.
     from: u64,
     scratch: Core<P>,
@@ -798,59 +777,11 @@ struct Plan<P: Payload> {
     effects: Vec<Effect<P>>,
 }
 
-/// Applying a record keeps every call dispatched before `from` rerunnable,
-/// and never lowers the epoch.
-proof fn lemma_apply_keeps_reruns<P: Payload>(view: CoreView, record: Record<P>, from: u64)
-    requires
-        from <= view.seq,
-        spec_apply(view, record) is Some,
-    ensures
-        rerunnable(view, from) ==> rerunnable(spec_apply(view, record)->0, from),
-        spec_apply(view, record)->0.epoch >= view.epoch,
-{
-    let next = spec_apply(view, record)->0;
-    if !rerunnable(view, from) {
-        return;
-    }
-    assert forall|index: int|
-        0 <= index < next.calls.len() && dispatched_before((#[trigger] next.calls[index]).phase, from)
-        implies next.calls[index].rerun == Some(Rerun::Safe) by {
-        match record {
-            Record::StepFinished { calls, .. } => {
-                if index >= view.calls.len() {
-                    assert(next.calls[index] == proposed(calls@)[index - view.calls.len()]);
-                } else {
-                    assert(next.calls[index] == view.calls[index]);
-                }
-            },
-            Record::Approved { call, .. } | Record::Dispatched { call } | Record::ToolResult {
-                call,
-                ..
-            } => {
-                if index != call.0 as int {
-                    assert(next.calls[index] == view.calls[index]);
-                }
-            },
-            Record::TurnStarted { .. } => {},
-            Record::StepStarted { .. } | Record::ModelOutput { .. } | Record::StepReset { .. }
-            | Record::CancelRequested { .. } | Record::TurnEnded { .. } | Record::EpochBumped {
-                ..
-            } => {
-                assert(next.calls == view.calls);
-            },
-        }
-    }
-}
-
 impl<P: Payload> Plan<P> {
     spec fn inv(&self) -> bool {
         &&& self.scratch.wf()
-        &&& applies(self.start@.view, self.records@) == Some(self.scratch@)
-        &&& self.from == self.start@.view.seq
-        &&& self.from <= self.scratch@.seq
-        &&& self.scratch@.epoch >= self.start@.view.epoch
-        &&& self.start@.reruns ==> rerunnable(self.scratch@, self.from)
-        &&& self.start@.reruns ==> self.scratch@.epoch > self.start@.view.epoch
+        &&& applies(self.start@, self.records@) == Some(self.scratch@)
+        &&& self.from == self.start@.seq
         &&& forall|index: int|
             0 <= index < self.effects@.len() ==> !((#[trigger] self.effects@[index]) is RunTool)
     }
@@ -870,9 +801,6 @@ impl<P: Payload> Plan<P> {
             seq == old(self).scratch@.seq,
     {
         let seq = self.scratch.seq;
-        proof {
-            lemma_apply_keeps_reruns(self.scratch@, record, self.from);
-        };
         let _applied = self.scratch.apply(&record);
         proof {
             // `apply` refuses exactly what `spec_apply` cannot follow.
@@ -948,11 +876,11 @@ impl<P: Payload> Plan<P> {
     fn finish(self, outcome: Outcome, ask: Ask, runs: Runs) -> (decision: Decision<P>)
         requires
             self.inv(),
-            runs is All ==> self.start@.reruns,
+            runs is All ==> self.scratch@.epoch > self.start@.epoch,
         ensures
             match runs {
-                Runs::New => decided(self.start@.view, decision),
-                Runs::All => resumed(self.start@.view, decision),
+                Runs::New => decided(self.start@, decision),
+                Runs::All => resumed(self.start@, decision),
             },
     {
         let mut plan = self;
@@ -964,20 +892,18 @@ impl<P: Payload> Plan<P> {
             invariant
                 plan.scratch.wf(),
                 plan.start@ == origin,
-                applies(origin.view, plan.records@) == Some(plan.scratch@),
-                plan.from == origin.view.seq,
-                reruns ==> origin.reruns,
-                origin.reruns ==> rerunnable(plan.scratch@, plan.from),
-                origin.reruns ==> plan.scratch@.epoch > origin.view.epoch,
+                applies(origin, plan.records@) == Some(plan.scratch@),
+                plan.from == origin.seq,
+                reruns ==> plan.scratch@.epoch > origin.epoch,
                 count == plan.scratch.calls@.len(),
-                runs_ok(origin.view, plan.scratch@, plan.effects@, reruns),
+                runs_ok(origin, plan.scratch@, plan.effects@, reruns),
             decreases count - index,
         {
             if let Phase::Dispatched { seq } = plan.scratch.calls[index].phase {
-                let start = match runs {
-                    Runs::New => seq >= plan.from,
-                    Runs::All => true,
-                };
+                let start = seq >= plan.from || (matches!(runs, Runs::All) && matches!(
+                    plan.scratch.calls[index].rerun,
+                    Some(Rerun::Safe),
+                ));
                 if start {
                     if let Some(args) = &plan.scratch.calls[index].args {
                         let call = effect::approved(
@@ -989,9 +915,6 @@ impl<P: Payload> Plan<P> {
                         proof {
                             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
                             assert(call_ok(plan.scratch@.calls[index as int]));
-                            if seq < plan.from {
-                                assert(dispatched_before(plan.scratch@.calls[index as int].phase, plan.from));
-                            }
                         };
                         let ghost before = plan.effects@;
                         plan.effects.push(Effect::RunTool { call });
@@ -999,9 +922,9 @@ impl<P: Payload> Plan<P> {
                             assert forall|at: int|
                                 0 <= at < plan.effects@.len() && (#[trigger] plan.effects@[at]) is RunTool
                                 implies licensed(plan.scratch@, plan.effects@[at]->call) && (fresh(
-                                origin.view,
+                                origin,
                                 plan.effects@[at]->call,
-                            ) || (reruns && rerun(origin.view, plan.scratch@, plan.effects@[at]->call))) by {
+                            ) || (reruns && rerun(origin, plan.scratch@, plan.effects@[at]->call))) by {
                                 if at < before.len() {
                                     assert(plan.effects@[at] == before[at]);
                                 }
@@ -1020,7 +943,7 @@ impl<P: Payload> Plan<P> {
                         invariant
                             plan.scratch.wf(),
                             count == plan.scratch.calls@.len(),
-                            runs_ok(origin.view, plan.scratch@, plan.effects@, reruns),
+                            runs_ok(origin, plan.scratch@, plan.effects@, reruns),
                         decreases count - index,
                     {
                         if matches!(plan.scratch.calls[index].phase, Phase::Proposed) {
@@ -1040,8 +963,8 @@ impl<P: Payload> Plan<P> {
                                                 #[trigger] plan.effects@[at]) is RunTool implies licensed(
                                                 plan.scratch@,
                                                 plan.effects@[at]->call,
-                                            ) && (fresh(origin.view, plan.effects@[at]->call) || (reruns
-                                                && rerun(origin.view, plan.scratch@, plan.effects@[at]->call))) by {
+                                            ) && (fresh(origin, plan.effects@[at]->call) || (reruns
+                                                && rerun(origin, plan.scratch@, plan.effects@[at]->call))) by {
                                                 if at < before.len() {
                                                     assert(plan.effects@[at] == before[at]);
                                                 }
@@ -1606,12 +1529,11 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             plan.inv(),
-            plan.start@.view == self@,
-            !plan.start@.reruns,
+            plan.start@ == self@,
             plan.scratch@ == self@,
     {
         let plan = Plan {
-            start: Ghost(Origin { view: self@, reruns: false }),
+            start: Ghost(self@),
             from: self.seq,
             scratch: self.scratch(),
             records: Vec::new(),
@@ -1651,6 +1573,7 @@ impl<P: Payload> Core<P> {
             final(plan).inv(),
             final(plan).start == old(plan).start,
             final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
         if step.index >= self.limits.steps_per_turn() {
             plan.emit(Record::TurnEnded { turn: step.turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
@@ -1677,6 +1600,7 @@ impl<P: Payload> Core<P> {
             final(plan).inv(),
             final(plan).start == old(plan).start,
             final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
         let Some(open) = plan.open() else {
             return;
@@ -1689,6 +1613,7 @@ impl<P: Payload> Core<P> {
                 plan.inv(),
                 plan.start == old(plan).start,
                 plan.from == old(plan).from,
+                plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.turn == Turn::Open(open),
                 plan.scratch@.calls.len() == count,
                 open.first_call <= index,
@@ -1732,6 +1657,7 @@ impl<P: Payload> Core<P> {
                     plan.inv(),
                     plan.start == old(plan).start,
                     plan.from == old(plan).from,
+                    plan.scratch@.epoch == old(plan).scratch@.epoch,
                     plan.scratch@.turn == Turn::Open(open),
                     plan.scratch@.calls.len() == count,
                     open.first_call <= index,
@@ -1903,8 +1829,7 @@ impl<P: Payload> Core<P> {
                 while index < count
                     invariant
                         plan.inv(),
-                        plan.start@.view == self@,
-                        !plan.start@.reruns,
+                        plan.start@ == self@,
                         plan.scratch@.turn == Turn::Open(Open { intent: Intent::Cancel, ..open }),
                         plan.scratch@.calls.len() == count,
                     decreases count - index,
@@ -2132,40 +2057,27 @@ impl<P: Payload> Core<P> {
         let mut plan = self.plan();
         let epoch = Epoch(bump(self.epoch.0));
         plan.emit(Record::EpochBumped { epoch });
-        match plan.open() {
-            Some(open) => {
-                if !matches!(open.stage, Stage::Tools) {
-                    // Nothing is dispatched outside `Tools`, so nothing can
-                    // be rerun: reruns are allowed vacuously.
-                    plan.start = Ghost(Origin { reruns: true, ..plan.start@ });
-                }
-                match (open.stage, open.intent) {
-                    (Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. }, Intent::Cancel) => {
-                        plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
-                    },
-                    (Stage::Starting, Intent::Proceed) => {
-                        self.start_step(&mut plan, StepId { turn: open.turn, index: 0 });
-                    },
-                    (Stage::Model { .. }, Intent::Proceed) => {
-                        plan.emit(Record::StepReset { step: open.step, reason: Reset::Restart });
-                        self.start_step(&mut plan, open.step);
-                    },
-                    (Stage::Backoff { since, reset }, Intent::Proceed) => {
-                        let id = plan.id(since);
-                        plan.effect(Effect::Sleep { id, delay: backoff(reset) });
-                    },
-                    (Stage::Tools, Intent::Proceed | Intent::Cancel) => {
-                        Self::resume_tools(&mut plan);
-                        // Every call still dispatched may run again, in the
-                        // new epoch: from here on, reruns are allowed.
-                        plan.start = Ghost(Origin { reruns: true, ..plan.start@ });
-                        self.settle(&mut plan);
-                    },
-                }
-            },
-            None => {
-                plan.start = Ghost(Origin { reruns: true, ..plan.start@ });
-            },
+        if let Some(open) = plan.open() {
+            match (open.stage, open.intent) {
+                (Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. }, Intent::Cancel) => {
+                    plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
+                },
+                (Stage::Starting, Intent::Proceed) => {
+                    self.start_step(&mut plan, StepId { turn: open.turn, index: 0 });
+                },
+                (Stage::Model { .. }, Intent::Proceed) => {
+                    plan.emit(Record::StepReset { step: open.step, reason: Reset::Restart });
+                    self.start_step(&mut plan, open.step);
+                },
+                (Stage::Backoff { since, reset }, Intent::Proceed) => {
+                    let id = plan.id(since);
+                    plan.effect(Effect::Sleep { id, delay: backoff(reset) });
+                },
+                (Stage::Tools, Intent::Proceed | Intent::Cancel) => {
+                    Self::resume_tools(&mut plan);
+                    self.settle(&mut plan);
+                },
+            }
         }
         plan.finish(Outcome::Accepted, Ask::Yes, Runs::All)
     }
