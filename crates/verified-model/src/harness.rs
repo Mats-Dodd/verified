@@ -112,7 +112,8 @@ pub enum Domain {
     Trace(Offers),
 }
 
-/// The BFS's values: one-byte payloads, ids made from small indices.
+/// The BFS's values: one-byte payloads, ids made from small indices, and
+/// bounds on the world's faults.
 #[derive(Clone, Debug)]
 pub struct Bounded {
     /// Distinct messages the user may send; one extra send repeats the first.
@@ -126,12 +127,19 @@ pub struct Bounded {
     /// Answers the user may give to a proposed call not awaiting one:
     /// repeated, late, racing another, or after a crash dropped the ask.
     pub stale_answers: u8,
+    pub max_crashes: u8,
+    pub max_interrupts: u8,
+    pub max_duplicates: u8,
+    /// Whether a client follows the stream (and may reconnect this often).
+    pub client: Option<u8>,
 }
 
 /// The values a trace carries, offered wherever the model allows them.
 ///
 /// User commands are offered whenever the shell takes input (the user may
-/// repeat or race them); completions only for their own effect.
+/// repeat or race them); completions only for their own effect. Crashes,
+/// interrupts and reconnects are unbounded, and nothing only the model's
+/// world does (late duplicates, orphans acting or replying) is offered.
 #[derive(Clone, Debug, Default)]
 pub struct Offers {
     pub messages: Vec<Message>,
@@ -215,11 +223,6 @@ pub enum Bug {
 pub struct Harness {
     pub limits: Limits,
     pub domain: Domain,
-    pub max_crashes: u8,
-    pub max_interrupts: u8,
-    pub max_duplicates: u8,
-    /// Whether a client follows the stream (and may reconnect this often).
-    pub client: Option<u8>,
     pub bug: Option<Bug>,
 }
 
@@ -260,19 +263,32 @@ const fn reportable(flight: &Flight, exit: Exit) -> bool {
 }
 
 impl Harness {
+    /// A harness for BFS under `limits` over `bounded`.
+    #[must_use]
+    pub const fn bounded(limits: Limits, bounded: Bounded) -> Self {
+        Self {
+            limits,
+            domain: Domain::Bounded(bounded),
+            bug: None,
+        }
+    }
+
     /// A harness for replaying traces run under `limits`: actions carry the
-    /// values `offers` holds, and faults are bounded only by their `u8`
-    /// counters.
+    /// values `offers` holds.
     #[must_use]
     pub const fn trace(limits: Limits, offers: Offers) -> Self {
         Self {
             limits,
             domain: Domain::Trace(offers),
-            max_crashes: u8::MAX,
-            max_interrupts: u8::MAX,
-            max_duplicates: u8::MAX,
-            client: Some(u8::MAX),
             bug: None,
+        }
+    }
+
+    /// Whether the world may crash again.
+    const fn may_crash(&self, world: &World) -> bool {
+        match &self.domain {
+            Domain::Bounded(bounded) => world.crashes < bounded.max_crashes,
+            Domain::Trace(_) => true,
         }
     }
 
@@ -437,32 +453,40 @@ impl Harness {
     }
 
     fn client_actions(&self, state: &World, actions: &mut Vec<Action>) {
-        let Some(reconnects) = self.client else {
-            return;
+        // A dropped connection is always reopened; a live one may also drop
+        // (in BFS, up to the client's bound).
+        let may_drop = match &self.domain {
+            Domain::Bounded(Bounded { client: None, .. }) => return,
+            Domain::Bounded(Bounded {
+                client: Some(reconnects),
+                ..
+            }) => state.client.reconnects < *reconnects,
+            Domain::Trace(_) => true,
         };
         if let Some(cursor) = state.client.cursor
             && self.served(state).len() > cursor
         {
             actions.push(Action::Read);
         }
-        // A dropped connection is always reopened; a live one may also drop
-        // (up to `reconnects` times).
-        if state.client.cursor.is_none() || state.client.reconnects < reconnects {
+        if state.client.cursor.is_none() || may_drop {
             actions.push(Action::Reconnect);
         }
     }
 
     /// Side effects of runs already started: tool tasks run beside the
-    /// shell, whatever it is doing, and a crash does not stop them.
-    fn executions(state: &World, actions: &mut Vec<Action>) {
+    /// shell, whatever it is doing, and (in BFS) a crash does not stop
+    /// them.
+    fn executions(&self, state: &World, actions: &mut Vec<Action>) {
         for (id, flight) in &state.flights {
             if matches!(flight.job, Job::Tool { .. }) && !flight.executed {
                 actions.push(Action::Execute(*id));
             }
         }
-        for (id, flight) in &state.orphans {
-            if !flight.executed {
-                actions.push(Action::OrphanExecute(*id));
+        if let Domain::Bounded(_) = self.domain {
+            for (id, flight) in &state.orphans {
+                if !flight.executed {
+                    actions.push(Action::OrphanExecute(*id));
+                }
             }
         }
     }
@@ -493,7 +517,7 @@ impl Harness {
                         }
                     }
                 }
-                if state.interrupts < self.max_interrupts
+                if state.interrupts < bounded.max_interrupts
                     && let Some(turn) = self.core(state).and_then(|core| core.running())
                 {
                     actions.push(Action::Interrupt(turn));
@@ -507,9 +531,7 @@ impl Harness {
                         .iter()
                         .map(|(call, verdict)| Action::Answer(call.clone(), *verdict)),
                 );
-                if state.interrupts < self.max_interrupts {
-                    actions.extend(offers.interrupts.iter().copied().map(Action::Interrupt));
-                }
+                actions.extend(offers.interrupts.iter().copied().map(Action::Interrupt));
             }
         }
     }
@@ -584,18 +606,18 @@ impl Model for Harness {
             // The shell persists the decision before it delivers anything
             // more to the core; meanwhile tools run and clients read.
             actions.push(Action::Sync);
-            if state.crashes < self.max_crashes {
+            if self.may_crash(state) {
                 for keep in 0..=state.pending.len() {
                     actions.push(Action::Crash(keep));
                 }
             }
-            Self::executions(state, actions);
+            self.executions(state, actions);
             // The stream may be read meanwhile: only durable records show.
             self.client_actions(state, actions);
             return;
         }
         self.user_actions(state, actions);
-        Self::executions(state, actions);
+        self.executions(state, actions);
         for (id, flight) in &state.flights {
             match &flight.job {
                 Job::Model { batches } => {
@@ -605,13 +627,15 @@ impl Model for Harness {
                 Job::Sleep => actions.push(Action::Woke(*id)),
             }
         }
-        for id in state.orphans.keys() {
-            actions.push(Action::OrphanComplete(*id));
+        if let Domain::Bounded(bounded) = &self.domain {
+            for id in state.orphans.keys() {
+                actions.push(Action::OrphanComplete(*id));
+            }
+            if state.duplicates < bounded.max_duplicates && state.last.is_some() {
+                actions.push(Action::Duplicate);
+            }
         }
-        if state.duplicates < self.max_duplicates && state.last.is_some() {
-            actions.push(Action::Duplicate);
-        }
-        if state.crashes < self.max_crashes {
+        if self.may_crash(state) {
             actions.push(Action::Crash(0));
         }
         self.client_actions(state, actions);

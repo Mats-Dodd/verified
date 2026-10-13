@@ -11,7 +11,7 @@ use verified_domain::{
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::{Divergence, harness};
 use verified_model::{
-    Action, Bounded, Bug, Domain, Harness, Job, Message, Mismatch, Observed, Offers, World, replay,
+    Action, Bounded, Bug, Harness, Job, Kind, Message, Mismatch, Observed, Offers, World, replay,
     suite,
 };
 
@@ -222,9 +222,14 @@ fn a_client_follows_the_stream() {
 #[test]
 fn serving_records_before_they_are_durable_is_caught() {
     let checker = Harness {
-        client: Some(0),
         bug: Some(Bug::ServePending),
-        ..suite::with_crashes(vec![Vec::new()], 1)
+        ..Harness::bounded(
+            suite::limits(1),
+            Bounded {
+                client: Some(0),
+                ..suite::crashing(vec![Vec::new()])
+            },
+        )
     }
     .checker()
     .spawn_bfs()
@@ -240,9 +245,14 @@ fn serving_records_before_they_are_durable_is_caught() {
 #[test]
 fn skipping_a_record_on_reconnect_is_caught() {
     let checker = Harness {
-        client: Some(1),
         bug: Some(Bug::SkipOnReconnect),
-        ..suite::with_crashes(vec![Vec::new()], 1)
+        ..Harness::bounded(
+            suite::limits(1),
+            Bounded {
+                client: Some(1),
+                ..suite::crashing(vec![Vec::new()])
+            },
+        )
     }
     .checker()
     .spawn_bfs()
@@ -259,15 +269,15 @@ fn skipping_a_record_on_reconnect_is_caught() {
 #[ignore = "larger bounds: minutes of BFS; run with --run-ignored only"]
 fn everything_at_once() {
     check(
-        Harness {
-            limits: suite::limits(2),
-            domain: suite::bounded(vec![Vec::new(), vec![Tool::Read], vec![Tool::Bash]], 1),
-            max_crashes: 1,
-            max_interrupts: 1,
-            max_duplicates: 1,
-            client: Some(1),
-            bug: None,
-        },
+        Harness::bounded(
+            suite::limits(2),
+            Bounded {
+                max_interrupts: 1,
+                max_duplicates: 1,
+                client: Some(1),
+                ..suite::crashing(vec![Vec::new(), vec![Tool::Read], vec![Tool::Bash]])
+            },
+        ),
         &[],
     );
 }
@@ -276,9 +286,9 @@ fn everything_at_once() {
 #[ignore = "larger bounds: hours of BFS; run with --run-ignored only"]
 fn larger_bounds() {
     check(
-        Harness {
-            limits: suite::limits(3),
-            domain: Domain::Bounded(Bounded {
+        Harness::bounded(
+            suite::limits(3),
+            Bounded {
                 messages: 2,
                 scripts: vec![
                     Vec::new(),
@@ -288,13 +298,12 @@ fn larger_bounds() {
                 ],
                 batches: 2,
                 stale_answers: 1,
-            }),
-            max_crashes: 2,
-            max_interrupts: 1,
-            max_duplicates: 1,
-            client: Some(1),
-            bug: None,
-        },
+                max_crashes: 2,
+                max_interrupts: 1,
+                max_duplicates: 1,
+                client: Some(1),
+            },
+        ),
         &[],
     );
 }
@@ -347,10 +356,13 @@ fn enabled(harness: &Harness, world: &World, pick: impl Fn(&Action) -> bool) -> 
 /// model call streams more than one batch. The model allowed neither before.
 #[test]
 fn the_world_runs_while_a_decision_is_persisted() {
-    let harness = Harness {
-        domain: suite::bounded(vec![vec![Tool::Read, Tool::Bash]], 2),
-        ..suite::with_crashes(Vec::new(), 1)
-    };
+    let harness = Harness::bounded(
+        suite::limits(1),
+        Bounded {
+            batches: 2,
+            ..suite::crashing(vec![vec![Tool::Read, Tool::Bash]])
+        },
+    );
     let mut path = Vec::new();
     let mut world = follow(&harness, &path);
     let mut take = |world: &mut World, pick: &dyn Fn(&Action) -> bool| {
@@ -380,8 +392,23 @@ fn the_world_runs_while_a_decision_is_persisted() {
     );
 }
 
-/// A path BFS found replays in trace mode, where each action is offered
-/// only because the path carries its values.
+/// `path` up to its first step only the model's world takes: orphans and
+/// late duplicates never happen in a simulated run, and trace mode never
+/// offers them.
+fn observable(mut path: Vec<Action>) -> Vec<Action> {
+    if let Some(unseen) = path.iter().position(|action| {
+        matches!(
+            action.kind(),
+            Kind::OrphanExecute | Kind::OrphanComplete | Kind::Duplicate
+        )
+    }) {
+        path.truncate(unseen);
+    }
+    path
+}
+
+/// A path BFS found replays in trace mode, as far as a run could take it,
+/// where each action is offered only because the path carries its values.
 #[test]
 fn a_path_found_by_bfs_replays_in_trace_mode() {
     let bounded = suite::with_crashes(
@@ -390,10 +417,12 @@ fn a_path_found_by_bfs_replays_in_trace_mode() {
     );
     let checker = bounded.clone().checker().spawn_bfs().join();
     for name in ["an outcome is unknown", "a turn completes", "a tool runs"] {
-        let path = checker
-            .discovery(name)
-            .expect("BFS reaches it")
-            .into_actions();
+        let path = observable(
+            checker
+                .discovery(name)
+                .expect("BFS reaches it")
+                .into_actions(),
+        );
         let trace = Harness::trace(bounded.limits.clone(), Offers::of(&path));
         assert_eq!(
             follow(&trace, &path),
@@ -598,20 +627,12 @@ fn path_to_an_unknown_outcome() -> (Harness, Vec<Action>) {
         1,
     );
     let checker = bounded.clone().checker().spawn_bfs().join();
-    let mut path = checker
-        .discovery("an outcome is unknown")
-        .expect("BFS reaches it")
-        .into_actions();
-    // Up to the first step nothing observes: orphans and duplicates never
-    // happen in a simulated run.
-    if let Some(unseen) = path.iter().position(|action| {
-        matches!(
-            action,
-            Action::OrphanExecute(_) | Action::OrphanComplete(_) | Action::Duplicate
-        )
-    }) {
-        path.truncate(unseen);
-    }
+    let path = observable(
+        checker
+            .discovery("an outcome is unknown")
+            .expect("BFS reaches it")
+            .into_actions(),
+    );
     (bounded, path)
 }
 
