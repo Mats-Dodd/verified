@@ -6,7 +6,7 @@
 //! shares so tests exercise the same mapping.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -204,9 +204,6 @@ pub enum Progress {
 /// Anthropic stream events in, model parts out.
 pub struct StreamParser {
     blocks: BTreeMap<u32, Block>,
-    /// The `tool_use` ids seen so far: a response reusing one fails here,
-    /// so two live calls never share an id.
-    calls: BTreeSet<CallId>,
     stop: FinishReason,
     parts: usize,
     max_parts: usize,
@@ -240,7 +237,6 @@ impl StreamParser {
     pub const fn new(max_parts: usize, max_input: usize) -> Self {
         Self {
             blocks: BTreeMap::new(),
-            calls: BTreeSet::new(),
             stop: FinishReason::Stop,
             parts: 0,
             max_parts,
@@ -333,11 +329,6 @@ impl StreamParser {
                     .map_err(|error| ModelError::Other(format!("tool_use id: {error}")))?;
                 let name = ToolName::parse(&name)
                     .map_err(|error| ModelError::Other(format!("tool name: {error}")))?;
-                if !self.calls.insert(id.clone()) {
-                    return Err(ModelError::Other(format!(
-                        "the response reuses tool_use id {id}"
-                    )));
-                }
                 self.emit(
                     out,
                     ModelPart::ToolInputStart {
