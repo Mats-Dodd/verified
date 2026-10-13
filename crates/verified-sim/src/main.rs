@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! verified-sim run --from 0 --count 1000     # nightly (`just sweep`): many seeds, each run twice
-//! verified-sim run --directed NAME           # one directed scenario, twice
+//! verified-sim directed NAME                # one directed scenario, twice
 //! verified-sim trace --seed 42               # one run of one seed, its trace
 //! verified-sim processes                     # each fixed seed in two fresh processes
 //! verified-sim coverage --count 200          # model coverage: the gap table
@@ -30,20 +30,15 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Runs `count` seeds from `from`, each twice, and stops at the first
-    /// failure; or one directed scenario, twice.
+    /// failure.
     Run {
-        #[arg(long, default_value_t = 0, conflicts_with = "directed")]
+        #[arg(long, default_value_t = 0)]
         from: u64,
-        #[arg(
-            long,
-            required_unless_present = "directed",
-            conflicts_with = "directed"
-        )]
-        count: Option<u64>,
-        /// The directed scenario to run, by name.
         #[arg(long)]
-        directed: Option<String>,
+        count: u64,
     },
+    /// Runs one directed scenario, by name, twice.
+    Directed { name: String },
     /// Runs one seed once and prints its trace (diff two of these to find
     /// nondeterminism).
     Trace {
@@ -133,10 +128,7 @@ fn main() -> Result<(), Failure> {
     let args = Args::parse();
     let mut out = io::stdout().lock();
     match args.command {
-        Command::Run {
-            directed: Some(name),
-            ..
-        } => {
+        Command::Directed { name } => {
             let chosen = directed::named(&name).ok_or(Failure::NoDirected(name))?;
             writeln!(out, "target: {}\n{:#?}", chosen.target, chosen.scenario)?;
             for key in directed::run(&chosen)?.keys {
@@ -144,12 +136,8 @@ fn main() -> Result<(), Failure> {
             }
             Ok(())
         }
-        Command::Run {
-            from,
-            count,
-            directed: None,
-        } => {
-            for seed in from..from.saturating_add(count.unwrap_or_default()) {
+        Command::Run { from, count } => {
+            for seed in from..from.saturating_add(count) {
                 report(&mut out, run::twice(&Scenario::from_seed(seed))?)?;
             }
             Ok(())

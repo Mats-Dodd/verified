@@ -51,9 +51,10 @@ sweep from="0" count="1000":
 coverage from="0" count="200":
     cargo run --quiet --profile sim-release -p verified-sim -- coverage --from {{from}} --count {{count}}
 
-# Each of `count` seeds from `from` traced in two fresh processes.
-processes from count:
-    cargo run --quiet --profile sim-release -p verified-sim -- processes --from {{from}} --count {{count}}
+# The fixed seeds, or `--from N --count C`, each traced in two fresh
+# processes.
+processes *args:
+    cargo run --quiet --profile sim-release -p verified-sim -- processes {{args}}
 
 # The shipped binary never links the simulation shims (the `sim` features of
 # verified-server and verified-tui, and so turmoil). Builds the root's
