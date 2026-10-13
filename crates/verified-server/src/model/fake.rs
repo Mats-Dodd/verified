@@ -43,7 +43,7 @@ use verified_wire::sse::SseEvent;
 use super::anthropic::{Progress, StreamParser, classify_status, request_json};
 use super::{Model, ModelError, ModelRequest};
 use crate::payload::ModelPart;
-use crate::seam::{Clock, World};
+use crate::seam::{Clock, Tasks};
 
 /// The fake's reply to one request.
 #[derive(Debug, Clone, PartialEq)]
@@ -357,7 +357,7 @@ impl Model for FakeModel {
 #[derive(Clone)]
 struct FakeHost {
     clock: Arc<dyn Clock>,
-    world: World,
+    tasks: Tasks,
 }
 
 impl fmt::Debug for FakeHost {
@@ -367,10 +367,10 @@ impl fmt::Debug for FakeHost {
 }
 
 /// The script as an HTTP host: `POST /v1/messages`, streaming SSE.
-pub fn router(clock: Arc<dyn Clock>, world: World) -> Router {
+pub fn router(clock: Arc<dyn Clock>, tasks: Tasks) -> Router {
     Router::new()
         .route("/v1/messages", post(messages))
-        .with_state(FakeHost { clock, world })
+        .with_state(FakeHost { clock, tasks })
 }
 
 async fn messages(State(host): State<FakeHost>, body: Bytes) -> Response {
@@ -384,7 +384,7 @@ async fn messages(State(host): State<FakeHost>, body: Bytes) -> Response {
         Reply::Events { events, pace } => {
             let (sender, receiver) = mpsc::channel::<Bytes>(4);
             let clock = Arc::clone(&host.clock);
-            host.world.spawn(async move {
+            host.tasks.spawn(async move {
                 for event in events {
                     if pace.get() > 0 {
                         clock.sleep(pace).await;

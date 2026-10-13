@@ -21,7 +21,7 @@ use verified_server::log::{MemDisk, MemLogStore};
 use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
 use verified_server::model::fake;
 use verified_server::model::{Model as _, ModelError, ModelRequest};
-use verified_server::seam::{Clock, OsEntropy, SystemClock, World};
+use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{Seams, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
@@ -60,17 +60,17 @@ async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
     (listener, addr)
 }
 
-async fn start() -> (SocketAddr, World) {
+async fn start() -> (SocketAddr, Tasks) {
     start_with(ServerLimits::v0()).await
 }
 
-async fn start_with(limits: ServerLimits) -> (SocketAddr, World) {
-    let world = World::new();
+async fn start_with(limits: ServerLimits) -> (SocketAddr, Tasks) {
+    let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     let (fake_listener, fake_addr) = listener().await;
-    let fake_app = fake::router(Arc::clone(&clock), world.clone());
-    world.spawn(async move {
+    let fake_app = fake::router(Arc::clone(&clock), tasks.clone());
+    tasks.spawn(async move {
         drop(axum::serve(fake_listener, fake_app).await);
     });
     let model = AnthropicModel::new(
@@ -91,11 +91,11 @@ async fn start_with(limits: ServerLimits) -> (SocketAddr, World) {
         env: Arc::new(verified_server::env::LocalEnv::new(
             std::env::temp_dir(),
             Arc::clone(&clock),
-            world.groups().clone(),
+            tasks.groups().clone(),
         )),
         clock,
         entropy: Arc::new(OsEntropy),
-        world: world.clone(),
+        tasks: tasks.clone(),
     };
     let config = ShellConfig {
         limits: limits.clone(),
@@ -108,10 +108,10 @@ async fn start_with(limits: ServerLimits) -> (SocketAddr, World) {
         limits.log_line_bytes,
         limits.log_file_bytes,
     ));
-    world.spawn(async move {
+    tasks.spawn(async move {
         drop(daemon::serve(daemon_listener, store, seams, config).await);
     });
-    (daemon_addr, world)
+    (daemon_addr, tasks)
 }
 
 async fn call(
@@ -139,7 +139,7 @@ async fn call(
 
 #[tokio::test]
 async fn commands_and_streams_over_http() {
-    let (addr, world) = start().await;
+    let (addr, tasks) = start().await;
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let base = format!("http://{addr}");
     let limits = WireLimits::DEFAULT;
@@ -274,7 +274,7 @@ async fn commands_and_streams_over_http() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown session");
 
-    world.shutdown().cancel();
+    tasks.shutdown().cancel();
 }
 
 fn session_at(byte: u8) -> SessionId {
@@ -351,7 +351,7 @@ async fn capacity_limits_answer_typed_rejections() {
     limits.sse_keep_alive = Millis::new(20);
     // Room for a new session's first records (its epoch), not for a turn.
     limits.session_bytes = 512;
-    let (addr, world) = start_with(limits).await;
+    let (addr, tasks) = start_with(limits).await;
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let base = format!("http://{addr}");
     let wire = WireLimits::DEFAULT;
@@ -480,7 +480,7 @@ async fn capacity_limits_answer_typed_rejections() {
         StatusCode::OK,
         "a repeat of an accepted message is still exists"
     );
-    world.shutdown().cancel();
+    tasks.shutdown().cancel();
 }
 
 const fn request() -> ModelRequest {
@@ -496,7 +496,7 @@ async fn stalled_host(reply: &'static [u8]) -> SocketAddr {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let (listener, addr) = listener().await;
-    World::new().spawn(async move {
+    Tasks::new().spawn(async move {
         let mut held = Vec::new();
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut buffer = vec![0u8; 64 << 10];

@@ -37,7 +37,7 @@ use verified_wire::stream::{
 
 use crate::daemon::{CreateError, Registry};
 use crate::limits::ServerLimits;
-use crate::seam::{Clock, World};
+use crate::seam::{Clock, Tasks};
 use crate::shell::{CommandError, Seams, SessionHandle};
 
 /// What every handler shares.
@@ -45,7 +45,7 @@ use crate::shell::{CommandError, Seams, SessionHandle};
 pub struct App {
     registry: Registry,
     clock: Arc<dyn Clock>,
-    world: World,
+    tasks: Tasks,
     limits: Arc<ServerLimits>,
     /// One permit per live stream follower across sessions (`sse_followers`).
     followers: Arc<Semaphore>,
@@ -63,7 +63,7 @@ impl App {
         Self {
             registry,
             clock: seams.clock,
-            world: seams.world,
+            tasks: seams.tasks,
             limits: Arc::new(limits.clone()),
             followers: Arc::new(Semaphore::new(limits.sse_followers)),
         }
@@ -266,7 +266,7 @@ fn live(app: &App, handle: SessionHandle, from: Offset) -> Response {
         });
     };
     let (sender, receiver) = mpsc::channel(app.limits.sse_queue);
-    app.world.spawn(follow(
+    app.tasks.spawn(follow(
         handle,
         from,
         sender,
@@ -394,7 +394,7 @@ mod tests {
     use crate::limits::ServerLimits;
     use crate::log::{MemDisk, MemLogStore};
     use crate::model::fake::FakeModel;
-    use crate::seam::{Clock, OsEntropy, SystemClock, World};
+    use crate::seam::{Clock, OsEntropy, SystemClock, Tasks};
     use crate::shell::{Planted, Seams, ShellConfig};
 
     #[tokio::test]
@@ -404,7 +404,7 @@ mod tests {
             sse_keep_alive: Millis::new(10),
             ..ServerLimits::v0()
         };
-        let world = World::new();
+        let tasks = Tasks::new();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let seams = Seams {
             model: Arc::new(FakeModel::new(
@@ -414,11 +414,11 @@ mod tests {
             env: Arc::new(LocalEnv::new(
                 PathBuf::from("."),
                 Arc::clone(&clock),
-                world.groups().clone(),
+                tasks.groups().clone(),
             )),
             clock: Arc::clone(&clock),
             entropy: Arc::new(OsEntropy),
-            world: world.clone(),
+            tasks: tasks.clone(),
         };
         let config = Arc::new(ShellConfig {
             limits: limits.clone(),
@@ -464,6 +464,6 @@ mod tests {
             ended.is_ok(),
             "the follower outlived its 100 ms lifetime by 2 s"
         );
-        world.shutdown().cancel();
+        tasks.shutdown().cancel();
     }
 }

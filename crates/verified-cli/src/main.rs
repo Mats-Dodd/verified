@@ -23,7 +23,7 @@ use verified_server::daemon::{self, DaemonError, Layout};
 use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
 use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey, BuildError};
-use verified_server::seam::{Clock as _, FileLock, OsEntropy, SystemClock, World};
+use verified_server::seam::{Clock as _, FileLock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::net;
 use verified_tui::app::Start;
@@ -145,20 +145,20 @@ async fn run_daemon(project: PathBuf, model: String, api_key: ApiKey) -> Result<
         &limits,
         Arc::clone(&clock),
     )?;
-    // The world's process-group registry goes to the Env, so a daemon that
+    // The daemon's process-group registry goes to the Env, so a daemon that
     // panics kills the commands it started.
-    let world = World::new();
-    world.groups().kill_on_panic();
+    let tasks = Tasks::new();
+    tasks.groups().kill_on_panic();
     let seams = Seams {
         model: Arc::new(anthropic),
         env: Arc::new(LocalEnv::new(
             project.clone(),
             Arc::clone(&clock),
-            world.groups().clone(),
+            tasks.groups().clone(),
         )),
         clock,
         entropy: Arc::new(OsEntropy),
-        world,
+        tasks,
     };
     let listener = net::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await

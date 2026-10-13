@@ -21,7 +21,7 @@ use verified_server::log::{FileLog, Log as _};
 use verified_server::model::fake::FakeModel;
 use verified_server::payload::{Command, Parsed, ProjectPath, ToolArgs, Truncation, measure};
 use verified_server::seam::{
-    Clock, FileLock, Lock as _, LockError, OsEntropy, ProcessGroups, SystemClock, World,
+    Clock, FileLock, Lock as _, LockError, OsEntropy, ProcessGroups, SystemClock, Tasks,
     entropy_u64,
 };
 use verified_server::shell::{Seams, ShellConfig};
@@ -405,14 +405,14 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
     let layout = Layout {
         project: project.clone(),
     };
-    let world = World::new();
+    let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
         model: Arc::new(FakeModel::new(Arc::clone(&clock), 1000)),
         env: Arc::new(local(project.clone())),
         clock,
         entropy: Arc::new(OsEntropy),
-        world: world.clone(),
+        tasks: tasks.clone(),
     };
     let config = ShellConfig {
         limits: ServerLimits::v0(),
@@ -425,7 +425,7 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
         .expect("bound");
     let run_layout = layout.clone();
     let (done, mut finished) = tokio::sync::mpsc::channel(1);
-    world.spawn(async move {
+    tasks.spawn(async move {
         let result = daemon::run(listener, &run_layout, &FileLock, seams, config).await;
         drop(done.send(result).await);
     });
@@ -444,7 +444,7 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
         matches!(second, Err(LockError::Held { .. })),
         "one daemon per project: {second:?}"
     );
-    world.shutdown().cancel();
+    tasks.shutdown().cancel();
     let result = within(Duration::from_secs(5), finished.recv())
         .await
         .expect("stops on shutdown")
@@ -457,7 +457,7 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
     assert!(again.is_ok(), "the lock is released when the daemon stops");
 }
 
-/// The model of the crash test: its stream panics, in a world task.
+/// The model of the crash test: its stream panics, in a daemon task.
 #[derive(Debug)]
 struct PanickingModel;
 
@@ -465,7 +465,7 @@ struct PanickingModel;
 impl verified_server::model::Model for PanickingModel {
     #[expect(
         clippy::panic,
-        reason = "the test's point: a broken invariant inside a world task"
+        reason = "the test's point: a broken invariant inside a daemon task"
     )]
     async fn stream(
         &self,
@@ -489,7 +489,7 @@ fn panicking_daemon() {
         .build()
         .expect("a runtime");
     runtime.block_on(async {
-        let world = World::new();
+        let tasks = Tasks::new();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let limits = ServerLimits::v0();
         let seams = Seams {
@@ -497,11 +497,11 @@ fn panicking_daemon() {
             env: Arc::new(LocalEnv::new(
                 std::env::temp_dir(),
                 Arc::clone(&clock),
-                world.groups().clone(),
+                tasks.groups().clone(),
             )),
             clock,
             entropy: Arc::new(OsEntropy),
-            world,
+            tasks,
         };
         let config = ShellConfig {
             limits: limits.clone(),
@@ -555,7 +555,7 @@ fn is_child() -> bool {
     std::env::var_os(PANIC_CHILD).is_some()
 }
 
-/// Crash-only in the shipped build: a panic in a world task (here the model
+/// Crash-only in the shipped build: a panic in a daemon task (here the model
 /// task) aborts the daemon process instead of leaving a half-dead daemon
 /// serving. Runs the daemon in a child process (this test binary again).
 #[test]
@@ -583,8 +583,8 @@ fn a_panicking_task_aborts_the_daemon() {
 const GROUPS_TEST: &str = "a_panic_anywhere_kills_the_running_commands";
 
 /// The child half: a running command's process group is registered with
-/// the world, as `LocalEnv` does, the daemon's panic hook is installed, and
-/// a plain thread (no world task, so no `catch_unwind`) panics. The process
+/// the daemon's tasks, as `LocalEnv` does, the daemon's panic hook is installed, and
+/// a plain thread (no daemon task, so no `catch_unwind`) panics. The process
 /// then aborts, as `panic = "abort"` does: nothing is dropped.
 #[expect(
     clippy::disallowed_methods,
@@ -597,7 +597,7 @@ const GROUPS_TEST: &str = "a_panic_anywhere_kills_the_running_commands";
 fn panicking_thread() {
     use std::os::unix::process::CommandExt as _;
 
-    let world = World::new();
+    let tasks = Tasks::new();
     let command = std::process::Command::new("/bin/sh")
         .args(["-c", "sleep 300 & wait"])
         .process_group(0)
@@ -613,8 +613,8 @@ fn panicking_thread() {
         format!("group {group}\n").as_bytes(),
     )
     .expect("the parent reads it");
-    world.groups().insert(group);
-    world.groups().kill_on_panic();
+    tasks.groups().insert(group);
+    tasks.groups().kill_on_panic();
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panicked| {
         hook(panicked);
@@ -623,7 +623,7 @@ fn panicking_thread() {
     let panicked = std::thread::spawn(|| {
         #[expect(
             clippy::panic,
-            reason = "the test's point: a panic outside every world task"
+            reason = "the test's point: a panic outside every daemon task"
         )]
         {
             panic!("a plain thread panics on purpose");
@@ -633,7 +633,7 @@ fn panicking_thread() {
     drop(panicked);
 }
 
-/// A panic anywhere in the daemon, not only in a world task, kills every
+/// A panic anywhere in the daemon, not only in a daemon task, kills every
 /// running command's process group before the process dies: under
 /// `panic = "abort"` nothing is dropped and no `catch_unwind` runs, so the
 /// panic hook is all that is left.
@@ -775,7 +775,7 @@ async fn a_daemonized_child_cannot_hang_bash() {
 }
 
 /// The daemon stopping (the call's future dropped) or crashing (an abort,
-/// after which nothing is dropped, so the world's registry is used) kills
+/// after which nothing is dropped, so the daemon's registry is used) kills
 /// a running command's whole process group, not only its leader.
 #[tokio::test]
 async fn a_stopping_daemon_kills_whole_process_groups() {

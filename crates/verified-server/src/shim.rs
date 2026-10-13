@@ -505,9 +505,9 @@ pub mod time {
     }
 }
 
-/// What a panicking world task does to the daemon (crash-only, Law 8).
+/// What a panicking daemon task does to the daemon (crash-only, Law 8).
 pub mod crash {
-    /// After a world task panicked and the world crashed. The panic hook has
+    /// After a daemon task panicked and its [`crate::seam::Tasks`] crashed. The panic hook has
     /// already printed the panic and, where the daemon installed
     /// [`crate::seam::ProcessGroups::kill_on_panic`], killed the running
     /// commands.
@@ -520,7 +520,7 @@ pub mod crash {
     }
 
     /// Sim: a process abort would end the whole test binary (every seed),
-    /// so the daemon's host fails instead: [`crate::seam::World::crashed`]
+    /// so the daemon's host fails instead: [`crate::seam::Tasks::crashed`]
     /// has fired, every task stops at its next safe point and
     /// `daemon::serve` returns `DaemonError::Panicked`, which turmoil
     /// reports as the host's error and the simulation treats as a failed

@@ -62,7 +62,7 @@ pub enum DaemonError {
     },
     #[error("serving HTTP: {0}")]
     Serve(#[source] io::Error),
-    /// A world task panicked (under the `sim` feature; the shipped daemon
+    /// A daemon task panicked (under the `sim` feature; the shipped daemon
     /// aborts instead). Crash-only: recovery on restart is the way back.
     #[error("a daemon task panicked")]
     Panicked,
@@ -159,7 +159,7 @@ impl RegistryTask {
         )
         .map_err(|source| DaemonError::Shell { session, source })?;
         let fatal = self.fatal.clone();
-        self.seams.world.spawn(async move {
+        self.seams.tasks.spawn(async move {
             if let Err(source) = running.await {
                 drop(fatal.try_send(DaemonError::Shell { session, source }));
             }
@@ -189,7 +189,7 @@ impl RegistryTask {
     }
 
     async fn run(mut self, mut inbox: mpsc::Receiver<RegistryInput>) {
-        let shutdown = self.seams.world.shutdown().clone();
+        let shutdown = self.seams.tasks.shutdown().clone();
         loop {
             let input = tokio::select! {
                 biased;
@@ -234,12 +234,12 @@ pub async fn boot(
         let (log, records) = store.open(session).await?;
         task.spawn_session(session, log, records)?;
     }
-    seams.world.spawn(task.run(receiver));
+    seams.tasks.spawn(task.run(receiver));
     Ok(Registry { inbox })
 }
 
 /// Serves the daemon on `listener` with sessions from `store` until the
-/// world shuts down or a session fails.
+/// daemon shuts down or a session fails.
 ///
 /// # Errors
 /// Recovery failed, a session failed (crash-only), or serving failed.
@@ -257,7 +257,7 @@ where
     let (fatal, mut failed) = mpsc::channel(1);
     let registry = boot(store, seams.clone(), Arc::clone(&config), fatal).await?;
     let app = routes::router(routes::App::new(registry, seams.clone(), &config.limits));
-    let stop = seams.world.shutdown().clone();
+    let stop = seams.tasks.shutdown().clone();
     let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
         stop.cancelled().await;
     });
@@ -265,12 +265,12 @@ where
     // the server is the crash) and recovery on restart is the way back. The
     // crash is checked first: it also fires `shutdown`, which ends `serving`
     // gracefully, and must not read as a clean stop.
-    let crashed = seams.world.crashed().clone();
+    let crashed = seams.tasks.crashed().clone();
     tokio::select! {
         biased;
         () = crashed.cancelled() => Err(DaemonError::Panicked),
         error = failed.recv() => {
-            seams.world.shutdown().cancel();
+            seams.tasks.shutdown().cancel();
             error.map_or(Ok(()), Err)
         }
         served = serving => match served {

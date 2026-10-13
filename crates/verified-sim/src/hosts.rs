@@ -19,7 +19,7 @@ use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
 use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
 use verified_server::model::fake;
-use verified_server::seam::{Clock, NoLock, World};
+use verified_server::seam::{Clock, NoLock, Tasks};
 use verified_server::shell::{Planted, Seams, ShellConfig};
 use verified_server::shim::time::SimClock;
 use verified_server::shim::{fs, net};
@@ -73,7 +73,7 @@ pub fn anthropic() -> impl Fn() -> Software {
         Box::pin(async {
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let listener = net::bind(any_addr(MODEL_PORT)).await?;
-            axum::serve(listener, fake::router(clock, World::new())).await?;
+            axum::serve(listener, fake::router(clock, Tasks::new())).await?;
             Ok(())
         })
     }
@@ -128,12 +128,12 @@ pub fn daemon(
                 &limits,
                 Arc::clone(&clock),
             )?;
-            let world = World::new();
+            let tasks = Tasks::new();
             let env = SimEnv::new(
                 LocalEnv::new(
                     PathBuf::from(PROJECT),
                     Arc::clone(&clock),
-                    world.groups().clone(),
+                    tasks.groups().clone(),
                 ),
                 Arc::clone(&clock),
                 ledger.clone(),
@@ -143,7 +143,7 @@ pub fn daemon(
                 env: Arc::new(env),
                 clock,
                 entropy: Arc::new(DaemonEntropy::new(seed ^ u64::from(boot))),
-                world,
+                tasks,
             };
             let listener = net::bind(any_addr(PORT)).await?;
             let layout = Layout {

@@ -22,7 +22,7 @@ use verified_server::log::{MemDisk, MemLogStore};
 use verified_server::model::fake::FakeModel;
 use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
-use verified_server::seam::{Clock, OsEntropy, SystemClock, World};
+use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{CommandError, Seams, SessionHandle, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
@@ -183,7 +183,7 @@ impl Env for MemEnv {
 
 struct Daemon {
     registry: Registry,
-    world: World,
+    tasks: Tasks,
     _fatal: mpsc::Receiver<DaemonError>,
 }
 
@@ -202,7 +202,7 @@ async fn boot(disk: &MemDisk, env: Arc<dyn Env>) -> Daemon {
 }
 
 async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> Daemon {
-    let world = World::new();
+    let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
         model: Arc::new(FakeModel::new(
@@ -212,7 +212,7 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
         env,
         clock,
         entropy: Arc::new(OsEntropy),
-        world: world.clone(),
+        tasks: tasks.clone(),
     };
     let config = Arc::new(ShellConfig {
         limits: limits.clone(),
@@ -231,7 +231,7 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
         .expect("the daemon boots");
     Daemon {
         registry,
-        world,
+        tasks,
         _fatal: failed,
     }
 }
@@ -406,7 +406,7 @@ async fn text_turn_streams_and_repeats_are_exists() {
     until(&handle, ended(second.turn_id)).await;
     let transcript = fold(&handle).await;
     assert_eq!(reply_text(&transcript, 1), "Echo: again", "second turn");
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -455,7 +455,7 @@ async fn safe_read_runs_without_asking() {
         vec!["approved", "dispatched", "result"],
         "approve before dispatch before result"
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -512,7 +512,7 @@ async fn edit_waits_for_approval_then_applies_once() {
         "{}",
         reply_text(&transcript, 0)
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -547,7 +547,7 @@ async fn denied_bash_never_runs() {
         "the model heard the refusal: {}",
         reply_text(&transcript, 0)
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -575,7 +575,7 @@ async fn approved_bash_sees_its_call_id() {
         "ran once, with VERIFIED_CALL_ID"
     );
     fold(&handle).await;
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -629,7 +629,7 @@ async fn cancel_stops_a_streaming_turn() {
         ),
         "a cancel names its turn; another turn is not running: {nothing:?}"
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -674,7 +674,7 @@ async fn overloaded_retries_then_fails() {
         .await
         .expect("accepted");
     until(&handle, ended(next.turn_id)).await;
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -700,7 +700,7 @@ async fn parallel_reads_each_get_one_result() {
         .count();
     assert_eq!(results, 2, "both reads ran and resolved");
     fold(&handle).await;
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -730,7 +730,7 @@ async fn restart_mid_bash_resolves_unknown_and_never_reruns() {
         tokio::task::yield_now().await;
     }
     assert_eq!(env.commands().len(), 1, "bash started");
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
 
     let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
@@ -766,7 +766,7 @@ async fn restart_mid_bash_resolves_unknown_and_never_reruns() {
         "the model heard: {}",
         reply_text(&transcript, 0)
     );
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
 }
 
 #[tokio::test]
@@ -780,7 +780,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
         .expect("accepted");
     until(&handle, ended(reply.turn_id)).await;
     let committed = records(&handle).await;
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
 
     // A torn group commit: half a line after the last whole record.
@@ -800,7 +800,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
         Some(committed.as_slice()),
         "every acknowledged record survives"
     );
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
     drop(handle);
 
     // Damage inside an acknowledged group, followed by later groups.
@@ -817,7 +817,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
         env: Arc::new(MemEnv::default()),
         clock,
         entropy: Arc::new(OsEntropy),
-        world: World::new(),
+        tasks: Tasks::new(),
     };
     let config = Arc::new(ShellConfig {
         limits: limits(),
@@ -884,7 +884,7 @@ async fn a_crash_during_an_edit_leaves_unknown_and_never_reruns() {
     })
     .await;
     assert!(dispatched, "the edit was dispatched");
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
 
     let env = MemEnv::with_file("lib.rs", "fn mian() {}");
@@ -915,7 +915,7 @@ async fn a_crash_during_an_edit_leaves_unknown_and_never_reruns() {
         "the model heard: {}",
         reply_text(&transcript, 0)
     );
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
 }
 
 /// An approved edit of the longest path the tools accept runs without
@@ -960,7 +960,7 @@ async fn the_longest_path_edits_without_a_crash() {
         "{}",
         reply_text(&transcript, 1)
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 /// Cancelling a turn while its approved `bash` runs stops the command, and
@@ -1015,7 +1015,7 @@ async fn cancelling_bash_reports_the_honest_message() {
     );
     assert_eq!(env.commands().len(), 1, "ran once");
     fold(&handle).await;
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
 }
 
 /// Bounds small enough to fill a log in a test.
@@ -1104,7 +1104,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
         u64::try_from(bytes.len()).expect("small") <= small.log_file_bytes,
         "the file never passes its bound"
     );
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
 
     let second = boot_with(&disk, Arc::new(MemEnv::default()), small.clone()).await;
@@ -1136,7 +1136,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
         "still within its bound"
     );
     fold(&handle).await;
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
 }
 
 /// Both the registry and a session see shutdown before a command already
@@ -1151,7 +1151,7 @@ async fn shutdown_wins_over_a_queued_command() {
         UnixMillis::new(1_700_000_000_000).expect("a time"),
         &[8; 10],
     );
-    daemon.world.shutdown().cancel();
+    daemon.tasks.shutdown().cancel();
     // Both commands are queued before either task runs again.
     let (created, reply) = tokio::join!(
         daemon.registry.create(other),
@@ -1210,7 +1210,7 @@ async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
         eventually(|| outputs() > before).await,
         "the slow reply streams"
     );
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
 
     // Room for a few short records, not for the rest of the turn.
@@ -1244,7 +1244,7 @@ async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
         u64::try_from(length()).expect("small") <= tight.log_file_bytes,
         "within its bound"
     );
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
 }
 
 /// A cancel whose `CancelRequested` is the first record a full log refuses
@@ -1276,7 +1276,7 @@ async fn a_cancel_that_fills_the_log_is_answered_as_a_cancel() {
         .await
         .expect("accepted");
     until(&handle, |chunks| approval_requested(chunks).is_some()).await;
-    first.world.shutdown().cancel();
+    first.tasks.shutdown().cancel();
     drop(handle);
     // A restart appends one EpochBumped; the next is as long.
     let before = length();
@@ -1288,7 +1288,7 @@ async fn a_cancel_that_fills_the_log_is_answered_as_a_cancel() {
         .expect("it boots");
     drop(records(&handle).await);
     let bumped = length().saturating_sub(before);
-    second.world.shutdown().cancel();
+    second.tasks.shutdown().cancel();
     drop(handle);
     // Room past the reserve for the next restart's EpochBumped, no more.
     let mut tight = small_limits();
@@ -1318,7 +1318,7 @@ async fn a_cancel_that_fills_the_log_is_answered_as_a_cancel() {
         u64::try_from(length()).expect("small") <= tight.log_file_bytes,
         "within its bound"
     );
-    third.world.shutdown().cancel();
+    third.tasks.shutdown().cancel();
 }
 
 /// The first refusal of a new message within two seconds.

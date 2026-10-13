@@ -20,7 +20,7 @@ use verified_server::limits::ServerLimits;
 use verified_server::model::fake::FakeModel;
 use verified_server::model::{Model, ModelError, ModelRequest};
 use verified_server::payload::ModelPart;
-use verified_server::seam::{Clock, NoLock, OsEntropy, World};
+use verified_server::seam::{Clock, NoLock, OsEntropy, Tasks};
 use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::time::SimClock;
 use verified_server::shim::{Barrier, fs, net};
@@ -85,18 +85,18 @@ fn daemon_host_of(
                 fs::write_synced(&path, &vec![b'x'; *size]).await?;
             }
             fs::sync_dir("/".as_ref()).await?;
-            let world = World::new();
+            let tasks = Tasks::new();
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let seams = Seams {
                 model: model(Arc::clone(&clock)),
                 env: Arc::new(LocalEnv::new(
                     "/project".into(),
                     Arc::clone(&clock),
-                    world.groups().clone(),
+                    tasks.groups().clone(),
                 )),
                 clock,
                 entropy: Arc::new(OsEntropy),
-                world,
+                tasks,
             };
             let config = ShellConfig {
                 limits,
@@ -345,7 +345,7 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
     sim.run()
 }
 
-/// A model whose stream panics: a broken invariant inside a world task.
+/// A model whose stream panics: a broken invariant inside a daemon task.
 #[derive(Debug)]
 struct PanickingModel;
 
@@ -353,7 +353,7 @@ struct PanickingModel;
 impl Model for PanickingModel {
     #[expect(
         clippy::panic,
-        reason = "the test's point: a broken invariant inside a world task"
+        reason = "the test's point: a broken invariant inside a daemon task"
     )]
     async fn stream(
         &self,
@@ -365,7 +365,7 @@ impl Model for PanickingModel {
     }
 }
 
-/// Crash-only under the simulation: a panic in a world task cannot abort
+/// Crash-only under the simulation: a panic in a daemon task cannot abort
 /// the test process (every seed shares it), so it fails the daemon's host
 /// instead. The run ends with that error rather than hanging with a
 /// half-dead daemon still serving.

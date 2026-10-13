@@ -9,7 +9,7 @@
 //!    for the fsync;
 //! 3. `apply` each record (a refusal is a defect: crash) and project it;
 //! 4. answer the command;
-//! 5. start the decision's effects through the [`World`], each of which
+//! 5. start the decision's effects through the [`Tasks`], each of which
 //!    reports back into the same inbox.
 //!
 //! Model parts are batched before they reach the core (group commit:
@@ -69,7 +69,7 @@ use crate::log::{Log, LogError};
 use crate::model::Model;
 use crate::payload::{ModelPart, Parsed, ToolOutput, Truncation, measure, proposal};
 use crate::projection::Projector;
-use crate::seam::{Clock, Entropy, World, id_entropy};
+use crate::seam::{Clock, Entropy, Tasks, id_entropy};
 use crate::shim::{Barrier, barrier};
 use crate::tool;
 
@@ -80,7 +80,7 @@ pub struct Seams {
     pub env: Arc<dyn Env>,
     pub clock: Arc<dyn Clock>,
     pub entropy: Arc<dyn Entropy>,
-    pub world: World,
+    pub tasks: Tasks,
 }
 
 /// Configuration every session shares: data from main.
@@ -414,7 +414,7 @@ impl fmt::Debug for Session {
     }
 }
 
-/// The task that runs a session; spawn it through the world.
+/// The task that runs a session; spawn it through [`Tasks`].
 pub type Running = Pin<Box<dyn Future<Output = Result<(), ShellError>> + Send>>;
 
 impl Session {
@@ -480,7 +480,7 @@ impl Session {
         if let Persisted::Done(_, effects) = resumed {
             self.start_effects(effects).await;
         }
-        let shutdown = self.seams.world.shutdown().clone();
+        let shutdown = self.seams.tasks.shutdown().clone();
         loop {
             let input = tokio::select! {
                 biased;
@@ -900,7 +900,7 @@ impl Session {
                     id,
                     cancel,
                 };
-                self.seams.world.spawn(task.run(request));
+                self.seams.tasks.spawn(task.run(request));
             }
             Effect::CancelModel { id } | Effect::CancelTool { id } => {
                 if let Some(cancel) = self.cancels.get(&id) {
@@ -917,7 +917,7 @@ impl Session {
                 barrier(Barrier::Dispatched(id)).await;
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
-                self.seams.world.spawn(run_tool(
+                self.seams.tasks.spawn(run_tool(
                     Arc::clone(&self.seams.env),
                     self.id,
                     call,
@@ -930,7 +930,7 @@ impl Session {
             Effect::Sleep { id, delay } => {
                 let clock = Arc::clone(&self.seams.clock);
                 let inbox = self.inbox.clone();
-                self.seams.world.spawn(async move {
+                self.seams.tasks.spawn(async move {
                     clock.sleep(delay).await;
                     report(&inbox, Event::Woke { id }).await;
                 });

@@ -418,7 +418,8 @@ impl StreamParser {
 ///
 /// Each call dials a fresh connection and drives it inside the call's own
 /// task (`hyper::client::conn::http1`), so the client starts no task of its
-/// own: every task the daemon runs goes through the world. Dialing, waiting
+/// own: every task the daemon runs goes through
+/// [`crate::seam::Tasks`]. Dialing, waiting
 /// for the response head and every gap between body frames are bounded by
 /// [`ServerLimits`] timeouts on the Clock seam; running past one is a
 /// [`ModelError::Network`], which the core retries on its schedule.

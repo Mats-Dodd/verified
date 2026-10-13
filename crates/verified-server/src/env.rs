@@ -322,7 +322,8 @@ pub struct LocalEnv {
 
 impl LocalEnv {
     /// The project at `root`; commands it starts are registered in `groups`
-    /// (the world's, so a crashing daemon kills them).
+    /// (those of the daemon's [`crate::seam::Tasks`], so a crashing daemon
+    /// kills them).
     #[must_use]
     pub const fn new(root: PathBuf, clock: Arc<dyn Clock>, groups: ProcessGroups) -> Self {
         Self {
@@ -352,7 +353,7 @@ fn kill_group(group: rustix::process::Pid) {
 /// A running command's process group: the child that leads it, and whether
 /// it is reaped.
 ///
-/// Registered in the world's [`ProcessGroups`] while its leader is not yet
+/// Registered in the daemon's [`ProcessGroups`] while its leader is not yet
 /// reaped. Dropped before that (the daemon stopping with the command still
 /// running), it kills the whole group: `kill_on_drop` alone signals only
 /// the leader. Once the leader is reaped the group id may be reused by an

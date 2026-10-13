@@ -1,5 +1,5 @@
 //! Seams for time, randomness and the daemon lock, with their real impls,
-//! and the world layer: the only place the daemon starts a task.
+//! and [`Tasks`]: the only place the daemon starts a task.
 //!
 //! The Model, Log and Env seams live with the code that uses them
 //! ([`crate::model`], [`crate::log`], [`crate::env`]).
@@ -179,12 +179,13 @@ impl Lock for NoLock {
     }
 }
 
-/// The world layer: the only place the daemon starts tasks. Every task
-/// belongs to one daemon; `shutdown` tells them to stop at a safe point.
+/// The daemon's tasks: the only place the daemon starts one, with the
+/// process groups of the commands they run. Every task belongs to one
+/// daemon; `shutdown` tells them to stop at a safe point.
 ///
 /// Crash-only (Law 8): a task that panics takes the daemon down, and
 /// recovery on restart is the way back. Every task is supervised: a panic
-/// is caught where the task is polled, fires [`World::crashed`], and is
+/// is caught where the task is polled, fires [`Tasks::crashed`], and is
 /// handed to the crash shim ([`crate::shim::crash`]). In the shipped daemon
 /// that aborts the process on the spot, so no other task runs another step
 /// (no log append, no tool) after a broken invariant. Under the `sim`
@@ -194,7 +195,7 @@ impl Lock for NoLock {
 /// the turmoil host's software fails, and the simulation reports the run as
 /// failed.
 #[derive(Debug, Clone, Default)]
-pub struct World {
+pub struct Tasks {
     shutdown: CancellationToken,
     crashed: CancellationToken,
     groups: ProcessGroups,
@@ -216,7 +217,7 @@ pub struct ProcessGroups {
         clippy::disallowed_types,
         reason = "writers: the Env seam's exec, as a group starts and once it is reaped or dropped; \
                   reader: the panic hook, before the process aborts; invariant: holds only \
-                  groups whose leader is not yet reaped (so no id is reused); dropped with the world"
+                  groups whose leader is not yet reaped (so no id is reused); dropped with the Tasks"
     )]
     live: Arc<std::sync::Mutex<BTreeSet<i32>>>,
 }
@@ -295,7 +296,7 @@ impl ProcessGroups {
     }
 }
 
-impl World {
+impl Tasks {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -303,10 +304,10 @@ impl World {
 
     /// Runs `task` concurrently. The task owns its own completion: it reports
     /// through a channel and is never cancelled by dropping it. A panic in
-    /// it crashes the daemon (see [`World`]).
+    /// it crashes the daemon (see [`Tasks`]).
     #[expect(
         clippy::disallowed_methods,
-        reason = "the world layer is the one place the daemon starts a task; each is supervised"
+        reason = "Tasks is the one place the daemon starts a task; each is supervised"
     )]
     pub fn spawn<F>(&self, task: F)
     where
@@ -314,7 +315,7 @@ impl World {
     {
         let supervised = Supervised {
             task: Box::pin(task),
-            world: self.clone(),
+            tasks: self.clone(),
         };
         drop(tokio::spawn(supervised));
     }
@@ -346,11 +347,11 @@ impl World {
     }
 }
 
-/// A task under the world's supervision: a panic while polling it is the
+/// A task under its daemon's supervision: a panic while polling it is the
 /// daemon's crash, never a silently finished task.
 struct Supervised {
     task: Pin<Box<dyn Future<Output = ()> + Send>>,
-    world: World,
+    tasks: Tasks,
 }
 
 impl Future for Supervised {
@@ -364,7 +365,7 @@ impl Future for Supervised {
         match panic::catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(cx))) {
             Ok(poll) => poll,
             Err(_payload) => {
-                this.world.crash();
+                this.tasks.crash();
                 crate::shim::crash::task_panicked();
                 Poll::Ready(())
             }
