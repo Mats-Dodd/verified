@@ -272,10 +272,12 @@ pub trait Env: Send + Sync + fmt::Debug {
     ) -> Result<Vec<DirEntry>, EnvError>;
 
     /// Replaces the contents of the edit's file with `contents`, atomically:
-    /// written to a sibling named by [`EditGrant::staged`], synced, renamed
-    /// over the file, and the directory synced. An error leaves the file as
-    /// it was; once the rename is done the file has changed, and a failed
-    /// directory sync is [`Written::Unsynced`], not an error.
+    /// written to a sibling named by [`EditGrant::staged`], synced, given the
+    /// file's mode, renamed over the file, and the directory synced. An
+    /// error leaves the file as it was; once the rename is done the file has
+    /// changed, and a failed directory sync is [`Written::Unsynced`], not an
+    /// error. The file is a new one: its hard links and ownership are not
+    /// kept.
     ///
     /// # Errors
     /// IO before the rename.
@@ -515,7 +517,10 @@ impl Env for LocalEnv {
         staged_name.push(edit.staged().as_str());
         let staged = dir.join(staged_name);
         let written = match fs::write_synced(&staged, contents).await {
-            Ok(()) => fs::rename(&staged, &target).await,
+            Ok(()) => match fs::copy_mode(&target, &staged).await {
+                Ok(()) => fs::rename(&staged, &target).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         if let Err(error) = written {

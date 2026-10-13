@@ -353,6 +353,28 @@ pub mod fs {
         file.sync_all().await
     }
 
+    /// Gives `to` the permissions of `from`. A no-op under `sim`, so the
+    /// simulation's schedule takes no extra IO step.
+    ///
+    /// # Errors
+    /// Any OS error.
+    #[cfg_attr(
+        feature = "sim",
+        expect(clippy::unused_async, reason = "async for the real build's IO")
+    )]
+    pub async fn copy_mode(from: &Path, to: &Path) -> io::Result<()> {
+        #[cfg(not(feature = "sim"))]
+        {
+            let permissions = backend::metadata(from).await?.permissions();
+            backend::set_permissions(to, permissions).await
+        }
+        #[cfg(feature = "sim")]
+        {
+            let _: (&Path, &Path) = (from, to);
+            Ok(())
+        }
+    }
+
     /// # Errors
     /// Any OS error.
     pub async fn rename(from: &Path, to: &Path) -> io::Result<()> {

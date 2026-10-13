@@ -285,6 +285,33 @@ async fn timeout_kills_and_output_is_bounded() {
     assert!(output.text.len() < 1200, "bounded: {}", output.text.len());
 }
 
+/// An edit replaces the file's contents, not its mode: an executable
+/// script stays executable.
+#[tokio::test]
+async fn an_edit_keeps_the_mode() {
+    let root = scratch("mode").await;
+    let file = root.join("run.sh");
+    fs::write_synced(&file, b"echo hi\n").await.expect("a file");
+    rustix::fs::chmod(&file, rustix::fs::Mode::from_raw_mode(0o755)).expect("chmod");
+    let env = local(root.clone());
+    let call = approved(ToolArgs::Edit {
+        path: ProjectPath::parse("run.sh").expect("a path"),
+        old: "hi".to_owned(),
+        new: "yo".to_owned(),
+    });
+    let (exit, output) = tool::run(
+        &env,
+        session(),
+        &call,
+        &CancellationToken::new(),
+        &ServerLimits::v0(),
+    )
+    .await;
+    assert_eq!(exit, Exit::Ok, "{}", output.text);
+    let mode = rustix::fs::stat(&file).expect("stat").st_mode & 0o777;
+    assert_eq!(mode, 0o755, "the mode is now {mode:o}");
+}
+
 #[tokio::test]
 async fn edit_is_compare_and_swap() {
     let root = scratch("edit").await;
