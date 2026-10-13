@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use async_trait::async_trait;
+use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use verified_domain::id::{IdEntropy, MessageId, UnixMillis};
@@ -640,4 +641,55 @@ async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
         "no gap"
     );
     assert_eq!(received, whole, "per offset, what the daemon served");
+}
+
+/// A daemon that never answers a dial.
+#[derive(Debug)]
+struct Unreachable;
+
+#[async_trait]
+impl Dialer for Unreachable {
+    fn authority(&self) -> &'static str {
+        "daemon:7777"
+    }
+
+    async fn dial(&self) -> io::Result<Box<dyn Stream>> {
+        std::future::pending().await
+    }
+}
+
+/// Ctrl-R held down while the daemon never answers: each press only
+/// restarts what has stopped, so the effects in flight stay bounded and the
+/// client quits cleanly.
+#[tokio::test]
+async fn holding_ctrl_r_while_the_daemon_is_silent_starts_nothing_new() {
+    for open in [false, true] {
+        let (keyboard, input) = scripted(16);
+        let mut entropy = Counting::default();
+        let session = new_session(&FixedClock, &mut entropy);
+        let seams = Seams {
+            input: Box::new(input),
+            dialer: Arc::new(Unreachable),
+            clock: Arc::new(FixedClock),
+            entropy: Box::new(entropy),
+        };
+        for _ in 0..7u8 {
+            keyboard
+                .try_send(Keyboard::key(KeyCode::Char('r'), KeyModifiers::CONTROL))
+                .expect("room for the key");
+        }
+        keyboard
+            .try_send(Keyboard::quit())
+            .expect("room for the key");
+        let start = if open {
+            Start::Open(session)
+        } else {
+            Start::New(session)
+        };
+        let mut screen = TestScreen::new(80, 12);
+        let app = verified_tui::run(start, Limits::DEFAULT, seams, &mut screen, &mut |_| {})
+            .await
+            .expect("the client quits");
+        assert_eq!(app.session(), session, "{start:?}");
+    }
 }

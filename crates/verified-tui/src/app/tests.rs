@@ -348,6 +348,13 @@ fn the_stream_drives_the_conversation() {
 fn updates_from_a_replaced_follower_are_dropped() {
     let mut app = opened();
     let stale = app.follow;
+    let _cmd = stream(
+        &mut app,
+        StreamUpdate::Disconnected {
+            error: ClientError::ClosedEarly,
+            retry: None,
+        },
+    );
     let _cmd = app.update(Msg::Reconnect);
     let _cmd = app.update(Msg::Feedback(Feedback::Stream {
         follow: stale,

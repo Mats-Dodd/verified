@@ -74,14 +74,15 @@ impl From<Feedback> for Msg {
     }
 }
 
-/// Whether the daemon has the session yet.
+/// Whether the daemon has the session yet, and if not, whether creating it
+/// is on its way or waiting for a retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    Creating,
+    Creating(Delivery),
     Ready,
 }
 
-/// Whether the message in flight is on its way or waiting for a retry.
+/// Whether a command in flight is on its way or waiting for a retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Sending,
@@ -200,8 +201,8 @@ impl App {
 
     /// The daemon has not acknowledged the session yet.
     #[must_use]
-    pub fn creating(&self) -> bool {
-        self.phase == Phase::Creating
+    pub const fn creating(&self) -> bool {
+        matches!(self.phase, Phase::Creating(_))
     }
 
     /// The message in flight did not reach the daemon; Enter resends it with
@@ -242,7 +243,7 @@ impl App {
     }
 
     fn activity(&self) -> Activity {
-        if self.phase == Phase::Creating {
+        if self.creating() {
             Activity::CreatingSession
         } else if self
             .pending
@@ -257,7 +258,8 @@ impl App {
         }
     }
 
-    const fn create(&self) -> Cmd {
+    const fn create(&mut self) -> Cmd {
+        self.phase = Phase::Creating(Delivery::Sending);
         Cmd::Send(Command::CreateSession(CreateSession {
             session_id: self.session,
         }))
@@ -312,8 +314,8 @@ impl App {
         if draft.is_empty() {
             return Cmd::None;
         }
-        if self.phase == Phase::Creating {
-            self.notice = Some("the session is still being created (^r retries)".to_owned());
+        if self.creating() {
+            self.notice = Some("the session is still being created".to_owned());
             return Cmd::None;
         }
         if self.transcript.running().is_some() {
@@ -371,9 +373,11 @@ impl App {
         })
     }
 
+    /// Restarts what has stopped; anything still on its way is left alone,
+    /// so holding the key starts nothing new.
     fn reconnect(&mut self) -> Cmd {
         match (self.phase, &self.connection) {
-            (Phase::Creating, _) => {
+            (Phase::Creating(Delivery::Failed), _) => {
                 self.notice = None;
                 self.create()
             }
@@ -385,14 +389,11 @@ impl App {
                 self.freshness = Freshness::Behind;
                 self.refollow()
             }
-            (
-                Phase::Ready,
-                Connection::Idle
-                | Connection::Connecting
-                | Connection::Live
-                | Connection::Retrying(_)
-                | Connection::Down(_),
-            ) => self.refollow(),
+            (Phase::Ready, Connection::Idle | Connection::Down(_)) => self.refollow(),
+            (Phase::Creating(Delivery::Sending), _)
+            | (Phase::Ready, Connection::Connecting | Connection::Live | Connection::Retrying(_)) => {
+                Cmd::None
+            }
         }
     }
 
@@ -413,7 +414,7 @@ impl App {
     fn answered(&mut self, answer: Answer) -> Cmd {
         match answer {
             Answer::SessionCreated { session, result } => {
-                if session != self.session || self.phase == Phase::Ready {
+                if session != self.session || self.phase != Phase::Creating(Delivery::Sending) {
                     return Cmd::None;
                 }
                 match result {
@@ -422,6 +423,7 @@ impl App {
                         self.refollow()
                     }
                     Err(error) => {
+                        self.phase = Phase::Creating(Delivery::Failed);
                         self.notice = Some(format!(
                             "cannot create the session: {} (^r retries)",
                             explain(&error)
@@ -621,7 +623,7 @@ impl Model for App {
 
     fn init(flags: Flags) -> (Self, Cmd) {
         let (session, phase) = match flags.start {
-            Start::New(session) => (session, Phase::Creating),
+            Start::New(session) => (session, Phase::Creating(Delivery::Sending)),
             Start::Open(session) => (session, Phase::Ready),
         };
         let mut app = Self {
@@ -644,7 +646,7 @@ impl Model for App {
             viewport: Viewport::default(),
         };
         let cmd = match phase {
-            Phase::Creating => app.create(),
+            Phase::Creating(_) => app.create(),
             Phase::Ready => app.refollow(),
         };
         (app, cmd)
