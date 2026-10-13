@@ -213,8 +213,8 @@ impl RegistryTask {
 /// Recovers every session in `store` and starts the registry.
 ///
 /// # Errors
-/// Limits under which some record would not fit the log, or a log that
-/// does not open or replay.
+/// Limits under which some record would not fit the log, more session
+/// logs than the store holds, or a log that does not open or replay.
 pub async fn boot(
     store: Arc<dyn LogStore>,
     seams: Seams,
@@ -230,15 +230,7 @@ pub async fn boot(
         config,
         fatal,
     };
-    let sessions = store.list().await?;
-    if sessions.len() > task.config.limits.sessions {
-        return Err(DaemonError::Log(LogError::TooLarge {
-            path: "sessions".to_owned(),
-            length: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
-            limit: u64::try_from(task.config.limits.sessions).unwrap_or(u64::MAX),
-        }));
-    }
-    for session in sessions {
+    for session in store.list().await? {
         let (log, records) = store.open(session).await?;
         task.spawn_session(session, log, records)?;
     }

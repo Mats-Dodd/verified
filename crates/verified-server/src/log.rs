@@ -599,7 +599,8 @@ pub trait LogStore: Send + Sync + fmt::Debug {
     /// Every session with a log.
     ///
     /// # Errors
-    /// IO errors, or a log name that is not a session id.
+    /// IO errors, a log name that is not a session id, or more logs than
+    /// the store's bound.
     async fn list(&self) -> Result<Vec<SessionId>, LogError>;
 
     /// Creates `session`'s empty log durably.
@@ -659,6 +660,15 @@ impl LogStore for FileLogStore {
                 path: self.dir.display().to_string(),
                 name: name.clone(),
             })?;
+            if sessions.len() >= self.max_sessions {
+                return Err(LogError::Io {
+                    path: self.dir.display().to_string(),
+                    source: std::io::Error::other(format!(
+                        "more than {} session logs",
+                        self.max_sessions
+                    )),
+                });
+            }
             sessions.push(session);
         }
         Ok(sessions)
