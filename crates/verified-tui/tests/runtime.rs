@@ -2,6 +2,11 @@
 //! daemon over in-memory pipes: create the session, catch up on the stream,
 //! reconnect from the last offset after the daemon closes it, send a message
 //! with a stamp-minted id, and quit.
+#![expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test harness code, not the code under test"
+)]
 
 use std::io;
 use std::sync::Arc;
@@ -26,10 +31,6 @@ use verified_wire::stream::{Control, Freshness, Offset, StreamEvent};
 
 /// Runs a test's in-memory server on the test's runtime: test scaffolding,
 /// not a task of the code under test.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the test's own fake server; the TUI under test starts no task itself"
-)]
 fn serve_in_background<F>(server: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -65,10 +66,6 @@ impl Clock for FixedClock {
 /// Entropy `[n; 10]` for the n-th draw, counting from one.
 #[derive(Debug, Default)]
 struct Counting {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test-only draw counter: the Entropy seam takes &self; the runtime is its one writer"
-    )]
     draws: std::sync::atomic::AtomicU8,
 }
 
@@ -308,10 +305,6 @@ async fn creates_catches_up_reconnects_sends_and_quits() {
 /// Refuses the first `refusals` dials, then serves like [`ScriptedDaemon`].
 #[derive(Debug)]
 struct FlakyDaemon {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test-only dial counter; the client is its only writer and it is read after the run"
-    )]
     dials: std::sync::atomic::AtomicU32,
     refusals: u32,
     seen: SyncSender<Seen>,
@@ -338,10 +331,6 @@ impl Dialer for FlakyDaemon {
 
 fn flaky(refusals: u32) -> (Arc<FlakyDaemon>, Receiver<Seen>) {
     let (seen, receiver) = sync_channel(64);
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the FlakyDaemon dial counter, as above"
-    )]
     let dials = std::sync::atomic::AtomicU32::new(0);
     let daemon = FlakyDaemon {
         dials,
@@ -461,10 +450,6 @@ enum Served {
 /// read asks for, one record per read, dropping connections per [`CUTS`].
 #[derive(Debug)]
 struct DroppingDaemon {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test-only dial counter, as in FlakyDaemon"
-    )]
     dials: std::sync::atomic::AtomicUsize,
     served: SyncSender<Served>,
 }
@@ -544,7 +529,6 @@ async fn serve_records(
 #[tokio::test]
 async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
     let (served_by_daemon, served) = sync_channel(64);
-    #[expect(clippy::disallowed_types, reason = "the DroppingDaemon dial counter")]
     let dials = std::sync::atomic::AtomicUsize::new(0);
     let daemon = Arc::new(DroppingDaemon {
         dials,

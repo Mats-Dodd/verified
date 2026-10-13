@@ -2,6 +2,13 @@
 //! SSE), and the real Anthropic client talking HTTP to the fake
 //! Anthropic host. Binds tokio listeners directly, so it runs the same with
 //! and without the `sim` feature.
+#![expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test harness code, not the code under test"
+)]
+
+mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,25 +40,10 @@ use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
 use verified_wire::transcript::Transcript;
 
-/// `work`, or an error once `limit` passes: a test's own bound on how long
-/// it waits for the code under test, never a seam of that code.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a test's own deadline on waiting, not a timeout inside the code under test"
-)]
-async fn within<F: Future>(
-    limit: Duration,
-    work: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    tokio::time::timeout(limit, work).await
-}
+use common::within;
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the test binds real loopback listeners for the daemon and the fake host, with or without the sim shim"
-)]
 async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

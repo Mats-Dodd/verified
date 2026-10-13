@@ -1,6 +1,7 @@
 //! The daemon alone on turmoil, driven by the TUI's client: a panic in a
 //! daemon task fails its host (crash-only under the simulation), and a
 //! session holding over 4 MiB of tool output is followed from the start.
+#![expect(clippy::panic, reason = "test harness code, not the code under test")]
 
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -126,10 +127,6 @@ struct PanickingModel;
 
 #[async_trait::async_trait]
 impl Model for PanickingModel {
-    #[expect(
-        clippy::panic,
-        reason = "the test's point: a broken invariant inside a daemon task"
-    )]
     async fn stream(
         &self,
         _request: &ModelRequest,

@@ -2,6 +2,14 @@
 //! groups, `FileLog` on disk, and `daemon::run` with its lock and port file.
 //! Without the `sim` feature only: with it, the fs shim is turmoil's.
 #![cfg(not(feature = "sim"))]
+#![expect(
+    clippy::disallowed_methods,
+    clippy::panic,
+    clippy::zombie_processes,
+    reason = "test harness code, not the code under test"
+)]
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,18 +36,7 @@ use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::{fs, net};
 use verified_server::tool;
 
-/// `work`, or an error once `limit` passes: a test's own bound on how long
-/// it waits for the code under test, never a seam of that code.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a test's own deadline on waiting, not a timeout inside the code under test"
-)]
-async fn within<F: Future>(
-    limit: Duration,
-    work: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    tokio::time::timeout(limit, work).await
-}
+use common::within;
 
 async fn scratch(name: &str) -> PathBuf {
     let mut random = [0u8; 8];
@@ -468,10 +465,6 @@ struct PanickingModel;
 
 #[async_trait::async_trait]
 impl verified_server::model::Model for PanickingModel {
-    #[expect(
-        clippy::panic,
-        reason = "the test's point: a broken invariant inside a daemon task"
-    )]
     async fn stream(
         &self,
         _request: &verified_server::model::ModelRequest,
@@ -539,10 +532,6 @@ fn panicking_daemon() {
 
 /// This test binary again, running only `test` as the child half of a
 /// crash test.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the test re-runs its own binary as the daemon under test; the env var marks the child"
-)]
 fn run_child(test: &str) -> std::process::Output {
     let exe = std::env::current_exe().expect("the test binary");
     std::process::Command::new(exe)
@@ -552,10 +541,6 @@ fn run_child(test: &str) -> std::process::Output {
         .expect("the child ran")
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the env var marks the child half of a crash test"
-)]
 fn is_child() -> bool {
     std::env::var_os(PANIC_CHILD).is_some()
 }
@@ -591,14 +576,6 @@ const GROUPS_TEST: &str = "a_panic_anywhere_kills_the_running_commands";
 /// the daemon's tasks, as `LocalEnv` does, the daemon's panic hook is installed, and
 /// a plain thread (no daemon task, so no `catch_unwind`) panics. The process
 /// then aborts, as `panic = "abort"` does: nothing is dropped.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the test starts its own command and its own unsupervised thread"
-)]
-#[expect(
-    clippy::zombie_processes,
-    reason = "the child aborts with its command running; the parent checks the group is gone"
-)]
 fn panicking_thread() {
     use std::os::unix::process::CommandExt as _;
 
@@ -626,13 +603,7 @@ fn panicking_thread() {
         std::process::abort();
     }));
     let panicked = std::thread::spawn(|| {
-        #[expect(
-            clippy::panic,
-            reason = "the test's point: a panic outside every daemon task"
-        )]
-        {
-            panic!("a plain thread panics on purpose");
-        }
+        panic!("a plain thread panics on purpose");
     })
     .join();
     drop(panicked);
@@ -705,10 +676,6 @@ async fn pid_in(path: &std::path::Path) -> i32 {
     unreachable_pid()
 }
 
-#[expect(
-    clippy::panic,
-    reason = "a test helper: the command never wrote its pid"
-)]
 fn unreachable_pid() -> i32 {
     panic!("the command did not write its pid")
 }

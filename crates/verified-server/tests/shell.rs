@@ -2,6 +2,13 @@
 //! tools and log framing, with the scripted model, an in-memory environment
 //! and an in-memory disk. No sockets and no filesystem, so they run the same
 //! with and without the `sim` feature.
+#![expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test harness code, not the code under test"
+)]
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,36 +39,13 @@ use verified_wire::command::{
 use verified_wire::stream::Offset;
 use verified_wire::transcript::Transcript;
 
-/// `work`, or an error once `limit` passes: a test's own bound on how long
-/// it waits for the code under test, never a seam of that code.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a test's own deadline on waiting, not a timeout inside the code under test"
-)]
-async fn within<F: Future>(
-    limit: Duration,
-    work: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    tokio::time::timeout(limit, work).await
-}
+use common::within;
 
 /// Files and a shell in memory. `block` commands wait for their cancel.
 #[derive(Debug, Default)]
 struct MemEnv {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test env: tool tasks write, the test reads after a turn ends; dropped with the test"
-    )]
     files: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test env: exec appends, the test reads after a turn ends; dropped with the test"
-    )]
     commands: std::sync::Mutex<Vec<(String, String)>>,
-    #[expect(
-        clippy::disallowed_types,
-        reason = "test env: edit tasks append, the test reads after a turn ends; dropped with the test"
-    )]
     writes: std::sync::Mutex<Vec<String>>,
     /// Writes never return: a crash between dispatch and result.
     stall_writes: bool,
