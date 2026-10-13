@@ -178,7 +178,7 @@ pub enum Connection {
     Connecting,
     /// Following; whether the last read on this connection reached the end.
     Live(Freshness),
-    /// Dropped; reconnecting after a delay.
+    /// Dropped; reconnecting after a delay, or at once on ^r.
     Retrying(String),
     /// Stopped following; ^r reconnects.
     Down(String),
@@ -221,7 +221,7 @@ pub fn status_line(status: &Status<'_>) -> Line<'static> {
         Connection::Idle => Span::styled("○", QUIET),
         Connection::Connecting => "◌ connecting".yellow(),
         Connection::Live(_) => "● live".green(),
-        Connection::Retrying(reason) => Span::styled(format!("◌ {reason}"), PROMPT),
+        Connection::Retrying(reason) => Span::styled(format!("◌ {reason} (^r now)"), PROMPT),
         Connection::Down(reason) => Span::styled(format!("✗ {reason} (^r)"), ERROR),
         Connection::Broken(reason) => Span::styled(format!("✗ {reason} (^r reloads)"), ERROR),
     });

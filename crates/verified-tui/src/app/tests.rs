@@ -613,6 +613,29 @@ fn retrying_shows_when() {
     assert!(matches!(app.connection(), Connection::Retrying(reason) if reason.contains("500ms")));
 }
 
+/// ^r cuts a follower's backoff short, once: until the new follower
+/// reports, more presses start nothing.
+#[test]
+fn ctrl_r_retries_at_once_while_retrying() {
+    let mut app = opened();
+    let _cmd = stream(
+        &mut app,
+        StreamUpdate::Disconnected {
+            error: ClientError::ClosedEarly,
+            retry: Some(Duration::from_millis(500)),
+        },
+    );
+    assert!(matches!(
+        app.update(Msg::Reconnect),
+        Cmd::Follow {
+            follow: FollowId(2),
+            ..
+        }
+    ));
+    assert_eq!(app.connection(), &Connection::Connecting);
+    assert_eq!(app.update(Msg::Reconnect), Cmd::None, "already connecting");
+}
+
 #[test]
 fn the_draft_is_bounded() {
     let mut limits = Limits::DEFAULT;

@@ -372,8 +372,10 @@ impl App {
         })
     }
 
-    /// Restarts what has stopped; anything still on its way is left alone,
-    /// so holding the key starts nothing new.
+    /// Restarts what has stopped, and a follower waiting out its backoff
+    /// at once; anything still on its way (a create being sent, a
+    /// connection being made or live) is left alone, so holding the key
+    /// starts nothing new: each restart waits for the new follower's word.
     fn reconnect(&mut self) -> Cmd {
         match (self.phase, &self.connection) {
             (Phase::Creating(Delivery::Failed), _) => {
@@ -387,12 +389,11 @@ impl App {
                 self.position = START;
                 self.refollow()
             }
-            (Phase::Ready, Connection::Idle | Connection::Down(_)) => self.refollow(),
+            (Phase::Ready, Connection::Idle | Connection::Down(_) | Connection::Retrying(_)) => {
+                self.refollow()
+            }
             (Phase::Creating(Delivery::Sending), _)
-            | (
-                Phase::Ready,
-                Connection::Connecting | Connection::Live(_) | Connection::Retrying(_),
-            ) => Cmd::None,
+            | (Phase::Ready, Connection::Connecting | Connection::Live(_)) => Cmd::None,
         }
     }
 
