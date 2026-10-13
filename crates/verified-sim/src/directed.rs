@@ -17,9 +17,8 @@ use verified_model::Replayed;
 use verified_model::coverage::{Class, Key, Phase, Resolved, Situation};
 use verified_wire::command::Verdict;
 
-use crate::check::Violation;
 use crate::hosts;
-use crate::run::{self, RunError};
+use crate::run::{self, Broken, RunError};
 use crate::scenario::{Scenario, TurnPlan};
 
 /// A gap random seeds miss, and the scenario that reaches it.
@@ -97,11 +96,8 @@ pub fn named(name: &str) -> Option<Directed> {
 pub enum DirectedError {
     #[error(transparent)]
     Run(#[from] RunError),
-    #[error("the directed scenario {name} broke invariants: {violations:?}")]
-    Violated {
-        name: &'static str,
-        violations: Vec<Violation>,
-    },
+    #[error(transparent)]
+    Broken(#[from] Broken),
     #[error("the directed scenario {name} missed its target {target}; it reached {reached:?}")]
     Missed {
         name: &'static str,
@@ -116,16 +112,7 @@ pub enum DirectedError {
 /// A run failed or diverged from the other, it broke an invariant (the
 /// model's replay among them), or its replay missed the target.
 pub fn run(directed: &Directed) -> Result<Replayed, DirectedError> {
-    let outcome = run::twice_scenario(&directed.scenario)?;
-    let replayed = match outcome.replayed {
-        Some(replayed) if outcome.violations.is_empty() => replayed,
-        Some(_) | None => {
-            return Err(DirectedError::Violated {
-                name: directed.name,
-                violations: outcome.violations,
-            });
-        }
-    };
+    let replayed = run::twice(&directed.scenario)?.verdict()?;
     if replayed.keys.contains(&directed.target) {
         Ok(replayed)
     } else {

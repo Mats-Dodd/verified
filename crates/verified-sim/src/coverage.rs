@@ -7,14 +7,16 @@
 //! did is a gap, classified as an over-approximation, a fidelity gap or a
 //! test gap.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 
 use verified_model::coverage::{Gap, Key, classify, explore};
 use verified_model::{Action, suite};
+use verified_server::shell::Planted;
 
 use crate::directed::{self, DirectedError};
-use crate::run::{self, RunError};
+use crate::run::{self, Broken, RunError};
+use crate::scenario::Scenario;
 
 /// What BFS reached under every bound: each key, the bounds that reach
 /// it, and the shortest path found to it.
@@ -52,8 +54,9 @@ pub enum CoverageError {
     Run(#[from] RunError),
     #[error(transparent)]
     Directed(#[from] DirectedError),
-    #[error("seed {seed} broke invariants, so its coverage means nothing: {violations}")]
-    Violated { seed: u64, violations: String },
+    /// A broken run's coverage means nothing.
+    #[error(transparent)]
+    Broken(#[from] Broken),
 }
 
 /// What the simulation reached: each key with the seeds that reach it,
@@ -62,17 +65,6 @@ pub enum CoverageError {
 pub struct Simulated {
     pub seeds: BTreeMap<Key, Vec<u64>>,
     pub directed: BTreeMap<Key, Vec<&'static str>>,
-}
-
-/// The keys of `outcome`'s replay.
-fn reached(seed: u64, outcome: run::Outcome) -> Result<BTreeSet<Key>, CoverageError> {
-    match outcome.replayed {
-        Some(replayed) if outcome.violations.is_empty() => Ok(replayed.keys),
-        Some(_) | None => Err(CoverageError::Violated {
-            seed,
-            violations: format!("{:?}", outcome.violations),
-        }),
-    }
 }
 
 /// Each key the seeds `from..from + count` reach, and each every directed
@@ -84,7 +76,8 @@ fn reached(seed: u64, outcome: run::Outcome) -> Result<BTreeSet<Key>, CoverageEr
 pub fn simulated(from: u64, count: u64) -> Result<Simulated, CoverageError> {
     let mut simulated = Simulated::default();
     for seed in from..from.saturating_add(count) {
-        for key in reached(seed, run::simulate(seed)?)? {
+        let outcome = run::once(&Scenario::from_seed(seed), Planted::default())?;
+        for key in outcome.verdict()?.keys {
             simulated.seeds.entry(key).or_default().push(seed);
         }
     }

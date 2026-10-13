@@ -8,14 +8,14 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use turmoil::barriers::{Barrier as SimBarrier, Reaction, Triggered};
-use verified_model::{Observed, Replayed};
+use verified_model::{Mismatch, Observed, Replayed};
 use verified_server::shell::Planted;
 use verified_server::shim::{Barrier, Observation};
 
 use crate::check::{self, Violation};
 use crate::driver;
 use crate::hosts::{self, ANTHROPIC, DAEMON, TUI};
-use crate::ledger::{Entry, Ledger};
+use crate::ledger::{self, Entry, Ledger, Stamped};
 use crate::model;
 use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
 
@@ -30,25 +30,93 @@ const RECOVERY_STEPS: usize = 20_000;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub scenario: Scenario,
-    /// The ledger as text, one line per entry: the determinism trace.
-    pub trace: Vec<String>,
-    /// Every broken invariant, the model's replay (`model`) among them.
+    /// The ledger: what happened in the world, in order.
+    pub entries: Vec<Stamped>,
+    /// Every world invariant broken.
     pub violations: Vec<Violation>,
     /// The run as the model replays it.
     pub observed: Vec<Observed>,
-    /// What the replay walked through, if the run is a path of the model.
-    pub replayed: Option<Replayed>,
+    /// What the replay walked through, or why the run is no path of the
+    /// model.
+    pub replayed: Result<Replayed, Mismatch>,
 }
 
-/// Why a run did not finish.
+impl Outcome {
+    /// The run's determinism trace ([`ledger::trace`]).
+    #[must_use]
+    pub fn trace(&self) -> Vec<String> {
+        ledger::trace(&self.entries)
+    }
+
+    /// What the replay walked through, if the run broke nothing: no world
+    /// invariant, and the model followed it.
+    ///
+    /// # Errors
+    /// The run broke a world invariant, or left the model.
+    pub fn verdict(self) -> Result<Replayed, Broken> {
+        match self.replayed {
+            Ok(replayed) if self.violations.is_empty() => Ok(replayed),
+            Ok(_) => Err(Broken {
+                seed: self.scenario.seed,
+                violations: self.violations,
+                mismatch: None,
+            }),
+            Err(mismatch) => Err(Broken {
+                seed: self.scenario.seed,
+                violations: self.violations,
+                mismatch: Some(mismatch),
+            }),
+        }
+    }
+}
+
+/// A run that broke something: the world invariants it broke, and why the
+/// model could not follow it, if it could not.
 #[derive(Debug, thiserror::Error)]
-#[error("seed {seed}: the simulation failed after {elapsed:?}: {reason}")]
-pub struct RunError {
+#[error(
+    "seed {seed} broke {violations:#?}{}",
+    mismatch.as_ref().map_or_else(String::new, |mismatch| format!("\n{mismatch}"))
+)]
+pub struct Broken {
     pub seed: u64,
-    pub elapsed: Duration,
-    pub reason: String,
-    /// The ledger up to the failure.
-    pub trace: Vec<String>,
+    pub violations: Vec<Violation>,
+    pub mismatch: Option<Mismatch>,
+}
+
+/// Why a run did not finish, or a seed's two runs differ.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("seed {seed}: the simulation failed after {elapsed:?}: {reason}")]
+    Failed {
+        seed: u64,
+        elapsed: Duration,
+        reason: String,
+        /// The ledger up to the failure.
+        trace: Vec<String>,
+    },
+    #[error(
+        "seed {seed}: two runs diverged at trace line {line}:\n  first:  {}\n  second: {}",
+        trace.get(*line).map_or("<end>", String::as_str),
+        other.as_deref().unwrap_or("<end>")
+    )]
+    Diverged {
+        seed: u64,
+        line: usize,
+        /// The first run's trace.
+        trace: Vec<String>,
+        /// The second run's line there.
+        other: Option<String>,
+    },
+}
+
+impl RunError {
+    /// The trace up to the failure, or the first run's.
+    #[must_use]
+    pub fn trace(&self) -> &[String] {
+        match self {
+            Self::Failed { trace, .. } | Self::Diverged { trace, .. } => trace,
+        }
+    }
 }
 
 /// What the harness must undo later.
@@ -325,7 +393,7 @@ fn observer(ledger: &Ledger) -> SimBarrier<Observation> {
 }
 
 fn failed(seed: u64, sim: &turmoil::Sim<'_>, ledger: &Ledger, reason: String) -> RunError {
-    RunError {
+    RunError::Failed {
         seed,
         elapsed: sim.elapsed(),
         reason,
@@ -333,30 +401,14 @@ fn failed(seed: u64, sim: &turmoil::Sim<'_>, ledger: &Ledger, reason: String) ->
     }
 }
 
-/// Runs the world of `seed` and judges it.
+/// Runs `scenario` (its seed draws everything it leaves open), with defects
+/// `planted` in the daemon (none, but in the mutation tests), and judges
+/// it.
 ///
 /// # Errors
 /// A host failed (the daemon returned an error or the TUI stopped early),
 /// or the run did not finish within its simulated time limit.
-pub fn simulate(seed: u64) -> Result<Outcome, RunError> {
-    simulate_with(seed, Planted::default())
-}
-
-/// [`simulate`], with defects `planted` in the daemon: the mutation tests
-/// show the world checks catch them.
-///
-/// # Errors
-/// As [`simulate`].
-pub fn simulate_with(seed: u64, planted: Planted) -> Result<Outcome, RunError> {
-    simulate_scenario(Scenario::from_seed(seed), planted)
-}
-
-/// Runs `scenario` (its seed draws everything it leaves open), with
-/// defects `planted` in the daemon, and judges it.
-///
-/// # Errors
-/// As [`simulate`].
-pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome, RunError> {
+pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> {
     let seed = scenario.seed;
     let ledger = Ledger::new(LEDGER_CAPACITY);
     let mut builder = turmoil::Builder::new();
@@ -380,7 +432,7 @@ pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome
         TUI,
         driver::tui(scenario.turns.clone(), seed, ledger.clone()),
     );
-    let mut faults = Faults::new(&scenario);
+    let mut faults = Faults::new(scenario);
     loop {
         let finished = sim
             .step()
@@ -416,61 +468,38 @@ pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome
         steps = steps.saturating_add(1);
     }
     let entries = ledger.entries();
-    let mut violations = check::world(&entries, &scenario);
+    let violations = check::world(&entries, scenario);
     let observed = model::observed(&entries);
-    let replayed = match model::replay(scenario.limits.core.clone(), &observed) {
-        Ok(replayed) => Some(replayed),
-        Err(mismatch) => {
-            violations.push(Violation {
-                invariant: "model",
-                detail: mismatch.to_string(),
-            });
-            None
-        }
-    };
+    let replayed = model::replay(scenario.limits.core.clone(), &observed);
     Ok(Outcome {
-        scenario,
-        trace: ledger.trace(),
+        scenario: scenario.clone(),
+        entries,
         violations,
         observed,
         replayed,
     })
 }
 
-/// Runs `seed` twice and compares the traces.
+/// Runs `scenario` twice, with nothing planted, and compares the traces.
 ///
 /// # Errors
-/// Either run failed, or the traces differ (the `reason` names the first
-/// differing line).
-pub fn twice(seed: u64) -> Result<Outcome, RunError> {
-    twice_scenario(&Scenario::from_seed(seed))
-}
-
-/// Runs `scenario` twice and compares the traces.
-///
-/// # Errors
-/// As [`twice`].
-pub fn twice_scenario(scenario: &Scenario) -> Result<Outcome, RunError> {
-    let seed = scenario.seed;
-    let first = simulate_scenario(scenario.clone(), Planted::default())?;
-    let second = simulate_scenario(scenario.clone(), Planted::default())?;
-    if first.trace != second.trace {
-        let at = first
-            .trace
-            .iter()
-            .zip(&second.trace)
-            .position(|(left, right)| left != right)
-            .unwrap_or_else(|| first.trace.len().min(second.trace.len()));
-        return Err(RunError {
-            seed,
-            elapsed: Duration::ZERO,
-            reason: format!(
-                "two runs diverged at trace line {at}:\n  first:  {}\n  second: {}",
-                first.trace.get(at).map_or("<end>", String::as_str),
-                second.trace.get(at).map_or("<end>", String::as_str),
-            ),
-            trace: first.trace,
-        });
+/// Either run failed, or the traces differ.
+pub fn twice(scenario: &Scenario) -> Result<Outcome, RunError> {
+    let first = once(scenario, Planted::default())?;
+    let second = once(scenario, Planted::default())?;
+    let (trace, other) = (first.trace(), second.trace());
+    if trace == other {
+        return Ok(first);
     }
-    Ok(first)
+    let line = trace
+        .iter()
+        .zip(&other)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| trace.len().min(other.len()));
+    Err(RunError::Diverged {
+        seed: scenario.seed,
+        line,
+        other: other.get(line).cloned(),
+        trace,
+    })
 }

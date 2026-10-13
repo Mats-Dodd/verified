@@ -10,39 +10,58 @@
 //! seed in two fresh processes.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 
-use verified_model::coverage::{Class, Key};
+use verified_domain::{Cause, Exit, Record, Reset, TurnOutcome};
+use verified_model::coverage::{Class, Key, Phase, Resolved};
 use verified_model::replay::harness;
 use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
 use verified_server::shell::Planted;
+use verified_server::shim::Observation;
 use verified_sim::directed::{self, Directed, DirectedError};
+use verified_sim::ledger::{Entry, Op};
+use verified_sim::run::Outcome;
 use verified_sim::scenario::{Fault, Scenario};
 use verified_sim::{hosts, run};
 
-/// Runs `seed` twice, compares the traces, then judges the world.
+/// Runs `seed` twice, compares the traces, then judges the run.
 fn seed(seed: u64) {
-    let outcome = run::twice(seed)
+    run::twice(&Scenario::from_seed(seed))
         .map_err(|error| {
-            let tail: Vec<&String> = error.trace.iter().rev().take(40).rev().collect();
+            let tail = error
+                .trace()
+                .iter()
+                .rev()
+                .take(40)
+                .rev()
+                .collect::<Vec<_>>();
             format!("{error}\nlast trace lines:\n{tail:#?}")
         })
-        .expect("the run finishes, deterministically");
-    assert!(
-        outcome.violations.is_empty(),
-        "seed {seed} ({:?}) broke invariants:\n{:#?}",
-        outcome.scenario,
-        outcome.violations
-    );
+        .expect("the run finishes, deterministically")
+        .verdict()
+        .map_err(|broken| broken.to_string())
+        .expect("the run breaks nothing");
+}
+
+/// One run of `seed`, with the defects `planted` in the daemon.
+fn once(seed: u64, planted: Planted) -> Outcome {
+    run::once(&Scenario::from_seed(seed), planted)
+        .map_err(|error| error.to_string())
+        .expect("the run finishes")
 }
 
 /// Different seeds must steer the world differently, or the seed is not
 /// reaching it.
 #[test]
 fn seeds_steer_the_world() {
-    let first = run::simulate(1).expect("seed 1 runs");
-    let second = run::simulate(2).expect("seed 2 runs");
-    assert_ne!(first.trace, second.trace, "two seeds made the same world");
+    let first = once(1, Planted::default());
+    let second = once(2, Planted::default());
+    assert_ne!(
+        first.trace(),
+        second.trace(),
+        "two seeds made the same world"
+    );
 }
 
 macro_rules! seeds {
@@ -90,71 +109,156 @@ seeds! {
 /// The seeds the suite runs, each in its own test above.
 const FIXED: [u64; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 342, 818];
 
-/// Fault paths the fixed seeds must reach, each as text its trace shows
-/// (every needle on some line): a path nobody reaches is a path nobody
-/// checks.
-const PATHS: [(&str, &[&str]); 6] = [
-    (
-        "the TUI stops following (Down) and the user reconnects",
-        &["User(\"reconnect\")"],
-    ),
-    (
-        "the TUI's create gives up and the user retries it",
-        &["User(\"retry creating\")"],
-    ),
-    (
-        "a daemon-Anthropic partition fails a model call over the network, and the core retries it",
-        &["the model link partitions", "Retry { fault: Network"],
-    ),
-    (
-        "the daemon crashes after an edit is dispatched, and the edit resolves Unknown",
-        &[
-            ": edit notes.txt",
-            "daemon crashes at Dispatched",
-            "exit: Err(Unknown)",
-        ],
-    ),
-    (
-        "the daemon crashes while a command runs, and the command resolves Unknown",
-        &[
-            "Exec { command: \"sleep",
-            "daemon crashes for",
-            "exit: Err(Unknown)",
-        ],
-    ),
-    (
-        "two edits and a command proposed in one step all act",
-        &[
-            "Exec { command: \"touch m",
-            "_1\"), effect",
-            "_2\"), effect",
-        ],
-    ),
-];
+/// Whether the scripted user did `what`.
+fn user(outcome: &Outcome, what: &str) -> bool {
+    outcome
+        .entries
+        .iter()
+        .any(|stamped| matches!(&stamped.entry, Entry::User(done) if done == what))
+}
 
-#[test]
-fn the_fixed_seeds_reach_every_fault_path() {
-    let mut reached: Vec<Vec<u64>> = vec![Vec::new(); PATHS.len()];
-    for seed in FIXED {
-        let outcome = run::simulate(seed).expect("the run finishes");
-        for ((_, needles), seeds) in PATHS.iter().zip(&mut reached) {
-            if needles
-                .iter()
-                .all(|needle| outcome.trace.iter().any(|line| line.contains(needle)))
-            {
-                seeds.push(seed);
+/// Whether the harness injected a fault described so.
+fn fault(outcome: &Outcome, described: &str) -> bool {
+    outcome.entries.iter().any(
+        |stamped| matches!(&stamped.entry, Entry::Fault(fault) if fault.starts_with(described)),
+    )
+}
+
+/// Whether the replay reached each of `keys`.
+fn reached(outcome: &Outcome, keys: &[Key]) -> bool {
+    outcome
+        .replayed
+        .as_ref()
+        .is_ok_and(|replayed| keys.iter().all(|key| replayed.keys.contains(key)))
+}
+
+/// Whether a group commit made durable a step reset to retry a model call
+/// that failed over the network.
+fn retried_over_the_network(outcome: &Outcome) -> bool {
+    outcome.entries.iter().any(|stamped| {
+        matches!(&stamped.entry, Entry::Acked { records, .. } if records.iter().any(|record| {
+            matches!(
+                record,
+                Record::StepReset {
+                    reason: Reset::Retry {
+                        fault: verified_domain::Fault::Network,
+                        ..
+                    },
+                    ..
+                }
+            )
+        }))
+    })
+}
+
+/// Whether a command and two edits that one model call proposed all acted
+/// on the world (the fake model's ids name the turn, then the position).
+fn command_and_two_edits_act(outcome: &Outcome) -> bool {
+    let mut acts: BTreeMap<&str, (bool, usize)> = BTreeMap::new();
+    for stamped in &outcome.entries {
+        if let Entry::Mutation {
+            call: Some(call),
+            op,
+            ..
+        } = &stamped.entry
+        {
+            let turn = call
+                .rsplit_once('_')
+                .map_or(call.as_str(), |(turn, _)| turn);
+            let (command, edits) = acts.entry(turn).or_default();
+            match op {
+                Op::Exec { .. } => *command = true,
+                Op::Write { .. } => *edits = edits.saturating_add(1),
             }
         }
     }
-    for ((path, _), seeds) in PATHS.iter().zip(&reached) {
-        assert!(!seeds.is_empty(), "no fixed seed reaches: {path}");
+    acts.values()
+        .any(|(command, edits)| *command && *edits >= 2)
+}
+
+/// Whether a run reached a path.
+type Reaches = fn(&Outcome) -> bool;
+
+#[test]
+fn the_fixed_seeds_reach_every_fault_path() {
+    // Each path, and whether a run reached it: a path nobody reaches is a
+    // path nobody checks.
+    let paths: [(&str, Reaches); 6] = [
+        (
+            "the TUI stops following (Down) and the user reconnects",
+            |outcome| user(outcome, "reconnect"),
+        ),
+        (
+            "the TUI's create gives up and the user retries it",
+            |outcome| user(outcome, "retry creating"),
+        ),
+        (
+            "a daemon-Anthropic partition fails a model call over the network, and the core retries it",
+            |outcome| {
+                fault(outcome, "the model link partitions") && retried_over_the_network(outcome)
+            },
+        ),
+        (
+            "the daemon crashes after an Unsafe call is dispatched and before it acts, and the call resolves Unknown",
+            |outcome| {
+                reached(
+                    outcome,
+                    &[
+                        Key::Crashed {
+                            class: Class::Unsafe,
+                            ran: false,
+                        },
+                        Key::Call {
+                            class: Class::Unsafe,
+                            phase: Phase::Dispatched,
+                            crossed: true,
+                            resolved: Resolved::Unknown,
+                        },
+                    ],
+                )
+            },
+        ),
+        (
+            "the daemon crashes while a command runs, after it acted, and the command resolves Unknown",
+            |outcome| {
+                reached(
+                    outcome,
+                    &[
+                        Key::Crashed {
+                            class: Class::Unsafe,
+                            ran: true,
+                        },
+                        Key::Call {
+                            class: Class::Unsafe,
+                            phase: Phase::Ran,
+                            crossed: true,
+                            resolved: Resolved::Unknown,
+                        },
+                    ],
+                )
+            },
+        ),
+        (
+            "two edits and a command proposed in one step all act",
+            command_and_two_edits_act,
+        ),
+    ];
+    let outcomes: Vec<Outcome> = FIXED
+        .iter()
+        .map(|seed| once(*seed, Planted::default()))
+        .collect();
+    for (path, reaches) in paths {
+        assert!(
+            outcomes.iter().any(reaches),
+            "no fixed seed reaches: {path}"
+        );
     }
 }
 
 /// Persist before acting (Law 2), as a mutation test: a daemon that starts
 /// tool runs before their decision is durable leaves the model on some
-/// seed, where the shell dispatches a tool run the model has not started,
-/// because its decision is not durable yet.
+/// seed, where the shell dispatches (or a tool acts for) a run the model has
+/// not started, because its decision is not durable yet.
 #[test]
 fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
     let planted = Planted {
@@ -162,18 +266,13 @@ fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
         ..Planted::default()
     };
     let caught = (0..16u64).any(|seed| {
-        let outcome = run::simulate_with(seed, planted).expect("the run finishes");
-        replay_says(&outcome, "no run the model started")
+        matches!(
+            once(seed, planted).replayed,
+            Err(Mismatch::Diverged(divergence))
+                if matches!(divergence.observed, Observed::Dispatched(_) | Observed::Mutated(_))
+        )
     });
     assert!(caught, "no seed's replay caught a tool run before persist");
-}
-
-/// Whether some violation of `outcome` is the replay's, saying `why`.
-fn replay_says(outcome: &run::Outcome, why: &str) -> bool {
-    outcome
-        .violations
-        .iter()
-        .any(|violation| violation.invariant == "model" && violation.detail.contains(why))
 }
 
 /// At most once inside one dispatch, as a mutation test: a shell that runs
@@ -186,10 +285,19 @@ fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
         ..Planted::default()
     };
     let caught = (0..16u64).any(|seed| {
-        let outcome = run::simulate_with(seed, planted).expect("the run finishes");
-        replay_says(&outcome, "acts on the world a second time")
+        let outcome = once(seed, planted);
+        let Err(Mismatch::Diverged(divergence)) = &outcome.replayed else {
+            return false;
+        };
+        let Observed::Mutated(id) = divergence.observed else {
+            return false;
+        };
+        outcome
+            .observed
+            .get(..divergence.index)
+            .is_some_and(|before| before.contains(&Observed::Mutated(id)))
     });
-    assert!(caught, "no seed's replay caught a second run");
+    assert!(caught, "no seed's replay caught a second act");
 }
 
 /// The model's `Execute` is the run acting on the world, not its return:
@@ -197,15 +305,17 @@ fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
 /// returns, so the crash comes after the `Unsafe` run acted.
 #[test]
 fn a_crash_while_a_command_runs_is_after_it_acted() {
-    let outcome = run::simulate(37).expect("seed 37 runs");
-    let replayed = outcome.replayed.expect("seed 37 replays");
+    let outcome = once(37, Planted::default());
     assert!(
-        replayed.keys.contains(&Key::Crashed {
-            class: Class::Unsafe,
-            ran: true,
-        }),
+        reached(
+            &outcome,
+            &[Key::Crashed {
+                class: Class::Unsafe,
+                ran: true,
+            }]
+        ),
         "seed 37 crashes after its command acted: {:?}",
-        replayed.keys
+        outcome.replayed
     );
 }
 
@@ -219,11 +329,24 @@ fn persisting_unknown_as_interrupted_fails_the_replay() {
         unknown_as_interrupted: true,
         ..Planted::default()
     };
-    let outcome = run::simulate_with(37, planted).expect("seed 37 runs");
+    let outcome = once(37, planted);
+    let interrupted = |record: &Record<_>| {
+        matches!(
+            record,
+            Record::ToolResult {
+                exit: Exit::Err(Cause::Interrupted),
+                ..
+            }
+        )
+    };
     assert!(
-        replay_says(&outcome, "the model made"),
-        "seed 37 (a command resolves Unknown) diverges at its commit: {:#?}",
-        outcome.violations
+        matches!(
+            &outcome.replayed,
+            Err(Mismatch::Diverged(divergence))
+                if matches!(&divergence.observed, Observed::Acked { records, .. } if records.iter().any(interrupted))
+        ),
+        "seed 37 (a command resolves Unknown) diverges at its commit: {:?}",
+        outcome.replayed
     );
 }
 
@@ -234,11 +357,11 @@ fn persisting_unknown_as_interrupted_fails_the_replay() {
 /// true model.
 #[test]
 fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
-    let outcome = run::simulate(37).expect("seed 37 runs");
+    let outcome = once(37, Planted::default());
     assert!(
-        outcome.replayed.is_some(),
-        "seed 37 replays: {:#?}",
-        outcome.violations
+        outcome.replayed.is_ok(),
+        "seed 37 replays: {:?}",
+        outcome.replayed
     );
     let harness = Harness {
         bug: Some(Bug::RerunUnsafe),
@@ -261,13 +384,10 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
 fn the_fixed_seeds_replay_every_kind_of_step() {
     let mut taken = std::collections::BTreeSet::new();
     for seed in FIXED {
-        let outcome = run::simulate(seed).expect("the run finishes");
-        assert!(
-            outcome.violations.is_empty(),
-            "seed {seed}: {:#?}",
-            outcome.violations
-        );
-        let replayed = outcome.replayed.expect("a run without violations replays");
+        let replayed = once(seed, Planted::default())
+            .verdict()
+            .map_err(|broken| broken.to_string())
+            .expect("the run breaks nothing");
         taken.extend(replayed.keys);
     }
     for kind in [
@@ -329,25 +449,27 @@ fn a_full_log_ends_the_running_turn_and_replays() {
             ));
             scenario.faults.sort_by_key(|(at, _)| *at);
         }
-        let outcome = run::twice_scenario(&scenario)
+        let outcome = run::twice(&scenario)
             .map_err(|error| error.to_string())
             .expect("the run finishes, deterministically");
-        assert!(
-            outcome.violations.is_empty(),
-            "seed {seed} (crash {crash:?}) on a small log broke invariants:\n{:#?}",
-            outcome.violations
-        );
         let filled = outcome
-            .trace
+            .entries
             .iter()
-            .position(|line| line.contains("Shell(Refused)"))
+            .position(|stamped| stamped.entry == Entry::Shell(Observation::Refused))
             .expect("the log fills");
+        let cancelled = outcome.entries.iter().skip(filled).any(|stamped| {
+            matches!(&stamped.entry, Entry::Acked { records, .. } if records.iter().any(|record| {
+                matches!(
+                    record,
+                    Record::TurnEnded {
+                        outcome: TurnOutcome::Cancelled,
+                        ..
+                    }
+                )
+            }))
+        });
         assert!(
-            outcome
-                .trace
-                .iter()
-                .skip(filled)
-                .any(|line| line.contains("outcome: Cancelled")),
+            cancelled,
             "seed {seed}: the turn running as the log fills ends cancelled"
         );
         assert_eq!(
@@ -355,6 +477,10 @@ fn a_full_log_ends_the_running_turn_and_replays() {
             crash.is_some(),
             "seed {seed}: only the crash leaves a resume refused"
         );
+        outcome
+            .verdict()
+            .map_err(|broken| broken.to_string())
+            .expect("a small log breaks nothing");
     }
 }
 

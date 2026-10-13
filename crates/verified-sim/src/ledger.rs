@@ -143,77 +143,95 @@ impl Ledger {
         self.record_at(at, entry);
     }
 
-    /// Every entry so far, in order.
+    /// `read` of every entry so far, in order, under the ledger's lock.
     ///
     /// # Panics
     /// A writer panicked while holding the lock.
+    pub fn with<T, F: FnOnce(&[Stamped]) -> T>(&self, read: F) -> T {
+        read(
+            &self
+                .entries
+                .lock()
+                .expect("no ledger writer panics while holding the lock"),
+        )
+    }
+
+    /// Every entry so far, in order.
     #[must_use]
     pub fn entries(&self) -> Vec<Stamped> {
-        self.entries
-            .lock()
-            .expect("no ledger writer panics while holding the lock")
-            .clone()
+        self.with(<[Stamped]>::to_vec)
     }
 
     /// How many daemon boots the ledger has seen.
     ///
     /// # Panics
-    /// A writer panicked while holding the lock.
+    /// More than 2^32 boots.
     #[must_use]
     pub fn boots(&self) -> u32 {
-        let entries = self.entries();
-        let count = entries
-            .iter()
-            .filter(|stamped| matches!(stamped.entry, Entry::Boot { .. }))
-            .count();
+        let count = self.with(|entries| {
+            entries
+                .iter()
+                .filter(|stamped| matches!(stamped.entry, Entry::Boot { .. }))
+                .count()
+        });
         u32::try_from(count).expect("fewer than 2^32 boots")
     }
 
     /// How many log recoveries the ledger has seen.
     #[must_use]
     pub fn recoveries(&self) -> usize {
-        self.entries()
-            .iter()
-            .filter(|stamped| matches!(stamped.entry, Entry::Recovered { .. }))
-            .count()
+        self.with(|entries| {
+            entries
+                .iter()
+                .filter(|stamped| matches!(stamped.entry, Entry::Recovered { .. }))
+                .count()
+        })
     }
 
     /// How many records the daemon's log holds as far as anyone was told:
     /// the last recovery plus every acknowledged group commit since.
     #[must_use]
     pub fn logged(&self) -> u64 {
-        let mut logged = 0u64;
-        for stamped in self.entries() {
-            match &stamped.entry {
-                Entry::Created => logged = 0,
-                Entry::Recovered { records } => {
-                    logged = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        self.with(|entries| {
+            let mut logged = 0u64;
+            for stamped in entries {
+                match &stamped.entry {
+                    Entry::Created => logged = 0,
+                    Entry::Recovered { records } => {
+                        logged = u64::try_from(records.len()).unwrap_or(u64::MAX);
+                    }
+                    Entry::Acked { records, .. } => {
+                        let added = u64::try_from(records.len()).unwrap_or(u64::MAX);
+                        logged = logged.saturating_add(added);
+                    }
+                    Entry::Boot { .. }
+                    | Entry::Mutation { .. }
+                    | Entry::Wrote { .. }
+                    | Entry::Fault(_)
+                    | Entry::User(_)
+                    | Entry::GaveUp { .. }
+                    | Entry::Read { .. }
+                    | Entry::Shell(_)
+                    | Entry::Caught { .. } => {}
                 }
-                Entry::Acked { records, .. } => {
-                    let added = u64::try_from(records.len()).unwrap_or(u64::MAX);
-                    logged = logged.saturating_add(added);
-                }
-                Entry::Boot { .. }
-                | Entry::Mutation { .. }
-                | Entry::Wrote { .. }
-                | Entry::Fault(_)
-                | Entry::User(_)
-                | Entry::GaveUp { .. }
-                | Entry::Read { .. }
-                | Entry::Shell(_)
-                | Entry::Caught { .. } => {}
             }
-        }
-        logged
+            logged
+        })
     }
 
-    /// The run's trace: one line per entry, simulated time first. Two runs of
-    /// one seed must produce identical traces.
+    /// The run's trace so far ([`trace`]).
     #[must_use]
     pub fn trace(&self) -> Vec<String> {
-        self.entries()
-            .iter()
-            .map(|stamped| format!("{:>8}ms {:?}", stamped.at.as_millis(), stamped.entry))
-            .collect()
+        self.with(trace)
     }
+}
+
+/// A run's trace: one line per entry, simulated time first. Two runs of one
+/// seed must produce identical traces.
+#[must_use]
+pub fn trace(entries: &[Stamped]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|stamped| format!("{:>8}ms {:?}", stamped.at.as_millis(), stamped.entry))
+        .collect()
 }

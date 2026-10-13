@@ -16,7 +16,9 @@
 use std::io::{self, Write as _};
 
 use clap::{Parser, Subcommand};
-use verified_sim::run::{self, Outcome, RunError};
+use verified_server::shell::Planted;
+use verified_sim::run::{self, Broken, Outcome, RunError};
+use verified_sim::scenario::Scenario;
 use verified_sim::{coverage, directed};
 
 #[derive(Debug, Parser)]
@@ -79,8 +81,8 @@ enum Command {
 enum Failure {
     #[error(transparent)]
     Run(#[from] RunError),
-    #[error("seed {seed} broke {count} invariants")]
-    Violated { seed: u64, count: usize },
+    #[error(transparent)]
+    Broken(#[from] Broken),
     #[error("writing the report: {0}")]
     Io(#[from] io::Error),
     #[error("tracing seed {seed} in a fresh process failed")]
@@ -111,33 +113,28 @@ fn trace_in_process(seed: u64) -> Result<Vec<u8>, Failure> {
     }
 }
 
-fn report(out: &mut impl io::Write, outcome: &Outcome) -> Result<(), Failure> {
+fn report(out: &mut impl io::Write, outcome: Outcome) -> Result<(), Failure> {
     writeln!(
         out,
         "seed {}: {} trace lines, {} violations",
         outcome.scenario.seed,
-        outcome.trace.len(),
+        outcome.entries.len(),
         outcome.violations.len()
     )?;
-    if let Some(replayed) = &outcome.replayed {
-        writeln!(
+    match &outcome.replayed {
+        Ok(replayed) => writeln!(
             out,
             "  replayed {} observations through the model, reaching {} coverage keys",
             replayed.observations,
             replayed.keys.len()
-        )?;
+        )?,
+        Err(mismatch) => writeln!(out, "  {mismatch}")?,
     }
     for violation in &outcome.violations {
         writeln!(out, "  {violation}")?;
     }
-    if outcome.violations.is_empty() {
-        Ok(())
-    } else {
-        Err(Failure::Violated {
-            seed: outcome.scenario.seed,
-            count: outcome.violations.len(),
-        })
-    }
+    outcome.verdict()?;
+    Ok(())
 }
 
 fn main() -> Result<(), Failure> {
@@ -146,16 +143,16 @@ fn main() -> Result<(), Failure> {
     match args.command {
         Command::Sweep { from, count } => {
             for seed in from..from.saturating_add(count) {
-                let outcome = run::twice(seed)?;
-                report(&mut out, &outcome)?;
+                let outcome = run::twice(&Scenario::from_seed(seed))?;
+                report(&mut out, outcome)?;
             }
             Ok(())
         }
         Command::Replay { seed, trace } => {
-            let outcome = match run::twice(seed) {
+            let outcome = match run::twice(&Scenario::from_seed(seed)) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    for line in &error.trace {
+                    for line in error.trace() {
                         writeln!(out, "{line}")?;
                     }
                     return Err(error.into());
@@ -163,11 +160,11 @@ fn main() -> Result<(), Failure> {
             };
             writeln!(out, "{:#?}", outcome.scenario)?;
             if trace {
-                for line in &outcome.trace {
+                for line in outcome.trace() {
                     writeln!(out, "{line}")?;
                 }
             }
-            report(&mut out, &outcome)
+            report(&mut out, outcome)
         }
         Command::Processes { from, count } => {
             for seed in from..from.saturating_add(count) {
@@ -201,9 +198,9 @@ fn main() -> Result<(), Failure> {
         }
         Command::Trace { seed, runs } => {
             for run in 0..runs {
-                let trace = match run::simulate(seed) {
-                    Ok(outcome) => outcome.trace,
-                    Err(error) => error.trace,
+                let trace = match run::once(&Scenario::from_seed(seed), Planted::default()) {
+                    Ok(outcome) => outcome.trace(),
+                    Err(error) => error.trace().to_vec(),
                 };
                 writeln!(out, "run {run}")?;
                 for line in &trace {
