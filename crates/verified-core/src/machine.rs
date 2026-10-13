@@ -635,14 +635,6 @@ impl<P: Payload> Call<P> {
     }
 }
 
-/// Whether the decision re-announces calls awaiting approval.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[verifier::external_derive]
-enum Ask {
-    Yes,
-    No,
-}
-
 /// Which dispatched calls the decision starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[verifier::external_derive]
@@ -869,11 +861,53 @@ impl<P: Payload> Plan<P> {
         self.emit(Record::ToolResult { call: CallIx(index), exit, output: None });
     }
 
-    /// Starts every tool run the decision licenses, announces calls
-    /// awaiting the user if `ask`, and hands the decision over.
+    /// Announces each call of the current step that awaits the user: an
+    /// `Unsafe` call still proposed, unless the turn is being cancelled.
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn ask(&mut self)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).start == old(self).start,
+            final(self).from == old(self).from,
+            final(self).scratch@ == old(self).scratch@,
+    {
+        let Some(open) = self.open() else {
+            return;
+        };
+        if matches!(open.intent, Intent::Cancel) {
+            return;
+        }
+        let count = self.scratch.calls.len();
+        let mut index = open.first_call;
+        while index < count
+            invariant
+                self.inv(),
+                self.start == old(self).start,
+                self.from == old(self).from,
+                self.scratch@ == old(self).scratch@,
+                count == self.scratch.calls@.len(),
+            decreases count - index,
+        {
+            if matches!(self.scratch.calls[index].phase, Phase::Proposed) && matches!(
+                self.scratch.calls[index].rerun,
+                Some(Rerun::Unsafe),
+            ) {
+                if let Some(args) = &self.scratch.calls[index].args {
+                    let request = effect::pending(CallIx(index), self.scratch.calls[index].id.clone(), args.clone());
+                    self.effect(Effect::AskApproval { request });
+                }
+            }
+            index += 1;
+        }
+    }
+
+    /// Starts every tool run the decision licenses and hands the decision
+    /// over.
     #[verifier::loop_isolation(false)]
     #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
-    fn finish(self, outcome: Outcome, ask: Ask, runs: Runs) -> (decision: Decision<P>)
+    fn finish(self, outcome: Outcome, runs: Runs) -> (decision: Decision<P>)
         requires
             self.inv(),
             runs is All ==> self.scratch@.epoch > self.start@.epoch,
@@ -934,53 +968,6 @@ impl<P: Payload> Plan<P> {
                 }
             }
             index += 1;
-        }
-        match (ask, plan.scratch.turn) {
-            (Ask::Yes, Turn::Open(open)) => match open.intent {
-                Intent::Proceed => {
-                    let mut index = open.first_call;
-                    while index < count
-                        invariant
-                            plan.scratch.wf(),
-                            count == plan.scratch.calls@.len(),
-                            runs_ok(origin, plan.scratch@, plan.effects@, reruns),
-                        decreases count - index,
-                    {
-                        if matches!(plan.scratch.calls[index].phase, Phase::Proposed) {
-                            if let Some(args) = &plan.scratch.calls[index].args {
-                                match P::tool(args).rerun() {
-                                    Rerun::Unsafe => {
-                                        let request = effect::pending(
-                                            CallIx(index),
-                                            plan.scratch.calls[index].id.clone(),
-                                            args.clone(),
-                                        );
-                                        let ghost before = plan.effects@;
-                                        plan.effects.push(Effect::AskApproval { request });
-                                        proof {
-                                            assert forall|at: int|
-                                                0 <= at < plan.effects@.len() && (
-                                                #[trigger] plan.effects@[at]) is RunTool implies licensed(
-                                                plan.scratch@,
-                                                plan.effects@[at]->call,
-                                            ) && (fresh(origin, plan.effects@[at]->call) || (reruns
-                                                && rerun(origin, plan.scratch@, plan.effects@[at]->call))) by {
-                                                if at < before.len() {
-                                                    assert(plan.effects@[at] == before[at]);
-                                                }
-                                            }
-                                        };
-                                    },
-                                    Rerun::Safe => {},
-                                }
-                            }
-                        }
-                        index += 1;
-                    }
-                },
-                Intent::Cancel => {},
-            },
-            (Ask::Yes | Ask::No, Turn::Idle) | (Ask::No, Turn::Open(_)) => {},
         }
         Decision { records: plan.records, effects: plan.effects, outcome }
     }
@@ -1741,7 +1728,7 @@ impl<P: Payload> Core<P> {
         let mut plan = self.plan();
         plan.emit(Record::TurnStarted { turn, message, text });
         self.start_step(&mut plan, StepId { turn, index: 0 });
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     fn on_approve(&self, call: &CallId, verdict: Verdict) -> (decision: Decision<P>)
@@ -1795,7 +1782,7 @@ impl<P: Payload> Core<P> {
             Verdict::Deny => plan.resolve(index, Exit::Err(Cause::Denied)),
         }
         self.settle(&mut plan);
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     fn on_interrupt(&self, turn: TurnId) -> (decision: Decision<P>)
@@ -1843,7 +1830,7 @@ impl<P: Payload> Core<P> {
                 self.settle(&mut plan);
             },
         }
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     /// The running turn if model call `id` is the live one.
@@ -1880,7 +1867,7 @@ impl<P: Payload> Core<P> {
         };
         let mut plan = self.plan();
         plan.emit(Record::ModelOutput { step: open.step, parts });
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     /// Whether two of `calls` share an id.
@@ -1962,7 +1949,8 @@ impl<P: Payload> Core<P> {
                 },
             },
         }
-        plan.finish(Outcome::Accepted, Ask::Yes, Runs::New)
+        plan.ask();
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
@@ -2009,7 +1997,7 @@ impl<P: Payload> Core<P> {
         }
         plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
         self.settle(&mut plan);
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     fn on_woke(&self, id: EffectId) -> (decision: Decision<P>)
@@ -2035,7 +2023,7 @@ impl<P: Payload> Core<P> {
                 plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
             },
         }
-        plan.finish(Outcome::Accepted, Ask::No, Runs::New)
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     // -----------------------------------------------------------------------
@@ -2079,7 +2067,8 @@ impl<P: Payload> Core<P> {
                 },
             }
         }
-        plan.finish(Outcome::Accepted, Ask::Yes, Runs::All)
+        plan.ask();
+        plan.finish(Outcome::Accepted, Runs::All)
     }
 
     /// Resolves each dispatched call with no result that cannot be rerun:
