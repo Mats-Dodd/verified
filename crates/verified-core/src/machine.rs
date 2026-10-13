@@ -59,8 +59,6 @@ use core::fmt;
 use vstd::prelude::*;
 
 #[cfg(verus_only)]
-use verified_domain::id::same_step;
-#[cfg(verus_only)]
 use verified_domain::record::rerun_of;
 use verified_domain::{
     Approver, CallId, CallIx, Cause, EffectId, Epoch, Exit, Failure, Fault, Limit, Limits,
@@ -174,7 +172,7 @@ pub open spec fn call_ok(call: CallView) -> bool {
 
 /// Whether `message` already started a turn.
 pub open spec fn seen_message(messages: Seq<MessageId>, message: MessageId) -> bool {
-    exists|at: int| 0 <= at < messages.len() && (#[trigger] messages[at])@ == message@
+    exists|at: int| 0 <= at < messages.len() && #[trigger] messages[at] == message
 }
 
 /// Policy approves only `Safe` calls; the user may approve any valid one.
@@ -198,7 +196,7 @@ pub open spec fn state_ok(view: CoreView) -> bool {
     &&& match view.turn {
         Turn::Idle => resolved(view.calls, 0, view.calls.len() as int),
         Turn::Open(open) => {
-            &&& open.step.turn@ == open.turn@
+            &&& open.step.turn == open.turn
             &&& open.first_call <= view.calls.len()
             &&& match open.stage {
                 Stage::Tools => resolved(view.calls, 0, open.first_call as int),
@@ -271,7 +269,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         Record::StepStarted { step } => match view.turn {
             Turn::Idle => None,
             Turn::Open(open) => {
-                if step.turn@ != open.turn@ || open.intent is Cancel {
+                if step.turn != open.turn || open.intent is Cancel {
                     None
                 } else {
                     let retries: Option<usize> = match open.stage {
@@ -313,7 +311,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             },
         },
         Record::ModelOutput { step, .. } => match view.turn {
-            Turn::Open(open) => if open.stage is Model && same_step(step, open.step) {
+            Turn::Open(open) => if open.stage is Model && step == open.step {
                 Some(CoreView { seq, ..view })
             } else {
                 None
@@ -322,7 +320,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         },
         Record::StepReset { step, reason } => match view.turn {
             Turn::Open(open) => {
-                if !(open.stage is Model) || open.intent is Cancel || !same_step(step, open.step) {
+                if !(open.stage is Model) || open.intent is Cancel || step != open.step {
                     None
                 } else {
                     let retries = match reason {
@@ -351,7 +349,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             Turn::Idle => None,
         },
         Record::StepFinished { step, calls } => match view.turn {
-            Turn::Open(open) => if open.stage is Model && same_step(step, open.step) {
+            Turn::Open(open) => if open.stage is Model && step == open.step {
                 Some(
                     CoreView {
                         seq,
@@ -444,7 +442,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             Turn::Idle => None,
         },
         Record::CancelRequested { turn } => match view.turn {
-            Turn::Open(open) => if turn@ == open.turn@ && open.intent is Proceed {
+            Turn::Open(open) => if turn == open.turn && open.intent is Proceed {
                 Some(
                     CoreView { seq, turn: Turn::Open(Open { intent: Intent::Cancel, ..open }), ..view },
                 )
@@ -454,7 +452,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             Turn::Idle => None,
         },
         Record::TurnEnded { turn, outcome } => match view.turn {
-            Turn::Open(open) => if turn@ == open.turn@ && ending_fits(open.intent, outcome)
+            Turn::Open(open) => if turn == open.turn && ending_fits(open.intent, outcome)
                 && resolved(view.calls, 0, view.calls.len() as int) {
                 Some(CoreView { seq, turn: Turn::Idle, ..view })
             } else {
@@ -1531,11 +1529,11 @@ impl<P: Payload> Core<P> {
         while index < self.messages.len()
             invariant
                 index <= self.messages@.len(),
-                forall|at: int| 0 <= at < index ==> (#[trigger] self.messages@[at])@ != message@,
+                forall|at: int| 0 <= at < index ==> #[trigger] self.messages@[at] != message,
             decreases self.messages@.len() - index,
         {
             if self.messages[index].same(message) {
-                assert(self.messages@[index as int]@ == message@);
+                assert(self.messages@[index as int] == message);
                 return true;
             }
             index += 1;
@@ -2118,7 +2116,7 @@ pub open spec fn may_start(view: CoreView, turn: TurnId, index: int) -> bool {
     match view.turn {
         Turn::Open(open) => {
             &&& open.intent is Proceed
-            &&& turn@ == open.turn@
+            &&& turn == open.turn
             &&& resolved(view.calls, 0, view.calls.len() as int)
             &&& match open.stage {
                 Stage::Starting => index == 0,

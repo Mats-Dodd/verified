@@ -11,8 +11,9 @@
 //! ASCII tokens minted by the daemon or the model provider.
 //!
 //! The core's own ids (`StepId`, `CallIx`, `Epoch`, `EffectId`) are derived
-//! from the log. The ids the core's proofs mention live inside `verus!` and
-//! expose a `View` (the raw value) so specifications can compare them.
+//! from the log. The ids the core's proofs mention live inside `verus!`, where
+//! specifications compare them structurally (`==`); exec code compares them
+//! with `same`, whose result Verus knows.
 
 use core::fmt;
 use core::str::FromStr;
@@ -42,30 +43,6 @@ pub struct MessageId(u128);
 #[verifier::external_derive]
 pub struct TurnId(u128);
 
-impl View for SessionId {
-    type V = u128;
-
-    closed spec fn view(&self) -> u128 {
-        self.0
-    }
-}
-
-impl View for MessageId {
-    type V = u128;
-
-    closed spec fn view(&self) -> u128 {
-        self.0
-    }
-}
-
-impl View for TurnId {
-    type V = u128;
-
-    closed spec fn view(&self) -> u128 {
-        self.0
-    }
-}
-
 impl SessionId {
     /// The id minted at `at` with `entropy` from the Entropy seam.
     #[verifier::external]
@@ -82,10 +59,7 @@ impl SessionId {
     }
 
     #[must_use]
-    pub const fn as_u128(self) -> (value: u128)
-        ensures
-            value == self@,
-    {
+    pub const fn as_u128(self) -> u128 {
         self.0
     }
 }
@@ -106,10 +80,7 @@ impl MessageId {
     }
 
     #[must_use]
-    pub const fn as_u128(self) -> (value: u128)
-        ensures
-            value == self@,
-    {
+    pub const fn as_u128(self) -> u128 {
         self.0
     }
 
@@ -117,7 +88,7 @@ impl MessageId {
     #[must_use]
     pub const fn same(self, other: Self) -> (same: bool)
         ensures
-            same == (self@ == other@),
+            same == (self == other),
     {
         self.0 == other.0
     }
@@ -139,10 +110,7 @@ impl TurnId {
     }
 
     #[must_use]
-    pub const fn as_u128(self) -> (value: u128)
-        ensures
-            value == self@,
-    {
+    pub const fn as_u128(self) -> u128 {
         self.0
     }
 
@@ -150,7 +118,7 @@ impl TurnId {
     #[must_use]
     pub const fn same(self, other: Self) -> (same: bool)
         ensures
-            same == (self@ == other@),
+            same == (self == other),
     {
         self.0 == other.0
     }
@@ -164,16 +132,11 @@ pub struct StepId {
     pub index: u32,
 }
 
-/// Whether two steps are the same step of the same turn.
-pub open spec fn same_step(one: StepId, other: StepId) -> bool {
-    one.turn@ == other.turn@ && one.index == other.index
-}
-
 impl StepId {
     #[must_use]
     pub const fn same(self, other: StepId) -> (same: bool)
         ensures
-            same == same_step(self, other),
+            same == (self == other),
     {
         self.turn.same(other.turn) && self.index == other.index
     }
