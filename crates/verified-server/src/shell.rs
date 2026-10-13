@@ -182,11 +182,11 @@ enum Input {
 /// changes from process to process. A [`Notify`] wakes them in the order
 /// they started waiting, so a simulated run replays exactly.
 #[derive(Clone)]
-pub struct Tail {
-    shared: Arc<TailState>,
+pub struct Committed {
+    shared: Arc<CommittedState>,
 }
 
-struct TailState {
+struct CommittedState {
     #[expect(
         clippy::disallowed_types,
         reason = "written only by the session task after each commit (it only grows); \
@@ -201,29 +201,29 @@ struct TailState {
     notify: Notify,
 }
 
-impl fmt::Debug for Tail {
+impl fmt::Debug for Committed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("Tail")
+            .debug_struct("Committed")
             .field("next", &self.get())
             .finish_non_exhaustive()
     }
 }
 
-impl Tail {
+impl Committed {
     #[expect(
         clippy::disallowed_types,
-        reason = "the atomics described on TailState"
+        reason = "the atomics described on CommittedState"
     )]
-    fn new(next: u64) -> (Self, TailWriter) {
+    fn new(next: u64) -> (Self, CommittedWriter) {
         let tail = Self {
-            shared: Arc::new(TailState {
+            shared: Arc::new(CommittedState {
                 next: core::sync::atomic::AtomicU64::new(next),
                 open: core::sync::atomic::AtomicBool::new(true),
                 notify: Notify::new(),
             }),
         };
-        (tail.clone(), TailWriter { tail })
+        (tail.clone(), CommittedWriter { tail })
     }
 
     /// The seq the next record will get.
@@ -254,13 +254,13 @@ impl Tail {
     }
 }
 
-/// The session's side of its [`Tail`]; dropping it tells followers the
+/// The session's side of its [`Committed`]; dropping it tells followers the
 /// session stopped.
-struct TailWriter {
-    tail: Tail,
+struct CommittedWriter {
+    tail: Committed,
 }
 
-impl TailWriter {
+impl CommittedWriter {
     fn set(&self, next: u64) {
         self.tail
             .shared
@@ -270,7 +270,7 @@ impl TailWriter {
     }
 }
 
-impl Drop for TailWriter {
+impl Drop for CommittedWriter {
     fn drop(&mut self) {
         self.tail
             .shared
@@ -285,7 +285,7 @@ impl Drop for TailWriter {
 pub struct SessionHandle {
     session: SessionId,
     inbox: mpsc::Sender<Input>,
-    tail: Tail,
+    tail: Committed,
     /// One permit per live stream follower (`sse_followers_per_session`).
     followers: Arc<Semaphore>,
 }
@@ -360,7 +360,7 @@ impl SessionHandle {
 
     /// The seq the next record will get; changes after every commit.
     #[must_use]
-    pub fn tail(&self) -> Tail {
+    pub fn tail(&self) -> Committed {
         self.tail.clone()
     }
 
@@ -383,7 +383,7 @@ pub struct Session {
     seams: Seams,
     config: Arc<ShellConfig>,
     inbox: mpsc::Sender<Input>,
-    tail: TailWriter,
+    tail: CommittedWriter,
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
@@ -441,7 +441,7 @@ impl Session {
             chunks.push(projected);
         }
         let (inbox, receiver) = mpsc::channel(config.limits.session_inbox);
-        let (tail_receiver, tail) = Tail::new(core.seq());
+        let (tail_receiver, tail) = Committed::new(core.seq());
         let handle = SessionHandle {
             session,
             inbox: inbox.clone(),

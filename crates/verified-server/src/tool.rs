@@ -155,13 +155,13 @@ pub const fn stopped(why: Stopped) -> &'static str {
 }
 
 /// The tail of a command's output, at most `limit` bytes.
-struct Tail {
+struct Kept {
     bytes: VecDeque<u8>,
     omitted: u64,
     limit: usize,
 }
 
-impl Tail {
+impl Kept {
     fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend(chunk);
         while self.bytes.len() > self.limit {
@@ -171,8 +171,8 @@ impl Tail {
     }
 }
 
-async fn collect(mut output: mpsc::Receiver<Vec<u8>>, limit: usize) -> Tail {
-    let mut tail = Tail {
+async fn collect(mut output: mpsc::Receiver<Vec<u8>>, limit: usize) -> Kept {
+    let mut tail = Kept {
         bytes: VecDeque::with_capacity(limit),
         omitted: 0,
         limit,
