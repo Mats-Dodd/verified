@@ -122,8 +122,9 @@ fn report(out: &mut impl io::Write, outcome: &Outcome) -> Result<(), Failure> {
     if let Some(replayed) = &outcome.replayed {
         writeln!(
             out,
-            "  replayed {} observations through the model: {:?}",
-            replayed.observations, replayed.actions
+            "  replayed {} observations through the model, reaching {} coverage keys",
+            replayed.observations,
+            replayed.keys.len()
         )?;
     }
     for violation in &outcome.violations {

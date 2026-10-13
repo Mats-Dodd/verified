@@ -58,6 +58,51 @@ pub enum Action {
     Reconnect,
 }
 
+/// The kind of an [`Action`], without its values.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    Send,
+    Answer,
+    Interrupt,
+    Execute,
+    Parts,
+    Finish,
+    Fail,
+    ToolDone,
+    Woke,
+    OrphanExecute,
+    OrphanComplete,
+    Duplicate,
+    Sync,
+    Crash,
+    Read,
+    Reconnect,
+}
+
+impl Action {
+    #[must_use]
+    pub const fn kind(&self) -> Kind {
+        match self {
+            Self::Send(_) => Kind::Send,
+            Self::Answer(..) => Kind::Answer,
+            Self::Interrupt(_) => Kind::Interrupt,
+            Self::Execute(_) => Kind::Execute,
+            Self::Parts(..) => Kind::Parts,
+            Self::Finish(..) => Kind::Finish,
+            Self::Fail(..) => Kind::Fail,
+            Self::ToolDone(..) => Kind::ToolDone,
+            Self::Woke(_) => Kind::Woke,
+            Self::OrphanExecute(_) => Kind::OrphanExecute,
+            Self::OrphanComplete(_) => Kind::OrphanComplete,
+            Self::Duplicate => Kind::Duplicate,
+            Self::Sync => Kind::Sync,
+            Self::Crash(_) => Kind::Crash,
+            Self::Read => Kind::Read,
+            Self::Reconnect => Kind::Reconnect,
+        }
+    }
+}
+
 /// The values actions may carry.
 #[derive(Clone, Debug)]
 pub enum Domain {

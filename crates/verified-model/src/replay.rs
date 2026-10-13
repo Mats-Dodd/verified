@@ -25,7 +25,7 @@
 //! observed, the state the model was in and what it allowed there.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use stateright::{Expectation, Model as _};
 use verified_core::{Event, ModelExit};
@@ -121,8 +121,6 @@ pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
 pub struct Replayed {
     /// The observations replayed.
     pub observations: usize,
-    /// How often each kind of action was taken.
-    pub actions: BTreeMap<&'static str, usize>,
     /// The coverage keys of every step taken.
     pub keys: BTreeSet<Key>,
     /// The state the run ended in.
@@ -218,29 +216,6 @@ pub fn summary(world: &World) -> String {
         world.client.cursor,
         world.crashes,
     )
-}
-
-/// The name of an action's kind.
-#[must_use]
-pub const fn kind(action: &Action) -> &'static str {
-    match action {
-        Action::Send(_) => "Send",
-        Action::Answer(..) => "Answer",
-        Action::Interrupt(_) => "Interrupt",
-        Action::Execute(_) => "Execute",
-        Action::Parts(..) => "Parts",
-        Action::Finish(..) => "Finish",
-        Action::Fail(..) => "Fail",
-        Action::ToolDone(..) => "ToolDone",
-        Action::Woke(_) => "Woke",
-        Action::OrphanExecute(_) => "OrphanExecute",
-        Action::OrphanComplete(_) => "OrphanComplete",
-        Action::Duplicate => "Duplicate",
-        Action::Sync => "Sync",
-        Action::Crash(_) => "Crash",
-        Action::Read => "Read",
-        Action::Reconnect => "Reconnect",
-    }
 }
 
 /// The actions `harness` enables at `world`.
@@ -540,7 +515,6 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
         });
     }
     let interrupted = interrupted(trace);
-    let mut actions: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for (index, observed) in (1..).zip(rest) {
         let mut after = world.clone();
@@ -548,8 +522,6 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
             for action in taken {
                 let next = take(harness, &after, &action)?;
                 keys.extend(coverage::keys(harness, &after, &action, &next));
-                let count = actions.entry(kind(&action)).or_default();
-                *count = count.saturating_add(1);
                 after = next;
             }
             agrees(harness, &world, after, observed)
@@ -565,7 +537,6 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
     }
     Ok(Replayed {
         observations: trace.len(),
-        actions,
         keys,
         end: world,
     })

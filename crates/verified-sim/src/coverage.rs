@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use verified_model::coverage::{Gap, Key, classify, explore};
-use verified_model::replay::kind;
 use verified_model::{Action, suite};
 
 use crate::directed::{self, DirectedError};
@@ -115,7 +114,7 @@ pub fn gaps(modelled: &Modelled, simulated: &Simulated) -> Vec<(Key, Gap, &'stat
 fn kinds(witness: &[Action]) -> String {
     witness
         .iter()
-        .map(|action| kind(action))
+        .map(|action| format!("{:?}", action.kind()))
         .collect::<Vec<_>>()
         .join(" ")
 }

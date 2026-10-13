@@ -2,8 +2,7 @@
 //!
 //! A key is not a state. It names what happened on one step (one edge of
 //! the model): how a call was resolved and how far it got first, a crash
-//! with a tool run in flight, a tool of a crashed daemon acting, a kind of
-//! action, how a turn ended, or one of a few [`Situation`]s. Keys come from
+//! with a tool run in flight, a kind of action, how a turn ended, or one of a few [`Situation`]s. Keys come from
 //! the edge alone (the state before, the action, the state after), so BFS
 //! can collect them for every edge it explores ([`explore`]) and a replay for
 //! every step a run takes ([`Replayed::keys`](crate::Replayed::keys)). The
@@ -19,8 +18,7 @@ use verified_domain::{
     Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome,
 };
 
-use crate::harness::{Action, Harness};
-use crate::replay::kind;
+use crate::harness::{Action, Harness, Kind};
 use crate::world::{Job, World};
 
 /// A call's class: what its approval and a crash do to it.
@@ -128,8 +126,6 @@ pub enum Situation {
     SecondBatch,
     /// Two `Unsafe` runs had acted and neither had reported.
     UnsafeTogether,
-    /// A call was dispatched again after a crash.
-    Redispatched(Class),
     /// A step was reset to retry its model call.
     StepRetried,
     /// A step was reset because the daemon restarted under it.
@@ -154,10 +150,8 @@ pub enum Key {
         class: Class,
         ran: bool,
     },
-    /// A tool run of a crashed daemon acted after the crash.
-    OrphanRan(Class),
     /// An action of this kind was taken.
-    Action(&'static str),
+    Action(Kind),
     /// A turn ended so.
     Turn(Ended),
     Situation(Situation),
@@ -181,8 +175,7 @@ impl fmt::Display for Key {
                 "crash {} the {class:?} run acted",
                 if *ran { "after" } else { "before" }
             ),
-            Self::OrphanRan(class) => write!(formatter, "orphan {class:?} run acts"),
-            Self::Action(name) => write!(formatter, "action {name}"),
+            Self::Action(kind) => write!(formatter, "action {kind:?}"),
             Self::Turn(ended) => write!(formatter, "turn {ended:?}"),
             Self::Situation(situation) => write!(formatter, "{situation:?}"),
         }
@@ -233,9 +226,6 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
             }
             Record::Dispatched { call } => {
                 if let Some(call) = calls.get_mut(call.0) {
-                    if new && call.dispatched.is_some() {
-                        keys.insert(Key::Situation(Situation::Redispatched(call.class)));
-                    }
                     call.dispatched = Some(at);
                 }
             }
@@ -296,7 +286,7 @@ const fn class(job: &Job) -> Option<Class> {
 /// The keys of the step `before` --`action`--> `after`.
 #[must_use]
 pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -> BTreeSet<Key> {
-    let mut keys = BTreeSet::from([Key::Action(kind(action))]);
+    let mut keys = BTreeSet::from([Key::Action(action.kind())]);
     let situation = |keys: &mut BTreeSet<Key>, situation| {
         keys.insert(Key::Situation(situation));
     };
@@ -324,11 +314,6 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                 );
             }
             decided(after, &mut keys);
-        }
-        Action::OrphanExecute(id) => {
-            if let Some(class) = before.orphans.get(id).and_then(|flight| class(&flight.job)) {
-                keys.insert(Key::OrphanRan(class));
-            }
         }
         Action::Execute(_) => {
             if before.persisting() {
@@ -383,7 +368,8 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
         | Action::Fail(..)
         | Action::ToolDone(..)
         | Action::Woke(_) => decided(after, &mut keys),
-        Action::OrphanComplete(_) | Action::Duplicate | Action::Sync => {}
+        Action::OrphanExecute(_) | Action::OrphanComplete(_) | Action::Duplicate | Action::Sync => {
+        }
     }
     keys
 }
@@ -472,36 +458,49 @@ pub enum Gap {
 
 /// The class of a gap at `key`, and why.
 #[must_use]
-pub fn classify(key: &Key) -> (Gap, &'static str) {
-    const ORPHAN: (Gap, &str) = (
-        Gap::Fidelity,
-        "a real tool's child process outlives the daemon and may act after the \
-         crash; the simulation's tool tasks die with the turmoil host",
-    );
+pub const fn classify(key: &Key) -> (Gap, &'static str) {
     const TEST: (Gap, &str) = (
         Gap::Test,
         "the real daemon can do it and the simulation could; no seed did",
     );
     match key {
-        Key::Action(name) => match *name {
-            "Duplicate" => (
-                Gap::OverApproximation,
-                "a run's task reports its completion once; the model redelivers one",
-            ),
-            "OrphanComplete" => (
-                Gap::OverApproximation,
-                "a crashed daemon's tasks and channels die with its process; no \
-                 reply of theirs reaches the next daemon",
-            ),
-            "OrphanExecute" => ORPHAN,
-            _ => TEST,
-        },
-        Key::OrphanRan(_) => ORPHAN,
+        Key::Action(Kind::Duplicate) => (
+            Gap::OverApproximation,
+            "a run's task reports its completion once; the model redelivers one",
+        ),
+        Key::Action(Kind::OrphanComplete) => (
+            Gap::OverApproximation,
+            "a crashed daemon's tasks and channels die with its process; no \
+             reply of theirs reaches the next daemon",
+        ),
+        Key::Action(Kind::OrphanExecute) => (
+            Gap::Fidelity,
+            "a real tool's child process outlives the daemon and may act after the \
+             crash; the simulation's tool tasks die with the turmoil host",
+        ),
         Key::Turn(Ended::Steps) => (
             Gap::Fidelity,
             "the fake model ends a turn after one round of tools; a real model may \
              call tools until the step limit",
         ),
-        Key::Call { .. } | Key::Crashed { .. } | Key::Turn(_) | Key::Situation(_) => TEST,
+        Key::Action(
+            Kind::Send
+            | Kind::Answer
+            | Kind::Interrupt
+            | Kind::Execute
+            | Kind::Parts
+            | Kind::Finish
+            | Kind::Fail
+            | Kind::ToolDone
+            | Kind::Woke
+            | Kind::Sync
+            | Kind::Crash
+            | Kind::Read
+            | Kind::Reconnect,
+        )
+        | Key::Call { .. }
+        | Key::Crashed { .. }
+        | Key::Turn(_)
+        | Key::Situation(_) => TEST,
     }
 }

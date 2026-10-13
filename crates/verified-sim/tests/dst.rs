@@ -13,7 +13,7 @@ use core::time::Duration;
 
 use verified_model::coverage::{Class, Key};
 use verified_model::replay::harness;
-use verified_model::{Bug, Harness, Mismatch, Observed};
+use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
 use verified_server::shell::Planted;
 use verified_sim::directed::{self, Directed, DirectedError};
@@ -268,25 +268,25 @@ fn the_fixed_seeds_replay_every_kind_of_step() {
             outcome.violations
         );
         let replayed = outcome.replayed.expect("a run without violations replays");
-        taken.extend(replayed.actions.into_keys());
+        taken.extend(replayed.keys);
     }
     for kind in [
-        "Send",
-        "Answer",
-        "Interrupt",
-        "Execute",
-        "Parts",
-        "Finish",
-        "Fail",
-        "ToolDone",
-        "Sync",
-        "Crash",
-        "Read",
-        "Reconnect",
+        Kind::Send,
+        Kind::Answer,
+        Kind::Interrupt,
+        Kind::Execute,
+        Kind::Parts,
+        Kind::Finish,
+        Kind::Fail,
+        Kind::ToolDone,
+        Kind::Sync,
+        Kind::Crash,
+        Kind::Read,
+        Kind::Reconnect,
     ] {
         assert!(
-            taken.contains(kind),
-            "no fixed seed replays a {kind}: {taken:?}"
+            taken.contains(&Key::Action(kind)),
+            "no fixed seed replays a {kind:?}: {taken:?}"
         );
     }
 }
