@@ -93,13 +93,6 @@ pub struct Seams {
     pub entropy: Box<dyn Entropy>,
 }
 
-/// Why the program stopped other than by quitting.
-#[derive(Debug, thiserror::Error)]
-pub enum RunError {
-    #[error(transparent)]
-    Terminal(#[from] TerminalError),
-}
-
 /// Everything that can wake the loop.
 enum Incoming {
     Event(Event),
@@ -240,7 +233,7 @@ pub async fn run(
     seams: Seams,
     screen: &mut dyn Screen,
     observe: &mut dyn FnMut(&App),
-) -> Result<App, RunError> {
+) -> Result<App, TerminalError> {
     let Seams {
         input,
         dialer,
@@ -265,7 +258,7 @@ pub async fn run(
     let mut outcome = Ok(());
     while flow == Flow::Continue {
         if let Err(error) = screen.draw(&mut |frame| app.view(frame)) {
-            outcome = Err(RunError::Terminal(error));
+            outcome = Err(error);
             break;
         }
         observe(&app);
@@ -295,7 +288,7 @@ pub async fn run(
                     None
                 }
                 Incoming::InputFailed(error) => {
-                    outcome = Err(RunError::Terminal(error));
+                    outcome = Err(error);
                     flow = Flow::Quit;
                     None
                 }

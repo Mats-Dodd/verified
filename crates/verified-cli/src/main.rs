@@ -27,7 +27,7 @@ use verified_server::seam::{Clock as _, FileLock, OsEntropy, SystemClock, World}
 use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::net;
 use verified_tui::app::Start;
-use verified_tui::tea::RunError;
+use verified_tui::seam::TerminalError;
 use verified_tui::terminal::{CrosstermInput, CrosstermScreen};
 
 // The shipped binary never links the simulation shims. Cargo unifies features
@@ -108,7 +108,7 @@ enum CliError {
     #[error("the TUI needs a terminal; run `verified daemon` for the daemon alone")]
     NotATerminal,
     #[error(transparent)]
-    Tui(#[from] RunError),
+    Tui(#[from] TerminalError),
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, CliError> {
@@ -280,7 +280,7 @@ async fn run_tui(project: PathBuf, session: Option<SessionId>) -> Result<(), Cli
         clock: Arc::new(clock),
         entropy: Box::new(entropy),
     };
-    let mut screen = CrosstermScreen::enter().map_err(RunError::from)?;
+    let mut screen = CrosstermScreen::enter()?;
     let ran = verified_tui::run(
         start,
         verified_tui::Limits::DEFAULT,
@@ -289,7 +289,7 @@ async fn run_tui(project: PathBuf, session: Option<SessionId>) -> Result<(), Cli
         &mut |_| {},
     )
     .await;
-    screen.leave().map_err(RunError::from)?;
+    screen.leave()?;
     ran?;
     Ok(())
 }
