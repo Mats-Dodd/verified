@@ -58,8 +58,8 @@ check.
   run is a path of the Stateright model, and every model property holds on
   each state the run passes through. It checks the shell's IO discipline
   against the model's rules of the world (act only after a durable
-  dispatch, at most once; a crash keeps a prefix of a pending group; the
-  stream serves only durable records), not only the world's outcome. It is
+  dispatch, at most once; a crash keeps a prefix of a pending group), not
+  only the world's outcome. It is
   only as strong as what the seeds reach: `just coverage` lists what BFS
   reaches and no seed does.
 - **Simulated** (DST): holds on every seed run, with the real daemon and TUI
@@ -80,8 +80,8 @@ Every entry passes all four parts of the admission rule.
 | U2 | **Policy approves only `Safe` calls.** An `Unsafe` call needs an approval command; it is never approved automatically. | Proved (`approver_fits`). Model-checked: `spec_apply` refuses a policy approval of an `Unsafe` call, so a log holding one does not recover. | Stateright `approval_by_policy_of_an_edit_is_caught`, which shows the proved grammar refusing it ("every durable prefix recovers" fails) |
 | U3 | **An `Unsafe` call is dispatched at most once, ever, and acts at most once.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Trace-checked (a dispatched run acts at most once). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
 | U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_interrupted_fails_the_replay` |
-| U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). Model-checked. | Mutation recorded in the commit that added this file |
-| U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Model-checked. Simulated (I6). The replay checks which offsets the client read and when; what it folded there is I6's. | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
+| U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). `spec_apply` is the one home of every clause on the log's shape (approval before dispatch, at most one result for a call, a turn ends once and only with every call resolved, an interrupted turn ends cancelled): a log that breaks one does not recover. Model-checked (every state's log recovers). | Mutation recorded in the commit that added this file |
+| U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Serving only durable records is structural: a read is an input to the shell, queued behind `persist`. Model-checked. Simulated (I6), the check of the real daemon and TUI. The replay checks which offsets the client read and when; what it folded there is I6's. | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
 
 ## Held, not yet admitted
 
@@ -93,7 +93,7 @@ planted shell bug has been seen to fail those checks, so none has moved up.
 
 | Property | Current check | Missing |
 |---|---|---|
-| Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked. Simulated (I5). | A planted bug: a duplicate or missing `ToolResult`. |
+| Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked: a second result is a log `spec_apply` refuses, and "quiescent implies the turn ended", which `spec_apply` allows only once every call resolved. The missing-result half has a Stateright planted bug (`leaving_an_unsafe_call_dispatched_after_a_crash_is_caught`). Simulated (I5). | A planted shell bug: a duplicate or missing `ToolResult`. |
 | Anything acknowledged survives a crash and replays. | Property-tested (`everything_acknowledged_replays`, `damage_before_a_later_group_is_corrupt`). Simulated (I4). | A committed DST planted bug, such as an append that skips fsync. |
 | A message starts at most one turn, so a retried command means the same thing. | `apply` refuses a duplicate message. Simulated (I8). | A planted bug. Is the core's refusal proved, or only checked at run time? |
 | An `edit` reported `Ok` wrote `new` in place of `old`. | Simulated (I7). | A committed planted bug (the mutation was only run once). |
@@ -221,8 +221,9 @@ described in `AGENTS.md` and the code.
   is keyed small (a call's class, how far it got and how it resolved; a
   crash against a run's act; situations such as a torn group). `just
   coverage A B` prints what BFS reaches and seeds `A..A+B` do not, each gap
-  classified, and the directed scenarios (a BFS witness compiled into a
-  scenario, its orderings kept as barrier holds) that close test gaps.
+  classified, and the directed scenarios that close test gaps: each a BFS
+  witness written out as a scenario, with the one ordering no seed promises
+  (two runs acting together) kept by a barrier.
 
 ## Deciding new work
 
