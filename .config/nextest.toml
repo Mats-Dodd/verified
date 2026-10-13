@@ -5,7 +5,7 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 leak-timeout = "500ms"
 
 # The simulation's tests spawn no subprocesses, yet under load nextest on
-# macOS reported LEAK on any of them, even the two-host `hello` test, past a
+# macOS reported LEAK on any of them past a
 # 3s window. The cause is the runner, not our teardown: macOS has no
 # `pipe2`, so a test's output pipe is created and only then marked
 # close-on-exec, and a sibling test that nextest spawns from another thread

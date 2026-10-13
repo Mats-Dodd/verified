@@ -94,7 +94,7 @@ planted shell bug has been seen to fail those checks, so none has moved up.
 | Property | Current check | Missing |
 |---|---|---|
 | Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked: a second result is a log `spec_apply` refuses, and "quiescent implies the turn ended", which `spec_apply` allows only once every call resolved. The missing-result half has a Stateright planted bug (`leaving_an_unsafe_call_dispatched_after_a_crash_is_caught`). Simulated (I5). | A planted shell bug: a duplicate or missing `ToolResult`. |
-| Anything acknowledged survives a crash and replays. | Property-tested (`everything_acknowledged_replays`, `damage_before_a_later_group_is_corrupt`). Simulated (I4). | A committed DST planted bug, such as an append that skips fsync. |
+| Anything acknowledged survives a crash and replays. | Property-tested (`everything_acknowledged_replays`, `damage_before_a_later_group_is_corrupt`). Trace-checked: each group the log acknowledges must be the model's next sync, and each boot must find every synced record, then a prefix of the pending group. | A committed DST planted bug, such as an append that skips fsync. |
 | A message starts at most one turn, so a retried command means the same thing. | `apply` refuses a duplicate message. Simulated (I8). | A planted bug. Is the core's refusal proved, or only checked at run time? |
 | An `edit` reported `Ok` wrote `new` in place of `old`. | Simulated (I7). | A committed planted bug (the mutation was only run once). |
 

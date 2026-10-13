@@ -2,8 +2,8 @@
 //!
 //! It wraps the daemon's real [`FileLogStore`] on turmoil's filesystem and
 //! records every replay ([`Entry::Recovered`]) and every acknowledged group
-//! commit ([`Entry::Acked`]): the facts I4 compares, and the moments I1
-//! orders mutations against.
+//! commit ([`Entry::Acked`]): what the model's replay judges each boot,
+//! and each act on the world, against.
 //!
 //! turmoil's filesystem answers at once, without yielding, so an append
 //! would finish before any other task of the daemon ran. A real fsync takes

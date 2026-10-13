@@ -6,10 +6,10 @@
 //! quiescent.
 //!
 //! What a tool may do to the world and when (approval and dispatch durable
-//! first, an `Unsafe` call at most once) is the model's replay to judge
-//! ([`crate::model`]), from the same ledger.
+//! first, an `Unsafe` call at most once), and what a crash keeps (every
+//! acknowledged record, then a prefix of the pending group), is the model's
+//! replay to judge ([`crate::model`]), from the same ledger.
 //!
-//! - I4 every recovered log extends every record acknowledged as synced.
 //! - I5 at quiescence every turn ended and every call resolved.
 //! - I6 exactly: each stream read the TUI folded, `from..next`, arrived as
 //!   the projection of exactly the log's records `from..next`, and the reads
@@ -222,41 +222,12 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     let mut gave_up = None;
     for (at, stamped) in entries.iter().enumerate() {
         match &stamped.entry {
-            Entry::Created => {
-                if !log.is_empty() {
-                    found.push(violation(
-                        "I4",
-                        "a session was created over a non-empty log".to_owned(),
-                    ));
-                }
-                log.clear();
-            }
+            Entry::Created => log.clear(),
             Entry::Recovered { records } => {
-                let kept = records.get(..log.len()).is_some_and(|kept| kept == log);
-                if !kept {
-                    found.push(violation(
-                        "I4",
-                        format!(
-                            "recovery at {}ms found {} records that do not extend the {} acknowledged",
-                            stamped.at.as_millis(),
-                            records.len(),
-                            log.len()
-                        ),
-                    ));
-                }
                 log.clone_from(records);
                 last_recovered = Some((at, records.clone()));
             }
-            Entry::Acked { first, records } => {
-                let next = u64::try_from(log.len()).unwrap_or(u64::MAX);
-                if *first != next {
-                    found.push(violation(
-                        "I4",
-                        format!("a group commit acknowledged from {first}, after {next} records"),
-                    ));
-                }
-                log.extend(records.iter().cloned());
-            }
+            Entry::Acked { records, .. } => log.extend(records.iter().cloned()),
             Entry::Caught { offset, transcript } => {
                 caught = caught.saturating_add(1);
                 quiescent(&log, "at quiescence", &mut found);
@@ -294,7 +265,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     }
     let Some((recovered_at, last)) = last_recovered else {
         found.push(violation(
-            "I4",
+            "harness",
             "the daemon never recovered a log".to_owned(),
         ));
         return found;
