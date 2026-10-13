@@ -1,4 +1,4 @@
-//! The `Limits` value parsed once at startup that bounds every collection,
+//! The `Limits` value made once at startup that bounds every collection,
 //! loop and retry. It is data: the core reads it, never grows past it, and
 //! turns an exceeded bound into a typed outcome.
 //!

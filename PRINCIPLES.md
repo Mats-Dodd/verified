@@ -88,10 +88,11 @@ Every entry passes all four parts of the admission rule.
 ## Held, not yet admitted
 
 A deterministic layer checks each of these today, but none has a committed
-planted bug. Until one exists, they are not promises. Every DST run now
-also checks the model's property among them ("quiescent implies the turn
-ended"), but no planted shell bug has been seen to fail it, so it has not
-moved up.
+planted bug in the layer where it would break. Until one exists, they are
+not promises. The first row has a Stateright planted bug, but a call left
+without a result would be the shell's doing (a run's report lost), not the
+core's, so it waits for a planted shell bug. Every DST run already checks
+its model property ("quiescent implies the turn ended") on the replay.
 
 | Property | Current check | Missing |
 |---|---|---|
@@ -178,8 +179,8 @@ the relevant invariant with this caveat.
 These are assumed, not checked:
 
 - **The verification tools:** Verus, Z3 and vstd, plus the two
-  `external_body` functions in the core: `bump`, which crashes on overflow,
-  and `CallId::same`.
+  `external_body` functions the core's proofs rely on: the core's `bump`,
+  which crashes on overflow, and the domain's `CallId::same`.
 - **Everything outside the core:** the shell, the TUI and their
   dependencies (tokio, hyper, axum, serde, ratatui) are simulated, not
   proved.
@@ -198,7 +199,12 @@ These are assumed, not checked:
   model wrong about the world would pass a wrong shell. Where the model is
   more hostile than the world (late duplicate completions, replies from a
   dead daemon's tasks), only the model checks are stronger; `just coverage`
-  lists these as over-approximations.
+  lists these as over-approximations. A full log is outside BFS: the model
+  never fills its log, so ending a turn on a full log is not model-checked.
+  It is trace-checked only on the runs of
+  `a_full_log_ends_the_running_turn_and_replays` (no seed fills a log), whose
+  replay applies the log's refusal and the resume it forces by hand
+  (`Observed::Refused`, `Harness::resumed`).
 - **The hardware and OS:** fsync tells the truth, the monotonic clock is
   monotonic, and signals are delivered on a best-effort basis.
 

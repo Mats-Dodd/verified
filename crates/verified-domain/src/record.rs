@@ -188,13 +188,14 @@ pub enum Record<P: Payload> {
     Approved { call: CallIx, by: Approver },
     /// A call is about to run. At most one per call.
     Dispatched { call: CallIx },
-    /// What a call actually did. Exactly one per call. `output` is absent
-    /// when the core synthesized the result (denied, interrupted before it
-    /// ran, unknown after a crash, invalid request, past a limit).
+    /// What a call actually did. At most one per call (U8); one for every
+    /// call once the turn is quiescent is held, not promised. `output` is
+    /// absent when the core synthesized the result (denied, interrupted
+    /// before it ran, unknown after a crash, invalid request, past a limit).
     ToolResult { call: CallIx, exit: Exit, output: Option<Measured<P::Output>> },
     /// The user asked to stop the turn.
     CancelRequested { turn: TurnId },
-    /// The turn is over. Exactly one per `TurnStarted`. A turn the user
+    /// The turn is over. At most one per `TurnStarted`. A turn the user
     /// asked to stop ends `Cancelled`, whatever else arrived after.
     TurnEnded { turn: TurnId, outcome: TurnOutcome },
     /// The daemon recovered; effects from earlier epochs are stale.

@@ -13,7 +13,8 @@
 //! The core's own ids (`StepId`, `CallIx`, `Epoch`, `EffectId`) are derived
 //! from the log. The ids the core's proofs mention live inside `verus!`, where
 //! specifications compare them structurally (`==`); exec code compares them
-//! with `same`, whose result Verus knows.
+//! with `same`, whose result Verus knows, except `CallId::same`, which is
+//! trusted (`PRINCIPLES.md`, the trusted base).
 
 use core::fmt;
 use core::str::FromStr;

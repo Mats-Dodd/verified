@@ -955,13 +955,16 @@ fn refused() -> Persisted {
 }
 
 /// Whether `record` is one that ends a turn, and so may take the log's
-/// reserve: a short line with no payload.
-const fn closes(record: &Record<Parsed>) -> bool {
+/// reserve: a short line, a result's output (if any) without its text, as
+/// [`closing`] leaves it.
+fn closes(record: &Record<Parsed>) -> bool {
     match record {
-        Record::CancelRequested { .. }
-        | Record::ToolResult { .. }
-        | Record::TurnEnded { .. }
-        | Record::EpochBumped { .. } => true,
+        Record::ToolResult { output, .. } => output
+            .as_ref()
+            .is_none_or(|output| output.body.text.is_empty()),
+        Record::CancelRequested { .. } | Record::TurnEnded { .. } | Record::EpochBumped { .. } => {
+            true
+        }
         Record::TurnStarted { .. }
         | Record::StepStarted { .. }
         | Record::ModelOutput { .. }

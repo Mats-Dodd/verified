@@ -153,7 +153,7 @@ impl ServerLimits {
     /// their bounds, escaped. Model output has no bound of its own small
     /// enough; the shell splits it into batches within
     /// [`ServerLimits::record_budget`] and fails a call whose single part
-    /// or whose calls do not fit (`Limit::Record`). And that any record's
+    /// or whose calls do not fit (`Fault::TooLarge`). And that any record's
     /// projection fits one stream read, so a client can follow every
     /// record.
     ///
