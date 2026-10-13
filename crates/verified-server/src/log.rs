@@ -10,12 +10,14 @@
 //! of the first record of the group commit the line was written in: every
 //! record of one `Decision` goes in one write and one fsync.
 //!
-//! On replay a bad line (bad CRC, wrong seq, too long, or no newline) is a
+//! On replay a bad line (bad CRC, wrong seq, or no newline) is a
 //! torn tail when nothing valid from a *later* group follows it: that group
 //! was never acknowledged, any prefix of a decision recovers, so the file is
 //! truncated there. A valid line from a later group after a bad one means a
 //! durable record was damaged: that is corruption, and recovery stops. A
-//! line whose CRC is good but whose record does not parse also stops it.
+//! line whose CRC is good is a record that was written, never a torn one:
+//! if this build cannot take it (it does not parse, or it is longer than
+//! `max_line`, as an older build's bound allowed) recovery stops too.
 //!
 //! Appends enforce the same bounds replay does (`max_line` per line,
 //! `max_file` per file), before writing a byte: a record replay would cut as
@@ -248,15 +250,18 @@ pub fn scan(bytes: &[u8], max_line: usize) -> Result<Scan, ScanError> {
         }
         let newline = rest.iter().position(|byte| *byte == b'\n');
         let good = newline.and_then(|end| {
-            if end > max_line {
-                return None;
-            }
             let found = frame(rest.get(..end)?)?;
             (found.seq == seq && found.group <= seq).then_some((found, end))
         });
         let Some((found, end)) = good else {
-            return torn_or_corrupt(bytes, offset, seq, records, max_line);
+            return torn_or_corrupt(bytes, offset, seq, records);
         };
+        if end > max_line {
+            return Err(ScanError::Unparseable {
+                seq,
+                reason: format!("a {end}-byte line, more than {max_line}"),
+            });
+        }
         // Parsing is the whole check: every id and every payload slot has
         // its own type, so a line that deserializes is a well-formed record.
         let record: Record<Parsed> =
@@ -285,12 +290,10 @@ fn torn_or_corrupt(
     offset: usize,
     seq: u64,
     records: Vec<Record<Parsed>>,
-    max_line: usize,
 ) -> Result<Scan, ScanError> {
     let rest = bytes.get(offset..).unwrap_or_default();
     for line in rest.split(|byte| *byte == b'\n').skip(1) {
-        if line.len() <= max_line
-            && let Some(later) = frame(line)
+        if let Some(later) = frame(line)
             && later.group > seq
         {
             return Err(ScanError::Corrupt {
@@ -936,6 +939,25 @@ mod tests {
             ),
             "a good CRC over a bad record is not a torn write"
         );
+    }
+
+    /// A written line longer than the bound (an older build's) is no torn
+    /// tail: recovery stops on it rather than cut it, whether or not a later
+    /// group follows.
+    #[test]
+    fn an_acknowledged_line_past_the_bound_stops_recovery() {
+        let records = vec![sized(10), sized(2_000)];
+        for groups in [&[1, 1][..], &[2]] {
+            let bytes = framed(&records, groups);
+            assert!(
+                matches!(
+                    scan(&bytes, 1_000),
+                    Err(ScanError::Unparseable { seq: 1, .. })
+                ),
+                "{groups:?}: {:?}",
+                scan(&bytes, 1_000).map(|scanned| scanned.tail)
+            );
+        }
     }
 
     proptest! {
