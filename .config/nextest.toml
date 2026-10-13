@@ -17,9 +17,15 @@ leak-timeout = "500ms"
 # runs for 10s, so for verified-sim a leak is reported (LEAK) but not
 # failed. Its tests spawn no processes at all; a real leak would still show
 # in the output.
+#
+# Some simulation tests run many whole worlds twice each in an unoptimized
+# build: `a_full_log_ends_the_running_turn_and_replays` takes ~15s on a
+# 16-core laptop and exceeded 60s on a shared 4-core CI runner. Simulated
+# time cannot hang on the wall clock, so give them the model tests' leash.
 [[profile.default.overrides]]
 filter = "package(verified-sim)"
 leak-timeout = { period = "3s", result = "pass" }
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The model-checking tests exhaustively explore state spaces in an unoptimized
 # build: `unsafe_calls_run_together` takes ~42s on a 16-core laptop (~64s
