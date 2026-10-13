@@ -28,7 +28,7 @@ use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{CreateSession, MessageText, SendMessage};
 use verified_wire::sse::SseDecoder;
-use verified_wire::stream::{Freshness, StreamEvent, decode_chunks};
+use verified_wire::stream::{Freshness, StreamEvent};
 
 use std::time::Duration;
 
@@ -130,26 +130,13 @@ async fn post(client: &HttpClient, path: &str, body: Vec<u8>) -> turmoil::Result
     Ok(response.status().as_u16())
 }
 
-async fn chunks(client: &HttpClient) -> turmoil::Result<Vec<UiChunk>> {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "http://daemon:{PORT}/sessions/{}/stream?offset=-1",
-            session()
-        ))
-        .body(Full::new(Bytes::new()))?;
-    let response = client.request(request).await?;
-    let body = response.into_body().collect().await?.to_bytes();
-    Ok(decode_chunks(&body)?)
-}
-
 /// Follows the stream live from the start, through the real SSE decoder,
 /// until a control event says it is up to date: every chunk.
 async fn follow(client: &HttpClient) -> turmoil::Result<Vec<UiChunk>> {
     let request = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "http://daemon:{PORT}/sessions/{}/stream?offset=-1&live=sse",
+            "http://daemon:{PORT}/sessions/{}/stream?offset=0000000000000000",
             session()
         ))
         .body(Full::new(Bytes::new()))?;
@@ -211,7 +198,7 @@ fn acknowledged_records_survive_a_crash() -> turmoil::Result {
         let client = client();
         send_hello(&client).await?;
         loop {
-            let read = chunks(&client).await?;
+            let read = follow(&client).await?;
             if turn_ended(&read) {
                 return Ok(());
             }
@@ -222,7 +209,7 @@ fn acknowledged_records_survive_a_crash() -> turmoil::Result {
     sim.crash("daemon");
     sim.bounce("daemon");
     sim.client("tui-after", async {
-        let read = chunks(&client()).await?;
+        let read = follow(&client()).await?;
         assert!(turn_ended(&read), "the finished turn survived the crash");
         let echoed: String = read
             .iter()
@@ -270,7 +257,7 @@ fn crash_mid_group_commit_recovers() -> turmoil::Result {
         // The message's commit was never acknowledged, so it is gone (cut as
         // a torn tail or never synced); retrying the same message id starts
         // the turn exactly once.
-        let before = chunks(&client).await?;
+        let before = follow(&client).await?;
         assert!(
             !before
                 .iter()
@@ -279,7 +266,7 @@ fn crash_mid_group_commit_recovers() -> turmoil::Result {
         );
         send_hello(&client).await?;
         loop {
-            let read = chunks(&client).await?;
+            let read = follow(&client).await?;
             if turn_ended(&read) {
                 let messages = read
                     .iter()

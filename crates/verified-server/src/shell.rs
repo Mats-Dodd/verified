@@ -59,7 +59,7 @@ use verified_wire::command::{
     Approve, ApproveReply, Cancel, CancelReply, Outcome as WireOutcome, Rejection, SendMessage,
     SendMessageReply, Verdict as WireVerdict,
 };
-use verified_wire::stream::{Freshness, Offset, ReadFrom, encode_chunks};
+use verified_wire::stream::{Freshness, Offset, encode_chunks};
 
 use crate::defect;
 use crate::env::Env;
@@ -164,7 +164,7 @@ enum Input {
         reply: Reply<CancelReply>,
     },
     Read {
-        from: ReadFrom,
+        from: Offset,
         reply: oneshot::Sender<StreamRead>,
     },
     Records {
@@ -216,14 +216,14 @@ impl Committed {
         reason = "the atomics described on CommittedState"
     )]
     fn new(next: u64) -> (Self, CommittedWriter) {
-        let tail = Self {
+        let committed = Self {
             shared: Arc::new(CommittedState {
                 next: core::sync::atomic::AtomicU64::new(next),
                 open: core::sync::atomic::AtomicBool::new(true),
                 notify: Notify::new(),
             }),
         };
-        (tail.clone(), CommittedWriter { tail })
+        (committed.clone(), CommittedWriter { committed })
     }
 
     /// The seq the next record will get.
@@ -232,8 +232,8 @@ impl Committed {
         self.shared.next.load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Waits until the tail is past `seq` (a record at `seq` is committed),
-    /// and returns it.
+    /// Waits until a record at `seq` is committed, and returns the seq the
+    /// next record will get.
     ///
     /// # Errors
     /// The session stopped first.
@@ -257,26 +257,26 @@ impl Committed {
 /// The session's side of its [`Committed`]; dropping it tells followers the
 /// session stopped.
 struct CommittedWriter {
-    tail: Committed,
+    committed: Committed,
 }
 
 impl CommittedWriter {
     fn set(&self, next: u64) {
-        self.tail
+        self.committed
             .shared
             .next
             .store(next, core::sync::atomic::Ordering::Release);
-        self.tail.shared.notify.notify_waiters();
+        self.committed.shared.notify.notify_waiters();
     }
 }
 
 impl Drop for CommittedWriter {
     fn drop(&mut self) {
-        self.tail
+        self.committed
             .shared
             .open
             .store(false, core::sync::atomic::Ordering::Release);
-        self.tail.shared.notify.notify_waiters();
+        self.committed.shared.notify.notify_waiters();
     }
 }
 
@@ -285,7 +285,7 @@ impl Drop for CommittedWriter {
 pub struct SessionHandle {
     session: SessionId,
     inbox: mpsc::Sender<Input>,
-    tail: Committed,
+    committed: Committed,
     /// One permit per live stream follower (`sse_followers_per_session`).
     followers: Arc<Semaphore>,
 }
@@ -346,7 +346,7 @@ impl SessionHandle {
     ///
     /// # Errors
     /// The session is gone.
-    pub async fn read(&self, from: ReadFrom) -> Result<StreamRead, Unavailable> {
+    pub async fn read(&self, from: Offset) -> Result<StreamRead, Unavailable> {
         self.ask(|reply| Input::Read { from, reply }).await
     }
 
@@ -360,8 +360,8 @@ impl SessionHandle {
 
     /// The seq the next record will get; changes after every commit.
     #[must_use]
-    pub fn tail(&self) -> Committed {
-        self.tail.clone()
+    pub fn committed(&self) -> Committed {
+        self.committed.clone()
     }
 
     /// A slot for one more live follower of this session, held until the
@@ -383,7 +383,7 @@ pub struct Session {
     seams: Seams,
     config: Arc<ShellConfig>,
     inbox: mpsc::Sender<Input>,
-    tail: CommittedWriter,
+    committed: CommittedWriter,
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
@@ -441,11 +441,11 @@ impl Session {
             chunks.push(projected);
         }
         let (inbox, receiver) = mpsc::channel(config.limits.session_inbox);
-        let (tail_receiver, tail) = Committed::new(core.seq());
+        let (committed, writer) = Committed::new(core.seq());
         let handle = SessionHandle {
             session,
             inbox: inbox.clone(),
-            tail: tail_receiver,
+            committed,
             followers: Arc::new(Semaphore::new(config.limits.sse_followers_per_session)),
         };
         let shell = Self {
@@ -458,7 +458,7 @@ impl Session {
             seams,
             config,
             inbox,
-            tail,
+            committed: writer,
             cancels: BTreeMap::new(),
             held_bytes,
             full: None,
@@ -561,7 +561,7 @@ impl Session {
                 self.chunks.push(projected);
                 self.records.push(record);
             }
-            self.tail.set(self.core.seq());
+            self.committed.set(self.core.seq());
         }
         Ok(Persisted::Done(outcome, effects))
     }
@@ -839,12 +839,9 @@ impl Session {
         }
     }
 
-    fn read(&self, from: ReadFrom) -> StreamRead {
+    fn read(&self, from: Offset) -> StreamRead {
         let tail = self.core.seq();
-        let start = match from {
-            ReadFrom::Now => tail,
-            ReadFrom::Offset(offset) => offset.seq().min(tail),
-        };
+        let start = from.seq().min(tail);
         // Records' arrays merged into one cost at most their lengths
         // together. `ServerLimits::check` makes sure one record's fits.
         let budget = self.config.limits.wire.max_data_bytes();

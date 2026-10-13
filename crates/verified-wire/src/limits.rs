@@ -40,8 +40,8 @@ impl WireLimits {
         max_errors_per_turn: 64,
     };
 
-    /// The most JSON one Durable Streams read (an SSE `data` event or a
-    /// catch-up body) carries: one `data:` line, within both SSE bounds.
+    /// The most JSON one Durable Streams read (an SSE `data` event)
+    /// carries: one `data:` line, within both SSE bounds.
     #[must_use]
     pub const fn max_data_bytes(&self) -> usize {
         let line = self.max_sse_line_bytes.saturating_sub(DATA_FIELD.len());

@@ -96,7 +96,7 @@ impl Seen {
             ),
             over: app.notice().is_some_and(|notice| notice.contains(OVER)),
             draft: !app.draft().is_empty(),
-            offset: app.position().offset.seq(),
+            offset: app.offset().seq(),
             transcript: quiet
                 .then(|| serde_json::to_value(app.transcript().turns()).ok())
                 .flatten(),

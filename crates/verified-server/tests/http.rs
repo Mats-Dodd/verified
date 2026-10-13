@@ -1,5 +1,5 @@
-//! End to end over localhost: the daemon's routes, the Durable Stream (catch
-//! up and live SSE), and the real Anthropic client talking HTTP to the fake
+//! End to end over localhost: the daemon's routes, the Durable Stream (live
+//! SSE), and the real Anthropic client talking HTTP to the fake
 //! Anthropic host. Binds tokio listeners directly, so it runs the same with
 //! and without the `sim` feature.
 
@@ -30,7 +30,7 @@ use verified_wire::command::{
     SendMessageReply, decode_reply,
 };
 use verified_wire::sse::SseDecoder;
-use verified_wire::stream::{StreamEvent, decode_chunks, header};
+use verified_wire::stream::{Freshness, StreamEvent};
 use verified_wire::transcript::Transcript;
 
 /// `work`, or an error once `limit` passes: a test's own bound on how long
@@ -119,18 +119,14 @@ async fn call(
     method: Method,
     uri: String,
     body: Vec<u8>,
-    if_none_match: Option<&str>,
-) -> (StatusCode, hyper::HeaderMap, Vec<u8>) {
-    let mut request = Request::builder().method(method).uri(uri);
-    if let Some(etag) = if_none_match {
-        request = request.header("if-none-match", etag);
-    }
-    let request = request
+) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
         .body(Full::new(Bytes::from(body)))
         .expect("a request");
     let response = client.request(request).await.expect("a response");
     let status = response.status();
-    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -138,7 +134,7 @@ async fn call(
         .expect("a body")
         .to_bytes()
         .to_vec();
-    (status, headers, bytes)
+    (status, bytes)
 }
 
 #[tokio::test]
@@ -148,14 +144,7 @@ async fn commands_and_streams_over_http() {
     let base = format!("http://{addr}");
     let limits = WireLimits::DEFAULT;
 
-    let (status, _, body) = call(
-        &client,
-        Method::GET,
-        format!("{base}/version"),
-        Vec::new(),
-        None,
-    )
-    .await;
+    let (status, body) = call(&client, Method::GET, format!("{base}/version"), Vec::new()).await;
     assert_eq!(status, StatusCode::OK, "version");
     assert!(
         String::from_utf8_lossy(&body).contains(env!("CARGO_PKG_VERSION")),
@@ -167,33 +156,24 @@ async fn commands_and_streams_over_http() {
         session_id: session,
     }
     .encode();
-    let (status, _, body) = call(
+    let (status, body) = call(
         &client,
         Method::POST,
         format!("{base}/sessions"),
         create.clone(),
-        None,
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "created");
     let reply: CreateSessionReply = decode_reply(&body, &limits).expect("a reply");
     assert_eq!(reply.outcome, Outcome::Created, "new");
-    let (status, _, _) = call(
-        &client,
-        Method::POST,
-        format!("{base}/sessions"),
-        create,
-        None,
-    )
-    .await;
+    let (status, _) = call(&client, Method::POST, format!("{base}/sessions"), create).await;
     assert_eq!(status, StatusCode::OK, "a repeat create is exists");
 
-    let (status, _, _) = call(
+    let (status, _) = call(
         &client,
         Method::POST,
         format!("{base}/sessions/{session}/messages"),
         b"{\"nope\":1}".to_vec(),
-        None,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "malformed body");
@@ -202,7 +182,7 @@ async fn commands_and_streams_over_http() {
     let live = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{base}/sessions/{session}/stream?offset=-1&live=sse"
+            "{base}/sessions/{session}/stream?offset=0000000000000000"
         ))
         .body(Full::new(Bytes::new()))
         .expect("a request");
@@ -222,12 +202,11 @@ async fn commands_and_streams_over_http() {
         message_id: MessageId::from_parts(UnixMillis::new(1_700_000_000_001).expect("t"), &[4; 10]),
         text: MessageText::parse("hello over http".to_owned(), &limits).expect("text"),
     };
-    let (status, _, body) = call(
+    let (status, body) = call(
         &client,
         Method::POST,
         format!("{base}/sessions/{session}/messages"),
         message.encode(),
-        None,
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "accepted");
@@ -285,57 +264,12 @@ async fn commands_and_streams_over_http() {
         "the real client parsed the fake's SSE"
     );
 
-    // Catch-up read: the same chunks, cacheable by range.
-    let stream = format!("{base}/sessions/{session}/stream?offset=-1");
-    let (status, headers, body) =
-        call(&client, Method::GET, stream.clone(), Vec::new(), None).await;
-    assert_eq!(status, StatusCode::OK, "catch-up");
-    let chunks = decode_chunks(&body).expect("chunks");
-    let mut caught_up = Transcript::new(&limits);
-    for chunk in &chunks {
-        caught_up.apply(chunk).expect("folds");
-    }
-    assert_eq!(
-        serde_json::to_value(caught_up.turns()).expect("json"),
-        serde_json::to_value(transcript.turns()).expect("json"),
-        "live and catch-up fold to the same transcript"
-    );
-    assert_eq!(
-        headers
-            .get(header::STREAM_UP_TO_DATE)
-            .and_then(|value| value.to_str().ok()),
-        Some("true"),
-        "up to date"
-    );
-    let etag = headers
-        .get("etag")
-        .and_then(|value| value.to_str().ok())
-        .expect("an etag")
-        .to_owned();
-    let (status, _, _) = call(&client, Method::GET, stream, Vec::new(), Some(&etag)).await;
-    assert_eq!(status, StatusCode::NOT_MODIFIED, "same range, same etag");
-
-    let (status, headers, _) = call(
-        &client,
-        Method::HEAD,
-        format!("{base}/sessions/{session}/stream"),
-        Vec::new(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "metadata");
-    assert!(
-        headers.get(header::STREAM_NEXT_OFFSET).is_some(),
-        "the next offset"
-    );
-
     let unknown = SessionId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[9; 10]);
-    let (status, _, _) = call(
+    let (status, _) = call(
         &client,
         Method::GET,
         format!("{base}/sessions/{unknown}/stream"),
         Vec::new(),
-        None,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown session");
@@ -360,11 +294,39 @@ async fn follow(
     let live = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{base}/sessions/{session}/stream?offset=-1&live=sse"
+            "{base}/sessions/{session}/stream?offset=0000000000000000"
         ))
         .body(Full::new(Bytes::new()))
         .expect("a request");
     client.request(live).await.expect("a response")
+}
+
+/// Every chunk of `session`'s stream, followed live until a control event
+/// says it is up to date; `None` when the follow is refused.
+async fn caught_up(client: &HttpClient, base: &str, session: SessionId) -> Option<Vec<UiChunk>> {
+    let response = follow(client, base, session).await;
+    if response.status() != StatusCode::OK {
+        return None;
+    }
+    let mut body = response.into_body();
+    let mut decoder = SseDecoder::new(&WireLimits::DEFAULT);
+    let mut chunks = Vec::new();
+    loop {
+        let frame = body.frame().await.expect("not ended").expect("a frame");
+        let Ok(bytes) = frame.into_data() else {
+            continue;
+        };
+        for event in decoder.feed(&bytes) {
+            match StreamEvent::from_sse(&event.expect("an event")).expect("a stream event") {
+                StreamEvent::Data(read) => chunks.extend(read),
+                StreamEvent::Control(control) => {
+                    if control.up_to_date == Freshness::UpToDate {
+                        return Some(chunks);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn body_of(response: hyper::Response<hyper::body::Incoming>) -> Vec<u8> {
@@ -397,12 +359,11 @@ async fn capacity_limits_answer_typed_rejections() {
         let create = CreateSession {
             session_id: session_at(byte),
         };
-        let (status, _, _) = call(
+        let (status, _) = call(
             &client,
             Method::POST,
             format!("{base}/sessions"),
             create.encode(),
-            None,
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "session {byte}");
@@ -410,12 +371,11 @@ async fn capacity_limits_answer_typed_rejections() {
     let third = CreateSession {
         session_id: session_at(3),
     };
-    let (status, _, body) = call(
+    let (status, body) = call(
         &client,
         Method::POST,
         format!("{base}/sessions"),
         third.encode(),
-        None,
     )
     .await;
     assert_eq!(
@@ -475,12 +435,11 @@ async fn capacity_limits_answer_typed_rejections() {
         text: MessageText::parse(text.to_owned(), &wire).expect("text"),
     };
     let messages = format!("{base}/sessions/{}/messages", session_at(1));
-    let (status, _, _) = call(
+    let (status, _) = call(
         &client,
         Method::POST,
         messages.clone(),
         message(1, "hi").encode(),
-        None,
     )
     .await;
     assert_eq!(
@@ -488,14 +447,13 @@ async fn capacity_limits_answer_typed_rejections() {
         StatusCode::CREATED,
         "under the bound when it started"
     );
-    let stream = format!("{base}/sessions/{}/stream?offset=-1", session_at(1));
     let mut ended = false;
     for _ in 0..500u32 {
-        let (_, _, body) = call(&client, Method::GET, stream.clone(), Vec::new(), None).await;
-        let chunks = decode_chunks(&body).expect("chunks");
-        if chunks
-            .iter()
-            .any(|chunk| matches!(chunk, UiChunk::TurnEnded { .. }))
+        // Refused while the last follower still holds the daemon's slot.
+        if let Some(chunks) = caught_up(&client, &base, session_at(1)).await
+            && chunks
+                .iter()
+                .any(|chunk| matches!(chunk, UiChunk::TurnEnded { .. }))
         {
             ended = true;
             break;
@@ -503,12 +461,11 @@ async fn capacity_limits_answer_typed_rejections() {
         SystemClock.sleep(Millis::new(10)).await;
     }
     assert!(ended, "the first turn ends, past the bound");
-    let (status, _, body) = call(
+    let (status, body) = call(
         &client,
         Method::POST,
         messages.clone(),
         message(2, "more").encode(),
-        None,
     )
     .await;
     let (status, rejection) = rejected(status, &body);
@@ -517,14 +474,7 @@ async fn capacity_limits_answer_typed_rejections() {
         matches!(rejection, Rejection::SessionFull { session_id, .. } if session_id == session_at(1)),
         "{rejection:?}"
     );
-    let (status, _, _) = call(
-        &client,
-        Method::POST,
-        messages,
-        message(1, "hi").encode(),
-        None,
-    )
-    .await;
+    let (status, _) = call(&client, Method::POST, messages, message(1, "hi").encode()).await;
     assert_eq!(
         status,
         StatusCode::OK,

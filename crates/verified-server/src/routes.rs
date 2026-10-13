@@ -3,13 +3,11 @@
 //! - `POST /sessions`, `/sessions/{id}/messages`, `/approvals`, `/cancel`:
 //!   commands with client-minted ids; a repeat answers `exists`
 //!   (`TigerBeetle`), a conflicting repeat is a 409 rejection.
-//! - `GET /sessions/{id}/stream?offset=…`: a catch-up read (Durable
-//!   Streams §5.6), cacheable by range with an `etag`.
-//! - `GET /sessions/{id}/stream?offset=…&live=sse&cursor=…`: catch-up, then
-//!   every append, each read followed by a `control` event (§5.8); closed
-//!   after `ServerLimits::sse_lifetime` so clients reconnect from the last
-//!   offset.
-//! - `HEAD /sessions/{id}/stream`: the next offset (§5.5).
+//! - `GET /sessions/{id}/stream?offset=…`: SSE from the offset, then every
+//!   append, each read followed by a `control` event (Durable Streams §5.8);
+//!   closed after `ServerLimits::sse_lifetime` so clients reconnect from the
+//!   last offset. This is the part of Durable Streams the TUI uses; a web
+//!   client gets the rest of the protocol when it arrives.
 //! - `GET /version`: the daemon's build, so a client of another build knows.
 //!
 //! Ported from q's `http/SessionStreamHttp.ts`.
@@ -23,7 +21,7 @@ use std::task::{Context, Poll};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -34,13 +32,12 @@ use verified_wire::command::{
 };
 use verified_wire::sse::KEEP_ALIVE;
 use verified_wire::stream::{
-    CATCH_UP_CACHE_CONTROL, Control, Cursor, Freshness, Jitter, NO_STORE, ReadFrom, StreamEvent,
-    catch_up_etag, encode_chunks, header as stream_header, query,
+    Control, Freshness, Offset, StreamEvent, header as stream_header, query,
 };
 
 use crate::daemon::{CreateError, Registry};
 use crate::limits::ServerLimits;
-use crate::seam::{Clock, Entropy, World, entropy_u64};
+use crate::seam::{Clock, World};
 use crate::shell::{CommandError, Seams, SessionHandle};
 
 /// What every handler shares.
@@ -48,7 +45,6 @@ use crate::shell::{CommandError, Seams, SessionHandle};
 pub struct App {
     registry: Registry,
     clock: Arc<dyn Clock>,
-    entropy: Arc<dyn Entropy>,
     world: World,
     limits: Arc<ServerLimits>,
     /// One permit per live stream follower across sessions (`sse_followers`).
@@ -67,7 +63,6 @@ impl App {
         Self {
             registry,
             clock: seams.clock,
-            entropy: seams.entropy,
             world: seams.world,
             limits: Arc::new(limits.clone()),
             followers: Arc::new(Semaphore::new(limits.sse_followers)),
@@ -84,7 +79,7 @@ pub fn router(app: App) -> Router {
         .route("/sessions/{id}/messages", post(send_message))
         .route("/sessions/{id}/approvals", post(approve))
         .route("/sessions/{id}/cancel", post(cancel))
-        .route("/sessions/{id}/stream", get(read_stream).head(metadata))
+        .route("/sessions/{id}/stream", get(read_stream))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(app)
 }
@@ -219,150 +214,35 @@ async fn cancel(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> 
     }
 }
 
-/// Whether a read follows the stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Live {
-    No,
-    Sse,
-}
-
-/// The stream query, parsed once.
-struct StreamQuery {
-    offset: Option<ReadFrom>,
-    live: Live,
-    cursor: Option<Cursor>,
-}
-
-fn parse_query(raw: Option<&str>) -> Result<StreamQuery, String> {
-    let mut parsed = StreamQuery {
-        offset: None,
-        live: Live::No,
-        cursor: None,
-    };
+/// The offset a stream read starts at: the query's one parameter.
+fn parse_offset(raw: Option<&str>) -> Result<Offset, String> {
+    let mut offset = None;
     for pair in raw
         .unwrap_or_default()
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
-            query::OFFSET => {
-                parsed.offset =
-                    Some(ReadFrom::parse(value).map_err(|error| format!("offset: {error}"))?);
-            }
-            query::LIVE => {
-                if value != query::LIVE_SSE {
-                    return Err(format!("live: only `{}` is served", query::LIVE_SSE));
-                }
-                parsed.live = Live::Sse;
-            }
-            query::CURSOR => {
-                parsed.cursor =
-                    Some(Cursor::parse(value).map_err(|error| format!("cursor: {error}"))?);
-            }
-            _ => {}
+        if key == query::OFFSET {
+            offset = Some(Offset::parse(value).map_err(|error| format!("offset: {error}"))?);
         }
     }
-    Ok(parsed)
+    offset.ok_or_else(|| "offset is required".to_owned())
 }
 
 async fn read_stream(
     State(app): State<App>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
-    headers: HeaderMap,
 ) -> Response {
     let handle = match session(&app, &id).await {
         Ok(handle) => handle,
         Err(response) => return *response,
     };
-    let query = match parse_query(raw.as_deref()) {
-        Ok(query) => query,
-        Err(reason) => return rejection(&Rejection::Malformed { reason }),
-    };
-    match query.live {
-        Live::Sse => {
-            let Some(from) = query.offset else {
-                return rejection(&Rejection::Malformed {
-                    reason: "offset is required for live reads".to_owned(),
-                });
-            };
-            live(&app, handle, from, query.cursor)
-        }
-        Live::No => {
-            let from = query
-                .offset
-                .unwrap_or(ReadFrom::Offset(verified_wire::stream::Offset::BEGINNING));
-            catch_up(handle, from, &headers).await
-        }
+    match parse_offset(raw.as_deref()) {
+        Ok(from) => live(&app, handle, from),
+        Err(reason) => rejection(&Rejection::Malformed { reason }),
     }
-}
-
-async fn catch_up(handle: SessionHandle, from: ReadFrom, headers: &HeaderMap) -> Response {
-    let Ok(read) = handle.read(from).await else {
-        return unavailable("the session is not running");
-    };
-    let mut response_headers = vec![
-        (header::CONTENT_TYPE, "application/json".to_owned()),
-        (
-            header::HeaderName::from_static(stream_header::STREAM_NEXT_OFFSET),
-            read.next.to_string(),
-        ),
-    ];
-    if matches!(read.freshness, Freshness::UpToDate) {
-        response_headers.push((
-            header::HeaderName::from_static(stream_header::STREAM_UP_TO_DATE),
-            "true".to_owned(),
-        ));
-    }
-    match from {
-        ReadFrom::Now => {
-            response_headers.push((header::CACHE_CONTROL, NO_STORE.to_owned()));
-        }
-        ReadFrom::Offset(offset) => {
-            let etag = catch_up_etag(handle.session(), offset, read.next);
-            let matched = headers
-                .get(header::IF_NONE_MATCH)
-                .and_then(|value| value.to_str().ok())
-                == Some(etag.as_str());
-            if matched {
-                return respond(
-                    StatusCode::NOT_MODIFIED,
-                    &[(header::ETAG, etag)],
-                    Body::empty(),
-                );
-            }
-            response_headers.push((header::CACHE_CONTROL, CATCH_UP_CACHE_CONTROL.to_owned()));
-            response_headers.push((header::ETAG, etag));
-        }
-    }
-    respond(
-        StatusCode::OK,
-        &response_headers,
-        Body::from(encode_chunks(&read.chunks)),
-    )
-}
-
-async fn metadata(State(app): State<App>, Path(id): Path<String>) -> Response {
-    let handle = match session(&app, &id).await {
-        Ok(handle) => handle,
-        Err(response) => return *response,
-    };
-    let Ok(read) = handle.read(ReadFrom::Now).await else {
-        return unavailable("the session is not running");
-    };
-    respond(
-        StatusCode::OK,
-        &[
-            (header::CONTENT_TYPE, "application/json".to_owned()),
-            (header::CACHE_CONTROL, NO_STORE.to_owned()),
-            (
-                header::HeaderName::from_static(stream_header::STREAM_NEXT_OFFSET),
-                read.next.to_string(),
-            ),
-        ],
-        Body::empty(),
-    )
 }
 
 /// The slots one live follower holds: one of its session's and one of the
@@ -372,7 +252,7 @@ struct Slots {
     _daemon: OwnedSemaphorePermit,
 }
 
-fn live(app: &App, handle: SessionHandle, from: ReadFrom, echoed: Option<Cursor>) -> Response {
+fn live(app: &App, handle: SessionHandle, from: Offset) -> Response {
     let Some(session_slot) = handle.follower() else {
         return rejection(&Rejection::TooManyFollowers {
             session_id: handle.session(),
@@ -385,16 +265,10 @@ fn live(app: &App, handle: SessionHandle, from: ReadFrom, echoed: Option<Cursor>
             limit: app.limits.sse_followers,
         });
     };
-    let cursor = Cursor::next(
-        app.clock.now(),
-        echoed,
-        Jitter::from_entropy(entropy_u64(app.entropy.as_ref())),
-    );
     let (sender, receiver) = mpsc::channel(app.limits.sse_queue);
     app.world.spawn(follow(
         handle,
         from,
-        cursor,
         sender,
         Arc::clone(&app.clock),
         Arc::clone(&app.limits),
@@ -423,8 +297,7 @@ fn live(app: &App, handle: SessionHandle, from: ReadFrom, echoed: Option<Cursor>
 /// stops.
 async fn follow(
     handle: SessionHandle,
-    from: ReadFrom,
-    cursor: Cursor,
+    from: Offset,
     sender: mpsc::Sender<Bytes>,
     clock: Arc<dyn Clock>,
     limits: Arc<ServerLimits>,
@@ -434,7 +307,7 @@ async fn follow(
     tokio::select! {
         biased;
         () = clock.sleep(limits.sse_lifetime) => {}
-        () = feed(&handle, from, cursor, &sender, clock.as_ref(), &limits) => {}
+        () = feed(&handle, from, &sender, clock.as_ref(), &limits) => {}
     }
 }
 
@@ -442,16 +315,15 @@ async fn follow(
 /// then waits for the next commit, with keep-alives while idle.
 async fn feed(
     handle: &SessionHandle,
-    from: ReadFrom,
-    cursor: Cursor,
+    from: Offset,
     sender: &mpsc::Sender<Bytes>,
     clock: &dyn Clock,
     limits: &ServerLimits,
 ) {
-    let tail = handle.tail();
-    let mut position = from;
+    let committed = handle.committed();
+    let mut from = from;
     loop {
-        let Ok(read) = handle.read(position).await else {
+        let Ok(read) = handle.read(from).await else {
             return;
         };
         let mut text = String::new();
@@ -462,7 +334,6 @@ async fn feed(
         }
         StreamEvent::Control(Control {
             stream_next_offset: read.next,
-            stream_cursor: cursor,
             up_to_date: read.freshness,
         })
         .to_sse()
@@ -470,14 +341,14 @@ async fn feed(
         if sender.send(Bytes::from(text)).await.is_err() {
             return;
         }
-        position = ReadFrom::Offset(read.next);
+        from = read.next;
         if matches!(read.freshness, Freshness::Behind) {
             continue;
         }
         loop {
             tokio::select! {
                 biased;
-                past = tail.past(read.next.seq()) => {
+                past = committed.past(read.next.seq()) => {
                     if past.is_err() {
                         return;
                     }
@@ -515,7 +386,7 @@ mod tests {
     use tokio::sync::{Semaphore, mpsc};
     use verified_domain::Millis;
     use verified_domain::id::{SessionId, UnixMillis};
-    use verified_wire::stream::{Cursor, Jitter, Offset, ReadFrom};
+    use verified_wire::stream::Offset;
 
     use super::{Slots, follow};
     use crate::daemon;
@@ -575,8 +446,7 @@ mod tests {
         let slots = Arc::new(Semaphore::new(2));
         let follower = follow(
             handle,
-            ReadFrom::Offset(Offset::BEGINNING),
-            Cursor::next(clock.now(), None, Jitter::from_entropy(0)),
+            Offset::BEGINNING,
             sender,
             Arc::clone(&clock),
             Arc::new(limits),

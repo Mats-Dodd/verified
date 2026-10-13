@@ -7,7 +7,7 @@ use serde_json::Value;
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId, UnixMillis};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{CreateSessionReply, Outcome, Rejection, SendMessageReply, Verdict};
-use verified_wire::stream::{Control, Cursor, Freshness, Offset};
+use verified_wire::stream::{Control, Freshness, Offset};
 use verified_wire::transcript::TranscriptTurn;
 
 use super::*;
@@ -97,7 +97,6 @@ fn opened() -> App {
 fn control(next: u64) -> Control {
     Control {
         stream_next_offset: Offset::at(next).expect("in range"),
-        stream_cursor: Cursor::parse("7").expect("a cursor"),
         up_to_date: Freshness::UpToDate,
     }
 }
@@ -110,7 +109,7 @@ fn stream(app: &mut App, update: StreamUpdate) -> Cmd {
 /// Delivers `chunks` as one read ending at `next`.
 fn read(app: &mut App, chunks: Vec<UiChunk>, next: u64) -> Cmd {
     let _connected = stream(app, StreamUpdate::Connected);
-    let from = app.position().offset;
+    let from = app.offset();
     stream(
         app,
         StreamUpdate::Read {
@@ -170,7 +169,7 @@ fn a_new_session_is_created_before_it_is_followed() {
         Cmd::Follow {
             follow: FollowId(1),
             session: session(),
-            from: START,
+            from: Offset::BEGINNING,
         }
     );
 }
@@ -326,11 +325,7 @@ fn the_stream_drives_the_conversation() {
     let mut app = opened();
     let _cmd = read(&mut app, fixture("in-progress"), 6);
     assert!(app.caught_up());
-    assert_eq!(app.position().offset, Offset::at(6).expect("in range"));
-    assert_eq!(
-        app.position().cursor,
-        Some(Cursor::parse("7").expect("a cursor"))
-    );
+    assert_eq!(app.offset(), Offset::at(6).expect("in range"));
     assert_eq!(app.activity(), Activity::Replying);
 }
 
@@ -348,7 +343,7 @@ fn caught_up_is_false_after_a_reconnect_until_a_read() {
     );
     let _cmd = stream(&mut app, StreamUpdate::Connected);
     assert!(!app.caught_up(), "reconnected, but nothing read yet");
-    let from = app.position().offset;
+    let from = app.offset();
     let _cmd = stream(
         &mut app,
         StreamUpdate::Read {
@@ -381,7 +376,7 @@ fn updates_from_a_replaced_follower_are_dropped() {
         },
     }));
     assert!(app.transcript().turns().is_empty());
-    assert_eq!(app.position(), START);
+    assert_eq!(app.offset(), Offset::BEGINNING);
 }
 
 #[test]
@@ -546,8 +541,8 @@ fn a_chunk_that_does_not_fold_breaks_the_stream_until_reloaded() {
     }));
     assert!(matches!(app.connection(), Connection::Broken(_)));
     assert_eq!(
-        app.position(),
-        START,
+        app.offset(),
+        Offset::BEGINNING,
         "nothing past the broken read is acknowledged"
     );
 
@@ -557,7 +552,7 @@ fn a_chunk_that_does_not_fold_breaks_the_stream_until_reloaded() {
         Cmd::Follow {
             follow: FollowId(3),
             session: session(),
-            from: START,
+            from: Offset::BEGINNING,
         }
     );
     assert!(app.transcript().turns().is_empty(), "reloads from scratch");
@@ -581,10 +576,7 @@ fn reconnecting_resumes_from_the_last_offset() {
         Cmd::Follow {
             follow: FollowId(2),
             session: session(),
-            from: Position {
-                offset: Offset::at(11).expect("in range"),
-                cursor: Some(Cursor::parse("7").expect("a cursor")),
-            },
+            from: Offset::at(11).expect("in range"),
         }
     );
     assert_eq!(app.transcript().turns().len(), 1, "the transcript is kept");

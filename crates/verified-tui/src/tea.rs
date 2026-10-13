@@ -18,10 +18,11 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use verified_domain::id::{IdEntropy, SessionId, UnixMillis};
+use verified_wire::stream::Offset;
 
 use crate::Limits;
 use crate::app::{App, Msg, Start};
-use crate::client::{Answer, Client, Command, Position, StreamUpdate};
+use crate::client::{Answer, Client, Command, StreamUpdate};
 use crate::seam::{Clock, Dialer, Entropy, Input, Screen, TerminalError};
 
 /// When and with what randomness an input event arrived: everything
@@ -64,7 +65,7 @@ pub enum Cmd {
     Follow {
         follow: FollowId,
         session: SessionId,
-        from: Position,
+        from: Offset,
     },
     /// Stop the current follower.
     StopFollowing,

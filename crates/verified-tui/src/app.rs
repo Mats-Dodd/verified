@@ -24,7 +24,7 @@ use verified_wire::stream::{Freshness, Offset};
 use verified_wire::transcript::{Part, ToolPart, ToolState, Transcript};
 
 use crate::Limits;
-use crate::client::{Answer, ClientError, Command, Position, StreamUpdate};
+use crate::client::{Answer, ClientError, Command, StreamUpdate};
 use crate::tea::{Cmd, Feedback, FollowId, Stamp};
 use crate::view::{self, Activity, Connection, Status};
 
@@ -120,7 +120,7 @@ pub struct App {
     phase: Phase,
     transcript: Transcript,
     /// Where the next read starts: just past the last folded read.
-    position: Position,
+    offset: Offset,
     folded: Option<Folded>,
     follow: FollowId,
     connection: Connection,
@@ -138,11 +138,6 @@ pub struct App {
     viewport: Viewport,
 }
 
-const START: Position = Position {
-    offset: Offset::BEGINNING,
-    cursor: None,
-};
-
 impl App {
     /// The folded stream.
     #[must_use]
@@ -157,8 +152,8 @@ impl App {
 
     /// Where the next read starts.
     #[must_use]
-    pub const fn position(&self) -> Position {
-        self.position
+    pub const fn offset(&self) -> Offset {
+        self.offset
     }
 
     /// The last read folded into the transcript, if any.
@@ -243,14 +238,14 @@ impl App {
         }))
     }
 
-    /// Follows the stream from the current position with a new follower.
+    /// Follows the stream from the current offset with a new follower.
     fn refollow(&mut self) -> Cmd {
         self.follow = self.follow.next();
         self.connection = Connection::Connecting;
         Cmd::Follow {
             follow: self.follow,
             session: self.session,
-            from: self.position,
+            from: self.offset,
         }
     }
 
@@ -365,7 +360,7 @@ impl App {
                 // The fold failed part-way: start over from the beginning.
                 self.transcript = Transcript::new(&self.limits.wire);
                 self.rendered.clear();
-                self.position = START;
+                self.offset = Offset::BEGINNING;
                 self.refollow()
             }
             (Phase::Ready, Connection::Idle | Connection::Down(_) | Connection::Retrying(_)) => {
@@ -481,10 +476,10 @@ impl App {
                 // the app restarts it from the one it last folded; they are
                 // the same offset, or a read was skipped or folded twice.
                 assert!(
-                    from == self.position.offset,
+                    from == self.offset,
                     "follower {} delivered a read from {from}, but the transcript is folded up to {}",
                     follow.0,
-                    self.position.offset
+                    self.offset
                 );
                 for chunk in &chunks {
                     if let Err(error) = self.transcript.apply(chunk) {
@@ -495,10 +490,7 @@ impl App {
                         return Cmd::StopFollowing;
                     }
                 }
-                self.position = Position {
-                    offset: control.stream_next_offset,
-                    cursor: Some(control.stream_cursor),
-                };
+                self.offset = control.stream_next_offset;
                 let count = self
                     .folded
                     .as_ref()
@@ -562,7 +554,7 @@ impl App {
             session,
             phase,
             transcript: Transcript::new(&limits.wire),
-            position: START,
+            offset: Offset::BEGINNING,
             folded: None,
             follow: FollowId(0),
             connection: Connection::Idle,

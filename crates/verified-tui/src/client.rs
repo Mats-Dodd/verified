@@ -21,7 +21,7 @@
 //! the next read asks for it again from the last delivered offset.
 //!
 //! No client *state* depends on a dropped future finishing. The follower's
-//! only state is its [`Position`], advanced only after a read has been
+//! only state is its offset, advanced only after a read has been
 //! handed to the inbox; every future that touches it is either awaited to
 //! the end or dropped on the way to the follower returning, so a
 //! half-finished read is never resumed from. The app's own state changes
@@ -44,7 +44,7 @@ use verified_wire::command::{
     Rejection, SendMessage, SendMessageReply, decode_reply,
 };
 use verified_wire::sse::{SseDecoder, SseError};
-use verified_wire::stream::{Control, Cursor, Offset, StreamError, StreamEvent, query};
+use verified_wire::stream::{Control, Offset, StreamError, StreamEvent, query};
 
 use crate::Limits;
 use crate::seam::{Clock, Dialer};
@@ -169,14 +169,6 @@ pub enum Answer {
         turn_id: TurnId,
         result: Result<CancelReply, ClientError>,
     },
-}
-
-/// Where a follower reads from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Position {
-    pub offset: Offset,
-    /// The last cursor the daemon sent, echoed back on reconnect.
-    pub cursor: Option<Cursor>,
 }
 
 /// What following a stream reports.
@@ -366,7 +358,7 @@ impl Client {
     pub async fn follow<T, W>(
         &self,
         session: SessionId,
-        from: Position,
+        from: Offset,
         inbox: &mpsc::Sender<T>,
         wrap: W,
         stop: &CancellationToken,
@@ -374,14 +366,14 @@ impl Client {
         T: Send,
         W: Fn(StreamUpdate) -> T + Sync,
     {
-        let mut position = from;
+        let mut offset = from;
         let mut failures: u32 = 0;
         loop {
             let mut progress = Progress::None;
             let read = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                read = self.read_live(session, &mut position, &mut progress, inbox, &wrap) => read,
+                read = self.read_live(session, &mut offset, &mut progress, inbox, &wrap) => read,
             };
             if progress == Progress::Made {
                 failures = 0;
@@ -417,7 +409,7 @@ impl Client {
     async fn read_live<T, W>(
         &self,
         session: SessionId,
-        position: &mut Position,
+        offset: &mut Offset,
         progress: &mut Progress,
         inbox: &mpsc::Sender<T>,
         wrap: &W,
@@ -426,18 +418,7 @@ impl Client {
         T: Send,
         W: Fn(StreamUpdate) -> T + Sync,
     {
-        // Query parameters in lexicographic order (Durable Streams §10.1).
-        let cursor = position
-            .cursor
-            .map(|cursor| format!("{}={cursor}&", query::CURSOR))
-            .unwrap_or_default();
-        let path = format!(
-            "/sessions/{session}/stream?{cursor}{}={}&{}={}",
-            query::LIVE,
-            query::LIVE_SSE,
-            query::OFFSET,
-            position.offset
-        );
+        let path = format!("/sessions/{session}/stream?{}={offset}", query::OFFSET);
         let request = self.request(Method::GET, &path, Bytes::new());
         let opening = async {
             let stream = self.dialer.dial().await.map_err(ClientError::Connect)?;
@@ -482,7 +463,7 @@ impl Client {
                             }
                         }
                         StreamEvent::Control(control) => {
-                            let from = position.offset;
+                            let from = *offset;
                             let next = control.stream_next_offset;
                             let chunks = pending.take().unwrap_or_default();
                             // A read ends at or past its start, and one with
@@ -494,7 +475,6 @@ impl Client {
                                     chunks: chunks.len(),
                                 });
                             }
-                            let cursor = control.stream_cursor;
                             let update = StreamUpdate::Read {
                                 from,
                                 chunks,
@@ -507,10 +487,7 @@ impl Client {
                             // this one ended. Chunks still pending when the
                             // connection drops were never delivered, so the
                             // next connection asks for them again.
-                            *position = Position {
-                                offset: next,
-                                cursor: Some(cursor),
-                            };
+                            *offset = next;
                             *progress = Progress::Made;
                         }
                     }

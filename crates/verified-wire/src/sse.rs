@@ -71,11 +71,6 @@ impl SseEvent {
         &self.payload
     }
 
-    #[must_use]
-    pub fn into_payload(self) -> String {
-        self.payload
-    }
-
     /// Appends the event's wire form to `out`.
     pub fn encode_into(&self, out: &mut String) {
         out.push_str("event: ");

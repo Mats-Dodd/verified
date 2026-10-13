@@ -22,7 +22,7 @@ use verified_tui::{Limits, new_session};
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::SendMessage;
-use verified_wire::stream::{Control, Cursor, Freshness, Offset, StreamEvent};
+use verified_wire::stream::{Control, Freshness, Offset, StreamEvent};
 
 /// Runs a test's in-memory server on the test's runtime: test scaffolding,
 /// not a task of the code under test.
@@ -109,7 +109,6 @@ fn simple_chunks() -> Vec<UiChunk> {
 fn control(next: u64) -> String {
     StreamEvent::Control(Control {
         stream_next_offset: Offset::at(next).expect("in range"),
-        stream_cursor: Cursor::parse("7").expect("a cursor"),
         up_to_date: Freshness::UpToDate,
     })
     .to_sse()
@@ -264,7 +263,7 @@ async fn creates_catches_up_reconnects_sends_and_quits() {
     let golden: Value = serde_json::from_str(SIMPLE_TURNS).expect("golden");
     assert_eq!(folded, golden);
     assert!(app.caught_up());
-    assert_eq!(app.position().offset, Offset::at(11).expect("in range"));
+    assert_eq!(app.offset(), Offset::at(11).expect("in range"));
 
     let lines: Vec<&str> = seen_log
         .iter()
@@ -275,12 +274,10 @@ async fn creates_catches_up_reconnects_sends_and_quits() {
         .collect();
     assert_eq!(lines.first(), Some(&"POST /sessions HTTP/1.1"));
     let stream = format!("GET /sessions/{session}/stream?");
-    assert!(lines.contains(&format!("{stream}live=sse&offset=0000000000000000 HTTP/1.1").as_str()));
+    assert!(lines.contains(&format!("{stream}offset=0000000000000000 HTTP/1.1").as_str()));
     assert!(
-        lines.contains(
-            &format!("{stream}cursor=7&live=sse&offset=0000000000000011 HTTP/1.1").as_str()
-        ),
-        "resumes from the last control offset, echoing the cursor: {lines:?}"
+        lines.contains(&format!("{stream}offset=0000000000000011 HTTP/1.1").as_str()),
+        "resumes from the last control offset: {lines:?}"
     );
 
     // The session id was the first draw, the paste the second, Enter the third.
@@ -444,8 +441,8 @@ const CUTS: [Option<(u64, usize)>; 3] = [
 /// What the dropping daemon saw and did.
 #[derive(Debug)]
 enum Served {
-    /// A stream read was requested from this offset, echoing this cursor.
-    Opened { offset: Offset, cursor: bool },
+    /// A stream read was requested from this offset.
+    Opened { offset: Offset },
     /// A record's data and control event were written whole.
     Record { seq: u64, chunks: Vec<UiChunk> },
 }
@@ -495,9 +492,8 @@ async fn serve_records(
         .find_map(|pair| pair.strip_prefix("offset="))
         .map(|offset| Offset::parse(offset).expect("an offset"))
         .expect("an offset parameter");
-    let cursor = query.split('&').any(|pair| pair.starts_with("cursor="));
     served
-        .send(Served::Opened { offset, cursor })
+        .send(Served::Opened { offset })
         .expect("the test is listening");
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).await.expect("written");
@@ -551,10 +547,7 @@ async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
     );
     let at = UnixMillis::new(NOW).expect("in range");
     let session = verified_domain::id::SessionId::from_parts(at, &[0; 10]);
-    let start = verified_tui::client::Position {
-        offset: Offset::BEGINNING,
-        cursor: None,
-    };
+    let start = Offset::BEGINNING;
     let stop = tokio_util::sync::CancellationToken::new();
     let (inbox, mut updates) = tokio::sync::mpsc::channel(8);
     let end = Offset::at(RECORDS).expect("in range");
@@ -623,7 +616,7 @@ async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
         std::collections::BTreeMap::new();
     for served in served.try_iter() {
         match served {
-            Served::Opened { offset, cursor } => opened.push((offset.seq(), cursor)),
+            Served::Opened { offset } => opened.push(offset.seq()),
             Served::Record { seq, chunks } => {
                 let previous = whole.insert(seq, chunks);
                 assert!(previous.is_none(), "the daemon served {seq} twice");
@@ -632,8 +625,8 @@ async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
     }
     assert_eq!(
         opened,
-        [(0, false), (3, true), (5, true)],
-        "each reconnect asks for exactly the next unseen record, echoing the cursor"
+        [0, 3, 5],
+        "each reconnect asks for exactly the next unseen record"
     );
     assert_eq!(
         received.keys().copied().collect::<Vec<_>>(),

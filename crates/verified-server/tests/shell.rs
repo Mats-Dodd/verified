@@ -29,7 +29,7 @@ use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
     Approve, Cancel, MessageText, Outcome, Rejection, SendMessage, Verdict,
 };
-use verified_wire::stream::{Offset, ReadFrom};
+use verified_wire::stream::Offset;
 use verified_wire::transcript::Transcript;
 
 /// `work`, or an error once `limit` passes: a test's own bound on how long
@@ -262,10 +262,7 @@ async fn all_chunks(handle: &SessionHandle) -> Vec<UiChunk> {
     let mut chunks = Vec::new();
     let mut from = Offset::BEGINNING;
     loop {
-        let read = handle
-            .read(ReadFrom::Offset(from))
-            .await
-            .expect("the session runs");
+        let read = handle.read(from).await.expect("the session runs");
         let done = read.next == from;
         chunks.extend(read.chunks);
         if done {
@@ -280,14 +277,14 @@ async fn until<F>(handle: &SessionHandle, ready: F) -> Vec<UiChunk>
 where
     F: Fn(&[UiChunk]) -> bool,
 {
-    let tail = handle.tail();
+    let committed = handle.committed();
     loop {
-        let seen = tail.get();
+        let seen = committed.get();
         let chunks = all_chunks(handle).await;
         if ready(&chunks) {
             return chunks;
         }
-        within(Duration::from_secs(20), tail.past(seen))
+        within(Duration::from_secs(20), committed.past(seen))
             .await
             .expect("the stream moves within 20s")
             .expect("the session runs");

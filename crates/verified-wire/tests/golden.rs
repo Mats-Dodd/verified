@@ -249,9 +249,9 @@ proptest! {
         );
     }
 
-    /// A catch-up body is the same chunks.
+    /// A data event's chunk array is the same chunks.
     #[test]
-    fn catch_up_bodies_round_trip(fixture_index in 0..FIXTURES.len()) {
+    fn chunk_arrays_round_trip(fixture_index in 0..FIXTURES.len()) {
         let (_, stream, _) = FIXTURES.get(fixture_index).copied().expect("in range");
         let sent = chunks(stream);
         let body = verified_wire::stream::encode_chunks(&sent);
