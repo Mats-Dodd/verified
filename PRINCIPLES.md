@@ -76,9 +76,9 @@ Every entry passes all four parts of the admission rule.
 
 | # | Invariant | Strongest check | Planted bug |
 |---|---|---|---|
-| U1 | **Approval before dispatch.** A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. Simulated (I1). | DST `running_tools_before_their_dispatch_is_durable_is_caught`; replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
+| U1 | **Approval before dispatch.** A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. Only the replay judges a run's acts, against the model's world: a model wrong about the world in a way that licenses an early act would pass a shell that acts early (see "the model's world" in the trusted base). | replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
 | U2 | **Policy approves only `Safe` calls.** An `Unsafe` call needs an approval command; it is never approved automatically. | Proved (`approver_fits`). Model-checked. | Stateright `approval_by_policy_of_an_edit_is_caught` |
-| U3 | **An `Unsafe` call is dispatched at most once, ever, and acts at most once.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Simulated (I3). Trace-checked (a dispatched run acts at most once; I3, counting acts per call across crashes, catches every run this does). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
+| U3 | **An `Unsafe` call is dispatched at most once, ever, and acts at most once.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Trace-checked (a dispatched run acts at most once). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
 | U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_interrupted_fails_the_replay` |
 | U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). Model-checked. | Mutation recorded in the commit that added this file |
 | U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Model-checked. Simulated (I6). The replay checks which offsets the client read and when; what it folded there is I6's. | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
@@ -93,7 +93,7 @@ has been seen to fail those checks, so none has moved up.
 
 | Property | Current check | Missing |
 |---|---|---|
-| Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked. Simulated (I2, I5). | A planted bug: a duplicate or missing `ToolResult`. |
+| Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked. Simulated (I5). | A planted bug: a duplicate or missing `ToolResult`. |
 | Anything acknowledged survives a crash and replays. | Property-tested (`everything_acknowledged_replays`, `damage_before_a_later_group_is_corrupt`). Simulated (I4). | A committed DST planted bug, such as an append that skips fsync. |
 | A message starts at most one turn, so a retried command means the same thing. | `apply` refuses a duplicate message. Simulated (I8). | A planted bug. Is the core's refusal proved, or only checked at run time? |
 | An `edit` reported `Ok` wrote `new` in place of `old`. | Simulated (I7). | A committed planted bug (the mutation was only run once). |

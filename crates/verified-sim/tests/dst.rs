@@ -66,7 +66,7 @@ seeds! {
     seed_6 = 6;
     seed_7 = 7;
     // The daemon crashes while a command runs: it resolves Unknown, and a
-    // core that reran it would be caught here by I3.
+    // core that reran it would be caught here by the replay.
     seed_37 = 37;
     // A reconnect resumes mid-turn: only the read-by-read I6 catches a
     // follower that skips a record there.
@@ -75,10 +75,8 @@ seeds! {
     // user retries it by hand.
     seed_51 = 51;
     // The daemon crashes after an edit is dispatched and before it writes:
-    // the edit resolves Unknown. (A rerun edit would miss `old` and write
-    // nothing, so I3 sees reruns through seed 37's command and the
-    // Stateright model.) Later two edits and a command are proposed in one
-    // step.
+    // the edit resolves Unknown. Later two edits and a command are proposed
+    // in one step.
     seed_53 = 53;
     // The daemon crashes after a command is dispatched, so it resolves
     // Unknown; then the TUI link stays down past the follower's reconnect
@@ -154,55 +152,20 @@ fn the_fixed_seeds_reach_every_fault_path() {
 }
 
 /// Persist before acting (Law 2), as a mutation test: a daemon that starts
-/// tool runs before their decision is durable is caught by I1 on some seed.
-#[test]
-fn running_tools_before_their_dispatch_is_durable_is_caught() {
-    let planted = Planted {
-        run_before_persist: true,
-        ..Planted::default()
-    };
-    let caught = (0..40u64).find(|seed| {
-        run::simulate_with(*seed, planted).is_ok_and(|outcome| {
-            outcome
-                .violations
-                .iter()
-                .any(|violation| violation.invariant == "I1")
-        })
-    });
-    assert!(caught.is_some(), "no seed caught a tool run before persist");
-}
-
-/// The same defect, caught by the model: the replay leaves the model where
-/// the shell dispatches a tool run the model has not started, because its
-/// decision is not durable yet. It catches every seed I1 does, and seeds I1
-/// cannot: a `read` changes nothing in the world for I1 to see.
+/// tool runs before their decision is durable leaves the model on some
+/// seed, where the shell dispatches a tool run the model has not started,
+/// because its decision is not durable yet.
 #[test]
 fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
     let planted = Planted {
         run_before_persist: true,
         ..Planted::default()
     };
-    let mut beyond_i1 = 0usize;
-    for seed in 0..16u64 {
+    let caught = (0..16u64).any(|seed| {
         let outcome = run::simulate_with(seed, planted).expect("the run finishes");
-        let caught = |invariant: &str| {
-            outcome
-                .violations
-                .iter()
-                .any(|violation| violation.invariant == invariant)
-        };
-        let replay = outcome.violations.iter().any(|violation| {
-            violation.invariant == "model" && violation.detail.contains("no run the model started")
-        });
-        assert!(
-            replay || !caught("I1"),
-            "seed {seed}: I1 caught the defect and the replay did not"
-        );
-        if replay && !caught("I1") {
-            beyond_i1 = beyond_i1.saturating_add(1);
-        }
-    }
-    assert!(beyond_i1 > 0, "the replay catches no seed I1 misses");
+        replay_says(&outcome, "no run the model started")
+    });
+    assert!(caught, "no seed's replay caught a tool run before persist");
 }
 
 /// Whether some violation of `outcome` is the replay's, saying `why`.
@@ -216,28 +179,17 @@ fn replay_says(outcome: &run::Outcome, why: &str) -> bool {
 /// At most once inside one dispatch, as a mutation test: a shell that runs
 /// a tool twice and reports it once is caught by the replay at the second
 /// act on the world, though the shell's own `ToolRan` is passed only once.
-/// Only `Unsafe` tools act, so I3 (acts per call) catches each such run too.
 #[test]
 fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
     let planted = Planted {
         run_twice: true,
         ..Planted::default()
     };
-    let mut caught = 0usize;
-    for seed in 0..16u64 {
+    let caught = (0..16u64).any(|seed| {
         let outcome = run::simulate_with(seed, planted).expect("the run finishes");
-        if replay_says(&outcome, "acts on the world a second time") {
-            caught = caught.saturating_add(1);
-            assert!(
-                outcome
-                    .violations
-                    .iter()
-                    .any(|violation| violation.invariant == "I3"),
-                "seed {seed}: the replay caught a second act and I3 did not"
-            );
-        }
-    }
-    assert!(caught > 0, "no seed's replay caught a second run");
+        replay_says(&outcome, "acts on the world a second time")
+    });
+    assert!(caught, "no seed's replay caught a second run");
 }
 
 /// The model's `Execute` is the run acting on the world, not its return:

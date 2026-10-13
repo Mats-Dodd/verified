@@ -6,7 +6,7 @@ use stateright::{Checker as _, Expectation, Model as _};
 use verified_core::{Event, ModelExit, Verdict};
 use verified_domain::{
     Abstract, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId, Proposal,
-    Record, Request, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
+    Record, Request, Rerun, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::{Divergence, harness};
@@ -800,17 +800,32 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
     let first = |pick: &dyn Fn(&Observed) -> bool| {
         trace.iter().position(pick).expect("the path observes it")
     };
-    let (ran, id) = trace
+    // Where the trace sees each run return, the run, and its tool.
+    let runs: Vec<(usize, EffectId, Tool)> = trace
         .iter()
         .enumerate()
-        .find_map(|(at, observed)| {
-            if let Observed::Ran(id) = observed {
-                Some((at, *id))
+        .filter_map(|(at, observed)| {
+            let Observed::Ran(id) = observed else {
+                return None;
+            };
+            let executed = path
+                .iter()
+                .position(|action| *action == Action::Execute(*id))?;
+            let before = follow(&bounded, path.get(..executed)?);
+            if let Job::Tool { tool, .. } = before.flights.get(id)?.job {
+                Some((at, *id, tool))
             } else {
                 None
             }
         })
-        .expect("a tool runs");
+        .collect();
+    let run = |rerun: Rerun| {
+        runs.iter()
+            .copied()
+            .find(|(_, _, tool)| tool.rerun() == rerun)
+            .expect("the path runs a tool of each class")
+    };
+    let (ran, id, _) = run(Rerun::Safe);
 
     // A completion the model does not enable there: the tool reports
     // before its run returned. The model's next state alone would take it.
@@ -825,7 +840,15 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
     assert_eq!(found.index, ran, "where the report came early: {found:?}");
     assert!(found.why.contains("is not enabled"), "{found:?}");
 
-    // A run acting on the world twice before it returns.
+    // A `Safe` run acting on the world, which it only reads.
+    let mut mutated = trace.clone();
+    mutated.insert(ran, Observed::Mutated(id));
+    let found = divergence(&replays(&mutated), &mutated);
+    assert_eq!(found.index, ran, "the act: {found:?}");
+    assert!(found.why.contains("changes nothing"), "{found:?}");
+
+    // An `Unsafe` run acting on the world twice before it returns.
+    let (ran, id, _) = run(Rerun::Unsafe);
     let mut twice = trace.clone();
     twice.insert(ran, Observed::Mutated(id));
     twice.insert(ran, Observed::Mutated(id));

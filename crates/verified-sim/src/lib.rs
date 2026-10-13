@@ -6,7 +6,7 @@
 //! draws a [`scenario`]: what the user types and answers, crashes (at random
 //! times and aimed at barriers inside the daemon), partitions between the
 //! TUI and the daemon, and torn writes. After each run [`check`] judges the
-//! world (I1-I8), [`model`] replays the run through the Stateright model and
+//! world (I4-I8), [`model`] replays the run through the Stateright model and
 //! checks its properties on every state, and [`run::twice`] runs each seed
 //! twice to prove the trace is deterministic.
 

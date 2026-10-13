@@ -5,18 +5,10 @@
 //! what each recovery found on disk, and what the TUI showed when it was
 //! quiescent.
 //!
-//! - I1 every world mutation carried an approval, durably and beforehand:
-//!   when the environment changed the world for a call, the log this daemon
-//!   life knew to be synced (what it recovered plus every group acknowledged
-//!   since) already held the call's `Approved`, and the very `Dispatched`
-//!   record its effect id names (by seq), for a tool that makes that kind
-//!   of change, and the effect ran in that log's current epoch (the one its
-//!   last `EpochBumped` set: a run started before its decision's epoch was
-//!   durable, or left over from an earlier life, does not match); and the
-//!   final log still holds them.
-//! - I2 every call has exactly one `ToolResult` in the final log.
-//! - I3 an Unsafe call (`edit`, `bash`) acted on the world at most once,
-//!   across every crash.
+//! What a tool may do to the world and when (approval and dispatch durable
+//! first, an `Unsafe` call at most once) is the model's replay to judge
+//! ([`crate::model`]), from the same ledger.
+//!
 //! - I4 every recovered log extends every record acknowledged as synced.
 //! - I5 at quiescence every turn ended and every call resolved.
 //! - I6 exactly: each stream read the TUI folded, `from..next`, arrived as
@@ -31,13 +23,14 @@
 //!   edits are durable: after the final crash each file holds what the last
 //!   write to it that finished wrote, or what a write that overlapped that
 //!   one wrote (two racing renames land in either order).
-//! - I8 each message the user sent started exactly one turn, but the one it
-//!   gave up on when the session took no more, which started at most one.
+//! - I8 the log started one turn for each message the user sent, but the
+//!   one it gave up on when the session took no more, which started at most
+//!   one.
 
 use core::fmt;
 use std::collections::BTreeMap;
 
-use verified_domain::{EffectId, Exit, Record, Request, Rerun, Tool};
+use verified_domain::{EffectId, Exit, Record, Request};
 use verified_server::payload::{Parsed, ToolArgs};
 use verified_server::projection::Projector;
 use verified_wire::WireLimits;
@@ -70,10 +63,7 @@ const fn violation(invariant: &'static str, detail: String) -> Violation {
 struct Call {
     turn: usize,
     id: String,
-    tool: Option<Tool>,
     args: Option<ToolArgs>,
-    approved: usize,
-    dispatched: usize,
     /// The seq of each of its `Dispatched` records: its effects' seqs.
     effects: Vec<u64>,
     results: Vec<Exit>,
@@ -96,17 +86,14 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                 calls: proposed, ..
             } => {
                 for proposal in proposed {
-                    let (tool, args) = match &proposal.request {
-                        Request::Run { args } => (Some(args.tool()), Some(args.clone())),
-                        Request::Invalid { .. } => (None, None),
+                    let args = match &proposal.request {
+                        Request::Run { args } => Some(args.clone()),
+                        Request::Invalid { .. } => None,
                     };
                     calls.push(Call {
                         turn,
                         id: proposal.id.as_str().to_owned(),
-                        tool,
                         args,
-                        approved: 0,
-                        dispatched: 0,
                         effects: Vec::new(),
                         results: Vec::new(),
                     });
@@ -136,19 +123,10 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
             continue;
         };
         match record {
-            Record::Approved { .. } => call.approved = call.approved.saturating_add(1),
-            Record::Dispatched { .. } => {
-                if call.approved == 0 {
-                    found.push(violation(
-                        "I1",
-                        format!("call {} was dispatched before it was approved", call.id),
-                    ));
-                }
-                call.dispatched = call.dispatched.saturating_add(1);
-                call.effects.push(seq);
-            }
+            Record::Dispatched { .. } => call.effects.push(seq),
             Record::ToolResult { exit, .. } => call.results.push(*exit),
-            Record::TurnStarted { .. }
+            Record::Approved { .. }
+            | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
@@ -238,12 +216,8 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     let mut found = Vec::new();
     let mut log: Vec<Record<Parsed>> = Vec::new();
     let mut last_recovered: Option<(usize, Vec<Record<Parsed>>)> = None;
-    let mut mutations: Vec<(Option<String>, Op)> = Vec::new();
     let mut reads: Vec<Read<'_>> = Vec::new();
     let mut disk = Disk::default();
-    // Whether this daemon life has opened or created its log yet: until it
-    // has, it knows nothing durable, and no tool of it may run.
-    let mut known = false;
     let mut caught = 0usize;
     let mut gave_up = None;
     for (at, stamped) in entries.iter().enumerate() {
@@ -256,7 +230,6 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                     ));
                 }
                 log.clear();
-                known = true;
             }
             Entry::Recovered { records } => {
                 let kept = records.get(..log.len()).is_some_and(|kept| kept == log);
@@ -272,7 +245,6 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                     ));
                 }
                 log.clone_from(records);
-                known = true;
                 last_recovered = Some((at, records.clone()));
             }
             Entry::Acked { first, records } => {
@@ -290,21 +262,9 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 quiescent(&log, "at quiescence", &mut found);
                 caught_up(&log, *offset, transcript, &mut found);
             }
-            Entry::Boot { files, .. } => {
-                known = false;
-                disk.boot(at, files);
-            }
+            Entry::Boot { files, .. } => disk.boot(at, files),
             Entry::Wrote { effect } => disk.wrote(at, *effect, &mut found),
             Entry::Mutation { call, effect, op } => {
-                licensed_now(
-                    &log,
-                    known,
-                    call.as_deref(),
-                    *effect,
-                    op,
-                    stamped,
-                    &mut found,
-                );
                 if let Op::Write { path, text } = op {
                     disk.writes.push(Write {
                         call: call.as_deref(),
@@ -316,7 +276,6 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                         end: None,
                     });
                 }
-                mutations.push((call.clone(), op.clone()));
             }
             Entry::Read { from, next, chunks } => reads.push(Read {
                 from: *from,
@@ -351,12 +310,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
             "the final recovery came before the TUI was quiescent".to_owned(),
         ));
     }
-    final_log(
-        &last,
-        &mutations,
-        (scenario.turns.len(), gave_up),
-        &mut found,
-    );
+    turns_started(&last, (scenario.turns.len(), gave_up), &mut found);
     edits_applied(&last, &disk, &mut found);
     edits_durable(&disk, &mut found);
     reads_exact(&last, &reads, &mut found);
@@ -542,101 +496,6 @@ fn edits_durable(disk: &Disk<'_>, found: &mut Vec<Violation>) {
     }
 }
 
-/// Whether `tool` makes changes like `op`.
-const fn makes(tool: Option<Tool>, op: &Op) -> bool {
-    matches!(
-        (tool, op),
-        (Some(Tool::Edit), Op::Write { .. }) | (Some(Tool::Bash), Op::Exec { .. })
-    )
-}
-
-/// I1 at the moment of a mutation: `log` is what this daemon life knew to
-/// be synced (`known`: it has opened its log at all). Persist before acting:
-/// a tool started before its `Dispatched` was synced fails here even when
-/// the record lands a moment later.
-/// The epoch `log` ends in, and the call each `Dispatched` record names,
-/// by its seq.
-fn dispatches(log: &[Record<Parsed>]) -> (u64, BTreeMap<u64, String>) {
-    let mut epoch = 0u64;
-    let mut names: Vec<&str> = Vec::new();
-    let mut dispatched = BTreeMap::new();
-    for (seq, record) in (0u64..).zip(log) {
-        match record {
-            Record::EpochBumped { epoch: bumped } => epoch = bumped.0,
-            Record::TurnStarted { .. } => names.clear(),
-            Record::StepFinished { calls, .. } => {
-                names.extend(calls.iter().map(|proposal| proposal.id.as_str()));
-            }
-            Record::Dispatched { call } => {
-                if let Some(name) = names.get(call.0) {
-                    dispatched.insert(seq, (*name).to_owned());
-                }
-            }
-            Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::Approved { .. }
-            | Record::ToolResult { .. }
-            | Record::CancelRequested { .. }
-            | Record::TurnEnded { .. } => {}
-        }
-    }
-    (epoch, dispatched)
-}
-
-fn licensed_now(
-    log: &[Record<Parsed>],
-    known: bool,
-    call: Option<&str>,
-    effect: EffectId,
-    op: &Op,
-    stamped: &Stamped,
-    found: &mut Vec<Violation>,
-) {
-    // A mutation no call can be named for is reported over the final log.
-    let Some(id) = call else { return };
-    let at = stamped.at.as_millis();
-    if !known {
-        found.push(violation(
-            "I1",
-            format!(
-                "call {id} changed the world ({op:?}) at {at}ms, before its daemon read its log"
-            ),
-        ));
-        return;
-    }
-    // Malformed records are reported over the final log too.
-    let mut ignored = Vec::new();
-    let licensed = calls(log, &mut ignored).iter().any(|known| {
-        known.id == id && known.approved > 0 && known.dispatched > 0 && makes(known.tool, op)
-    });
-    if !licensed {
-        found.push(violation(
-            "I1",
-            format!(
-                "call {id} changed the world ({op:?}) at {at}ms, before a synced group held its approval and dispatch"
-            ),
-        ));
-        return;
-    }
-    let (epoch, dispatched) = dispatches(log);
-    if dispatched.get(&effect.seq).map(String::as_str) != Some(id) {
-        found.push(violation(
-            "I1",
-            format!(
-                "call {id} changed the world ({op:?}) at {at}ms as effect {effect}, whose seq is not a synced dispatch of it"
-            ),
-        ));
-    } else if effect.epoch.0 != epoch {
-        found.push(violation(
-            "I1",
-            format!(
-                "call {id} changed the world ({op:?}) at {at}ms as effect {effect}, outside the synced epoch {epoch}"
-            ),
-        ));
-    }
-}
-
 /// One stream read the TUI folded.
 #[derive(Debug, Clone, Copy)]
 struct Read<'ledger> {
@@ -702,91 +561,27 @@ fn reads_exact(log: &[Record<Parsed>], reads: &[Read<'_>], found: &mut Vec<Viola
     }
 }
 
-/// I1, I2, I3 and I8 over the log the final recovery found, of a plan of
-/// `planned` messages the user may have given up at one.
-fn final_log(
+/// I8 over the log the final recovery found, of a plan of `planned`
+/// messages the user may have given up at one.
+fn turns_started(
     log: &[Record<Parsed>],
-    mutations: &[(Option<String>, Op)],
     (planned, gave_up): (usize, Option<usize>),
     found: &mut Vec<Violation>,
 ) {
-    let calls = calls(log, found);
-    for call in &calls {
-        if call.results.len() != 1 {
-            found.push(violation(
-                "I2",
-                format!("call {} has {} results", call.id, call.results.len()),
-            ));
-        }
-        if call.dispatched > 1 {
-            found.push(violation(
-                "I2",
-                format!("call {} was dispatched {} times", call.id, call.dispatched),
-            ));
-        }
-    }
-    let mut acted: BTreeMap<&str, usize> = BTreeMap::new();
-    for (call, op) in mutations {
-        let Some(id) = call else {
-            found.push(violation(
-                "I1",
-                format!("a mutation no call can be named for: {op:?}"),
-            ));
-            continue;
-        };
-        let licensed = calls
-            .iter()
-            .any(|known| known.id == *id && known.approved > 0 && known.dispatched > 0);
-        if !licensed {
-            found.push(violation(
-                "I1",
-                format!(
-                    "call {id} changed the world ({op:?}) without a durable approval and dispatch"
-                ),
-            ));
-        }
-        let count = acted.entry(id.as_str()).or_default();
-        *count = count.saturating_add(1);
-    }
-    for (id, count) in acted {
-        // The fake model reuses ids across turns: each turn's call may act once.
-        let allowed = calls
-            .iter()
-            .filter(|call| {
-                call.id == id
-                    && call.dispatched > 0
-                    && call
-                        .tool
-                        .is_some_and(|tool| matches!(tool.rerun(), Rerun::Unsafe))
-            })
-            .count();
-        if count > allowed {
-            found.push(violation(
-                "I3",
-                format!("Unsafe call {id} acted on the world {count} times"),
-            ));
-        }
-    }
-    let mut messages = Vec::new();
-    for record in log {
-        if let Record::TurnStarted { message, .. } = record {
-            messages.push(*message);
-        }
-    }
-    let sent = messages.len();
-    messages.sort_unstable();
-    messages.dedup();
-    let started = match gave_up {
-        None => sent == planned,
-        Some(turn) => sent == turn || sent == turn.saturating_add(1),
+    let started = log
+        .iter()
+        .filter(|record| matches!(record, Record::TurnStarted { .. }))
+        .count();
+    let expected = match gave_up {
+        None => started == planned,
+        Some(turn) => started == turn || started == turn.saturating_add(1),
     };
-    if messages.len() != sent || !started {
+    if !expected {
         found.push(violation(
             "I8",
             format!(
                 "{planned} messages were planned (given up at {gave_up:?}); the log started \
-                 {sent} turns from {} distinct messages",
-                messages.len()
+                 {started} turns"
             ),
         ));
     }

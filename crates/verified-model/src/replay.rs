@@ -29,11 +29,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use stateright::{Expectation, Model as _};
 use verified_core::{Event, ModelExit};
-use verified_domain::{Abstract, Cause, EffectId, Exit, Limits};
+use verified_domain::{Abstract, Cause, EffectId, Exit, Limits, Rerun, Tool};
 
 use crate::coverage::{self, Key};
 use crate::harness::{Action, Harness, Message, Offers};
-use crate::world::{Job, Rec, World};
+use crate::world::{Flight, Job, Rec, World};
 
 /// The most states the frontier may hold: past it, the observations no
 /// longer pin the model's state, and a replay could hide a bug behind a
@@ -60,8 +60,8 @@ pub enum Observed {
     Acked { first: u64, records: Vec<Rec> },
     /// A tool run is about to start: its `Dispatched` is durable.
     Dispatched(EffectId),
-    /// A tool run acted on the world: at most once per run, before it
-    /// returns.
+    /// A tool run acted on the world: an `Unsafe` run, at most once, before
+    /// it returns.
     Mutated(EffectId),
     /// A tool run returned: its side effect, if any, has happened. It acted
     /// here only if it never mutated and does not report `Interrupted`.
@@ -278,10 +278,14 @@ fn take(harness: &Harness, world: &World, action: &Action) -> Result<World, Stri
         .ok_or_else(|| format!("{action:?} has no next state"))
 }
 
-/// The tool run `id` started in `world` and has not yet returned.
-fn running(world: &World, id: EffectId) -> Result<(), String> {
+/// The tool of run `id`, which `world` started and has not yet returned.
+fn running(world: &World, id: EffectId) -> Result<Tool, String> {
     match world.flights.get(&id) {
-        Some(flight) if matches!(flight.job, Job::Tool { .. }) && !flight.executed => Ok(()),
+        Some(Flight {
+            job: Job::Tool { tool, .. },
+            executed: false,
+            ..
+        }) => Ok(*tool),
         Some(flight) => Err(format!(
             "effect {id:?} is {flight:?}, not a tool yet to run"
         )),
@@ -432,7 +436,12 @@ fn step(
                     "effect {id:?} acts on the world a second time in one run"
                 ));
             }
-            running(world, *id)?;
+            let tool = running(world, *id)?;
+            if tool.rerun() == Rerun::Safe {
+                return Err(format!(
+                    "effect {id:?} is a {tool:?} run, which changes nothing in the world"
+                ));
+            }
             one(Action::Execute(*id))
         }
         Observed::Ran(id) => match world.flights.get(id) {
