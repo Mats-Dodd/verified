@@ -9,8 +9,12 @@
 //! `just sim` also runs `verified-sim processes`, which traces each fixed
 //! seed in two fresh processes.
 
+use verified_model::coverage::{Class, Key};
+use verified_model::replay::harness;
+use verified_model::{Bug, Harness, Mismatch};
 use verified_server::shell::Planted;
-use verified_sim::run;
+use verified_sim::directed::{self, Directed};
+use verified_sim::{hosts, run};
 
 /// Runs `seed` twice, compares the traces, then judges the world.
 fn seed(seed: u64) {
@@ -76,10 +80,13 @@ seeds! {
     // Unknown; then the TUI link stays down past the follower's reconnect
     // schedule, so it stops following and the user reconnects by hand.
     seed_818 = 818;
+    // A tool runs while the next decision is being persisted: the model's
+    // world goes on during a sync, and only a run seen doing so pins that.
+    seed_342 = 342;
 }
 
 /// The seeds the suite runs, each in its own test above.
-const FIXED: [u64; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 818];
+const FIXED: [u64; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 342, 818];
 
 /// Fault paths the fixed seeds must reach, each as text its trace shows
 /// (every needle on some line): a path nobody reaches is a path nobody
@@ -148,6 +155,7 @@ fn the_fixed_seeds_reach_every_fault_path() {
 fn running_tools_before_their_dispatch_is_durable_is_caught() {
     let planted = Planted {
         run_before_persist: true,
+        ..Planted::default()
     };
     let caught = (0..40u64).find(|seed| {
         run::simulate_with(*seed, planted).is_ok_and(|outcome| {
@@ -158,6 +166,254 @@ fn running_tools_before_their_dispatch_is_durable_is_caught() {
         })
     });
     assert!(caught.is_some(), "no seed caught a tool run before persist");
+}
+
+/// The same defect, caught by the model: the replay leaves the model where
+/// the shell dispatches a tool run the model has not started, because its
+/// decision is not durable yet. It catches every seed I1 does, and seeds I1
+/// cannot: a `read` changes nothing in the world for I1 to see.
+#[test]
+fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
+    let planted = Planted {
+        run_before_persist: true,
+        ..Planted::default()
+    };
+    let mut beyond_i1 = 0usize;
+    for seed in 0..16u64 {
+        let outcome = run::simulate_with(seed, planted).expect("the run finishes");
+        let caught = |invariant: &str| {
+            outcome
+                .violations
+                .iter()
+                .any(|violation| violation.invariant == invariant)
+        };
+        let replay = outcome.violations.iter().any(|violation| {
+            violation.invariant == "model" && violation.detail.contains("no run the model started")
+        });
+        assert!(
+            replay || !caught("I1"),
+            "seed {seed}: I1 caught the defect and the replay did not"
+        );
+        if replay && !caught("I1") {
+            beyond_i1 = beyond_i1.saturating_add(1);
+        }
+    }
+    assert!(beyond_i1 > 0, "the replay catches no seed I1 misses");
+}
+
+/// Whether some violation of `outcome` is the replay's, saying `why`.
+fn replay_says(outcome: &run::Outcome, why: &str) -> bool {
+    outcome
+        .violations
+        .iter()
+        .any(|violation| violation.invariant == "model" && violation.detail.contains(why))
+}
+
+/// At most once inside one dispatch, as a mutation test: a shell that runs
+/// a tool twice and reports it once is caught by the replay at the second
+/// act on the world, though the shell's own `ToolRan` is passed only once.
+/// Only `Unsafe` tools act, so I3 (acts per call) catches each such run too.
+#[test]
+fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
+    let planted = Planted {
+        run_twice: true,
+        ..Planted::default()
+    };
+    let mut caught = 0usize;
+    for seed in 0..16u64 {
+        let outcome = run::simulate_with(seed, planted).expect("the run finishes");
+        if replay_says(&outcome, "acts on the world a second time") {
+            caught = caught.saturating_add(1);
+            assert!(
+                outcome
+                    .violations
+                    .iter()
+                    .any(|violation| violation.invariant == "I3"),
+                "seed {seed}: the replay caught a second act and I3 did not"
+            );
+        }
+    }
+    assert!(caught > 0, "no seed's replay caught a second run");
+}
+
+/// The model's `Execute` is the run acting on the world, not its return:
+/// seed 37's command starts (a mutation) and the daemon crashes before it
+/// returns, so the crash comes after the `Unsafe` run acted.
+#[test]
+fn a_crash_while_a_command_runs_is_after_it_acted() {
+    let outcome = run::simulate(37).expect("seed 37 runs");
+    let replayed = outcome.replayed.expect("seed 37 replays");
+    assert!(
+        replayed.keys.contains(&Key::Crashed {
+            class: Class::Unsafe,
+            ran: true,
+        }),
+        "seed 37 crashes after its command acted: {:?}",
+        replayed.keys
+    );
+}
+
+/// What the shell makes durable is what the core decided, as a mutation
+/// test: a shell that persists an `Unknown` result as `Interrupted` (U4,
+/// broken below the core) leaves the model where a group commit becomes
+/// durable holding other records than the model's.
+#[test]
+fn persisting_unknown_as_interrupted_fails_the_replay() {
+    let planted = Planted {
+        unknown_as_interrupted: true,
+        ..Planted::default()
+    };
+    let outcome = run::simulate_with(37, planted).expect("seed 37 runs");
+    assert!(
+        replay_says(&outcome, "the model made"),
+        "seed 37 (a command resolves Unknown) diverges at its commit: {:#?}",
+        outcome.violations
+    );
+}
+
+/// The model's properties are checked on every state a DST run passes
+/// through: replayed through a model whose shell reruns `Unsafe` calls
+/// after a crash, seed 37 (the daemon crashes while a command runs)
+/// breaks at-most-once, though the same run replays cleanly through the
+/// true model.
+#[test]
+fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
+    let outcome = run::simulate(37).expect("seed 37 runs");
+    assert!(
+        outcome.replayed.is_some(),
+        "seed 37 replays: {:#?}",
+        outcome.violations
+    );
+    let harness = Harness {
+        bug: Some(Bug::RerunUnsafe),
+        ..harness(hosts::limits().core, &outcome.observed)
+    };
+    let broken = match verified_model::replay(&harness, &outcome.observed) {
+        Err(Mismatch::Violated { property, .. }) => Some(property),
+        Ok(_) | Err(Mismatch::Diverged(_) | Mismatch::Unpinned { .. }) => None,
+    };
+    assert_eq!(
+        broken,
+        Some("an Unsafe call is dispatched at most once across crashes"),
+        "the rerun is caught as a broken property"
+    );
+}
+
+/// The replay is not vacuous: across the fixed seeds it takes every kind of
+/// step DST can make the model take.
+#[test]
+fn the_fixed_seeds_replay_every_kind_of_step() {
+    let mut taken = std::collections::BTreeSet::new();
+    for seed in FIXED {
+        let outcome = run::simulate(seed).expect("the run finishes");
+        assert!(
+            outcome.violations.is_empty(),
+            "seed {seed}: {:#?}",
+            outcome.violations
+        );
+        let replayed = outcome.replayed.expect("a run without violations replays");
+        assert!(
+            replayed.max_frontier <= 1,
+            "seed {seed}: the run pins the model's state"
+        );
+        taken.extend(replayed.actions.into_keys());
+    }
+    for kind in [
+        "Send",
+        "Answer",
+        "Interrupt",
+        "Execute",
+        "Parts",
+        "Finish",
+        "Fail",
+        "ToolDone",
+        "Sync",
+        "Crash",
+        "Read",
+        "Reconnect",
+    ] {
+        assert!(
+            taken.contains(kind),
+            "no fixed seed replays a {kind}: {taken:?}"
+        );
+    }
+}
+
+/// The directed scenario `name`.
+fn directed_scenario(name: &str) -> Directed {
+    directed::all()
+        .into_iter()
+        .find(|directed| directed.name == name)
+        .expect("a directed scenario of that name")
+}
+
+/// Runs `directed`'s scenario (compiled from its BFS witness) twice,
+/// judges it, and asserts that its replay reached the target.
+fn directed(name: &str) {
+    let directed = directed_scenario(name);
+    let scenario = directed::scenario(&directed)
+        .map_err(|error| error.to_string())
+        .expect("the witness compiles");
+    let outcome = run::twice_scenario(&scenario)
+        .map_err(|error| error.to_string())
+        .expect("the run finishes, deterministically");
+    assert!(
+        outcome.violations.is_empty(),
+        "{name} ({scenario:?}) broke invariants:\n{:#?}",
+        outcome.violations
+    );
+    let replayed = outcome.replayed.expect("a run without violations replays");
+    assert!(
+        replayed.keys.contains(&directed.target),
+        "{name} missed its target {}; it reached {:?}",
+        directed.target,
+        replayed.keys
+    );
+}
+
+macro_rules! directed {
+    ($($name:ident;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                directed(stringify!($name));
+            }
+        )*
+
+        /// Every directed scenario has its test above.
+        #[test]
+        fn every_directed_scenario_is_run() {
+            let tested = [$(stringify!($name)),*];
+            for directed in directed::all() {
+                assert!(tested.contains(&directed.name), "{} is never run", directed.name);
+            }
+        }
+    };
+}
+
+// Gaps no seed in 0..500 reaches (`just coverage 0 500`), each reached by
+// a scenario compiled from a BFS witness.
+directed! {
+    two_unsafe_runs_act_at_once;
+    a_call_past_the_step_bound;
+}
+
+/// The hold is the witness's essential ordering, not decoration: without
+/// it the same turn runs its two `Unsafe` calls one after the other.
+#[test]
+fn without_its_hold_a_directed_scenario_misses_its_target() {
+    let directed = directed_scenario("two_unsafe_runs_act_at_once");
+    let mut scenario = directed::scenario(&directed)
+        .map_err(|error| error.to_string())
+        .expect("the witness compiles");
+    assert!(!scenario.holds.is_empty(), "the witness compiles to a hold");
+    scenario.holds.clear();
+    let outcome = run::simulate_scenario(scenario, Planted::default()).expect("the run finishes");
+    let replayed = outcome.replayed.expect("the run replays");
+    assert!(
+        !replayed.keys.contains(&directed.target),
+        "the target is reached without the hold, so the hold proves nothing"
+    );
 }
 
 /// How many seeds the nightly sweep runs.

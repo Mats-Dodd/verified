@@ -54,6 +54,12 @@ pub fn epoch() -> UnixMillis {
     UnixMillis::new(1_760_000_000_000).expect("a 48-bit Unix time")
 }
 
+/// The daemon's limits (the model replays its runs under the same).
+#[must_use]
+pub fn limits() -> ServerLimits {
+    ServerLimits::v0()
+}
+
 /// A host's software, as turmoil runs it.
 pub type Software = Pin<Box<dyn Future<Output = turmoil::Result>>>;
 
@@ -104,7 +110,7 @@ pub fn daemon(ledger: Ledger, seed: u64, planted: Planted) -> impl Fn() -> Softw
             let boot = ledger.boots();
             let files = project_files().await?;
             ledger.record(Entry::Boot { boot, files });
-            let limits = ServerLimits::v0();
+            let limits = limits();
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let model = AnthropicModel::new(
                 net::Connector,

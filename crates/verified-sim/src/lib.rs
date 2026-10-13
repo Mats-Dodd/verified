@@ -6,15 +6,19 @@
 //! draws a [`scenario`]: what the user types and answers, crashes (at random
 //! times and aimed at barriers inside the daemon), partitions between the
 //! TUI and the daemon, and torn writes. After each run [`check`] judges the
-//! world (I1-I8), and [`run::twice`] runs each seed twice to prove the trace
-//! is deterministic.
+//! world (I1-I8), [`model`] replays the run through the Stateright model and
+//! checks its properties on every state, and [`run::twice`] runs each seed
+//! twice to prove the trace is deterministic.
 
 pub mod check;
+pub mod coverage;
+pub mod directed;
 pub mod driver;
 pub mod entropy;
 pub mod env;
 pub mod hosts;
 pub mod ledger;
+pub mod model;
 pub mod run;
 pub mod scenario;
 pub mod store;

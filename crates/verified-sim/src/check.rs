@@ -321,7 +321,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 next: *next,
                 chunks,
             }),
-            Entry::Fault(_) | Entry::User(_) => {}
+            Entry::Fault(_) | Entry::User(_) | Entry::Shell(_) => {}
         }
     }
     if caught == 0 {

@@ -1826,7 +1826,6 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "serde_json",
- "stateright",
  "verified-domain",
  "vstd",
 ]
@@ -1841,6 +1840,17 @@ dependencies = [
  "thiserror",
  "uuid",
  "vstd",
+]
+
+[[package]]
+name = "verified-model"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "stateright",
+ "verified-core",
+ "verified-domain",
+ "verified-server",
 ]
 
 [[package]]
@@ -1883,11 +1893,14 @@ dependencies = [
  "rand 0.9.5",
  "rand_chacha",
  "serde_json",
+ "stateright",
  "thiserror",
  "tokio",
  "tokio-util",
  "turmoil",
+ "verified-core",
  "verified-domain",
+ "verified-model",
  "verified-server",
  "verified-tui",
  "verified-wire",

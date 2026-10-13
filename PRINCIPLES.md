@@ -54,12 +54,21 @@ check.
 - **Proved** (Verus): holds for every input.
 - **Model-checked** (Stateright): holds in every interleaving within the
   model's bounds, against an abstract world.
+- **Trace-checked** (DST traces replayed through the model): every seed
+  run is a path of the Stateright model, and every model property holds on
+  each state the run passes through. It checks the shell's IO discipline
+  against the model's rules of the world (act only after a durable
+  dispatch, at most once; a crash keeps a prefix of a pending group; the
+  stream serves only durable records), not only the world's outcome. It is
+  only as strong as what the seeds reach: `just coverage` lists what BFS
+  reaches and no seed does.
 - **Simulated** (DST): holds on every seed run, with the real daemon and TUI
   against faked seams. This is evidence, not proof.
 - **Property-tested** (proptest): holds on sampled inputs.
 
 Invariants about the core should be proved or model-checked. Shell and view
-invariants may rest on simulation.
+invariants may rest on simulation, and should be trace-checked where the
+model states them.
 
 ## Upheld
 
@@ -67,17 +76,20 @@ Every entry passes all four parts of the admission rule.
 
 | # | Invariant | Strongest check | Planted bug |
 |---|---|---|---|
-| U1 | **Approval before dispatch.** A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Proved (`call_ok`, `licensed`, `decided`). Simulated (I1). | DST `running_tools_before_their_dispatch_is_durable_is_caught` |
+| U1 | **Approval before dispatch.** A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. Simulated (I1). | DST `running_tools_before_their_dispatch_is_durable_is_caught`; replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
 | U2 | **Policy approves only `Safe` calls.** An `Unsafe` call needs an approval command; it is never approved automatically. | Proved (`approver_fits`). Model-checked. | Stateright `approval_by_policy_of_an_edit_is_caught` |
-| U3 | **An `Unsafe` call is dispatched at most once, ever.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Simulated (I3). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught` |
-| U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught` |
+| U3 | **An `Unsafe` call is dispatched at most once, ever, and acts at most once.** This holds across crashes, so v never re-runs it on its own. | Proved (`resumed`). Model-checked. Simulated (I3). Trace-checked (a dispatched run acts at most once; I3, counting acts per call across crashes, catches every run this does). | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
+| U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_interrupted_fails_the_replay` |
 | U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). Model-checked. | Mutation recorded in the commit that added this file |
-| U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Model-checked. Simulated (I6). | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
+| U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Model-checked. Simulated (I6). The replay checks which offsets the client read and when; what it folded there is I6's. | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
 
 ## Held, not yet admitted
 
 A deterministic layer checks each of these today, but none has a committed
-planted bug. Until one exists, they are not promises.
+planted bug. Until one exists, they are not promises. Every DST run now
+also checks the model's properties among them ("each call has at most one
+result", "quiescent implies every call resolved"), but no planted shell bug
+has been seen to fail those checks, so none has moved up.
 
 | Property | Current check | Missing |
 |---|---|---|
@@ -171,7 +183,20 @@ These are assumed, not checked:
   proved.
 - **The simulation's fakes.** If a fake is kinder than the real seam it
   replaces, the simulation is optimistic. Fake fidelity is the weakest link
-  in the chain.
+  in the chain. `just coverage` names the fidelity gaps it sees, where the
+  model reaches what the fakes never do:
+  - **Orphans never act.** A crashed daemon's tool tasks die with the
+    turmoil host, but a real `bash` child outlives the daemon and may act
+    after the crash, even after its call resolved `Unknown`. U3 and U4 hold
+    there by model checking only; no run has seen it.
+  - **The fake model never loops.** It ends a turn after one round of
+    tools, so no run reaches the step limit; a real model may call tools
+    until it does.
+- **The model's world.** The replay checks a run against the model, so a
+  model wrong about the world would pass a wrong shell. Where the model is
+  more hostile than the world (late duplicate completions, replies from a
+  dead daemon's tasks), only the model checks are stronger; `just coverage`
+  lists these as over-approximations.
 - **The hardware and OS:** fsync tells the truth, the monotonic clock is
   monotonic, and signals are delivered on a best-effort basis.
 
@@ -188,6 +213,16 @@ described in `AGENTS.md` and the code.
   and reuses it on retry (the message candidate above).
 - Group commit with bounds identical at append and replay (the "survives
   and replays" property above).
+- Trace checking: the shell reports, under `sim` only, each input entering
+  the core and what it decided, and the barriers it passes; with the
+  simulation's ledger these are a run's observations, replayed through the
+  model after every DST run (U1, U3, U4).
+- Model coverage: each step of the model, BFS's and every replayed run's,
+  is keyed small (a call's class, how far it got and how it resolved; a
+  crash against a run's act; situations such as a torn group). `just
+  coverage A B` prints what BFS reaches and seeds `A..A+B` do not, each gap
+  classified, and the directed scenarios (a BFS witness compiled into a
+  scenario, its orderings kept as barrier holds) that close test gaps.
 
 ## Deciding new work
 

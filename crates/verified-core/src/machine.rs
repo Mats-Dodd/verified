@@ -33,7 +33,7 @@
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
 //!
-//! Model-checked, not proved (Stateright, `tests/model.rs`, and the scenario
+//! Model-checked, not proved (Stateright, `verified-model`, and the scenario
 //! tests in `tests/turns.rs`):
 //!
 //! - the core has no concurrency rules: every approved call is dispatched

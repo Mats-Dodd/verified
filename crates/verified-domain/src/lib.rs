@@ -21,7 +21,7 @@ pub use id::{
     StepId, ToolName, TurnId, UnixMillis,
 };
 pub use limits::{Limits, LimitsConfig, LimitsError, Millis};
-pub use payload::{Abstract, Codec, Measured, Payload, Unit};
+pub use payload::{Abstract, Codec, Measured, Payload, Unit, alpha};
 pub use record::{
     Approver, Cause, Exit, Failure, Fault, Limit, Proposal, Record, Request, Rerun, Reset, Tool,
     TurnOutcome,

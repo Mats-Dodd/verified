@@ -1,0 +1,143 @@
+//! Facts read back from a log, and the rules it broke.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use verified_domain::{
+    Abstract, Approver, CallId, CallIx, Cause, Exit, Fault, Limit, Limits, Record, Request, Rerun,
+    Tool, TurnId, TurnOutcome,
+};
+
+/// Facts read back from the log.
+#[derive(Debug, Default)]
+pub(crate) struct Audit {
+    /// Each approved call, and who approved it.
+    pub(crate) approved: BTreeMap<CallId, Approver>,
+    pub(crate) dispatched: BTreeSet<CallId>,
+    pub(crate) results: BTreeMap<CallId, u8>,
+    pub(crate) proposed: BTreeSet<CallId>,
+    pub(crate) turn_ends: BTreeMap<TurnId, u8>,
+    pub(crate) breaches: BTreeSet<Breach>,
+    /// Calls that failed by a limit.
+    pub(crate) limited: u8,
+    /// A turn was cancelled after its model call finished.
+    pub(crate) cancelled_after_finish: Option<TurnId>,
+}
+
+/// A rule the log broke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Breach {
+    DispatchBeforeApproval,
+    /// A turn the user stopped ended other than `Cancelled`.
+    CancelLost,
+    /// A call past `calls_per_step` or `calls_per_turn` was dispatched.
+    OverBoundDispatched,
+    /// Policy approved a call that only the user may approve.
+    PolicyApprovedMutation,
+    /// An `Unsafe` call dispatched before a crash was resolved after it
+    /// other than `Unknown`.
+    UnsafeKnownAfterCrash,
+}
+
+pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
+    let mut audit = Audit::default();
+    let mut names: Vec<CallId> = Vec::new();
+    let mut tools: Vec<Tool> = Vec::new();
+    let mut over: BTreeSet<usize> = BTreeSet::new();
+    // Unsafe calls dispatched and unresolved, and those of them a crash
+    // (an `EpochBumped`) came between dispatch and result for.
+    let mut unsafe_live: BTreeSet<usize> = BTreeSet::new();
+    let mut crossed: BTreeSet<usize> = BTreeSet::new();
+    let mut stopping: BTreeSet<TurnId> = BTreeSet::new();
+    for record in log {
+        match record {
+            Record::TurnStarted { .. } => {
+                names.clear();
+                tools.clear();
+                over.clear();
+                unsafe_live.clear();
+                crossed.clear();
+            }
+            Record::StepFinished { calls, step } => {
+                if stopping.contains(&step.turn) {
+                    audit.cancelled_after_finish = Some(step.turn);
+                }
+                let first = names.len();
+                for proposal in calls {
+                    let index = names.len();
+                    if index.saturating_sub(first) >= limits.calls_per_step()
+                        || index >= limits.calls_per_turn()
+                    {
+                        over.insert(index);
+                    }
+                    names.push(proposal.id.clone());
+                    tools.push(match &proposal.request {
+                        Request::Run { args } => *args,
+                        Request::Invalid { .. } => Tool::Read,
+                    });
+                    audit.proposed.insert(proposal.id.clone());
+                }
+            }
+            Record::CancelRequested { turn } => {
+                stopping.insert(*turn);
+            }
+            Record::Approved {
+                call: CallIx(index),
+                by,
+            } => {
+                if let Some(name) = names.get(*index) {
+                    audit.approved.insert(name.clone(), *by);
+                }
+                if *by == Approver::Policy
+                    && tools.get(*index).map(|tool| tool.rerun()) != Some(Rerun::Safe)
+                {
+                    audit.breaches.insert(Breach::PolicyApprovedMutation);
+                }
+            }
+            Record::Dispatched {
+                call: CallIx(index),
+            } => {
+                if let Some(name) = names.get(*index) {
+                    if !audit.approved.contains_key(name) {
+                        audit.breaches.insert(Breach::DispatchBeforeApproval);
+                    }
+                    audit.dispatched.insert(name.clone());
+                }
+                if over.contains(index) {
+                    audit.breaches.insert(Breach::OverBoundDispatched);
+                }
+                if tools.get(*index).map(|tool| tool.rerun()) == Some(Rerun::Unsafe) {
+                    unsafe_live.insert(*index);
+                }
+            }
+            Record::ToolResult {
+                call: CallIx(index),
+                exit,
+                ..
+            } => {
+                if let Some(name) = names.get(*index) {
+                    let count = audit.results.entry(name.clone()).or_default();
+                    *count = count.saturating_add(1);
+                }
+                if *exit == Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))) {
+                    audit.limited = audit.limited.saturating_add(1);
+                }
+                unsafe_live.remove(index);
+                if crossed.remove(index) && *exit != Exit::Err(Cause::Unknown) {
+                    audit.breaches.insert(Breach::UnsafeKnownAfterCrash);
+                }
+            }
+            Record::TurnEnded { turn, outcome } => {
+                let count = audit.turn_ends.entry(*turn).or_default();
+                *count = count.saturating_add(1);
+                if stopping.contains(turn) && *outcome != TurnOutcome::Cancelled {
+                    audit.breaches.insert(Breach::CancelLost);
+                }
+            }
+            Record::EpochBumped { .. } => {
+                crossed.extend(unsafe_live.iter().copied());
+            }
+            Record::StepStarted { .. } | Record::ModelOutput { .. } | Record::StepReset { .. } => {}
+        }
+    }
+    audit
+}

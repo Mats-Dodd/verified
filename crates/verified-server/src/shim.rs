@@ -514,14 +514,46 @@ pub enum Barrier {
     GroupWritten { bytes: usize },
 }
 
-/// Triggers `point` for a simulation's barriers.
+/// Triggers `point` for a simulation's barriers. Under `sim` it is first
+/// [`observe`]d, so a barrier that suspends here is still seen to be passed.
 pub async fn barrier(point: Barrier) {
     #[cfg(feature = "sim")]
     {
+        observe(Observation::Passed(point));
         turmoil::barriers::trigger(point).await;
     }
     #[cfg(not(feature = "sim"))]
     {
         let _: Barrier = point;
     }
+}
+
+/// What a simulation sees the shell do, beyond the log and the world.
+///
+/// Each input as it enters the core, with the records decided for it, and
+/// each [`Barrier`] passed. Only under `sim`: the shipped daemon neither
+/// builds nor clones any of it.
+#[cfg(feature = "sim")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Observation {
+    /// The shell resumed at boot and `resume` decided these records.
+    Resumed {
+        records: Vec<verified_domain::Record<crate::payload::Parsed>>,
+    },
+    /// `event` entered `decide`, which decided these records. The shell
+    /// handles one input at a time, so this is the event's place in the
+    /// core's order.
+    Decided {
+        event: verified_core::Event<crate::payload::Parsed>,
+        records: Vec<verified_domain::Record<crate::payload::Parsed>>,
+    },
+    /// A barrier was reached.
+    Passed(Barrier),
+}
+
+/// Reports `observation` to a simulation that watches for it
+/// (`turmoil::barriers`, observe-only: it never suspends the shell).
+#[cfg(feature = "sim")]
+pub fn observe(observation: Observation) {
+    turmoil::barriers::trigger_noop(observation);
 }

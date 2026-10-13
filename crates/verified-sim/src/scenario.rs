@@ -17,7 +17,7 @@ pub const FILES: [(&str, &str); 2] = [
 ];
 
 /// The words of `notes.txt` an `edit` may replace.
-const WORDS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+pub(crate) const WORDS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
 
 /// When the user presses Esc during a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,18 @@ pub struct AimedCrash {
     pub down: Duration,
 }
 
+/// A partial-order constraint on the daemon, kept with a barrier.
+///
+/// It orders a few points of the run and leaves the rest of its schedule
+/// to the seed. A directed scenario ([`crate::directed`]) states its target's
+/// essential ordering as holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// The first tool run to act waits, before it reports, until a second
+    /// has acted too: two runs act before either reports.
+    RanTogether,
+}
+
 /// Everything one simulated run does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scenario {
@@ -79,6 +91,8 @@ pub struct Scenario {
     /// Faults by the simulated time they strike, in order.
     pub faults: Vec<(Duration, Fault)>,
     pub aimed: Option<AimedCrash>,
+    /// Orderings the run must keep (a seed's scenario has none).
+    pub holds: Vec<Hold>,
     /// Torn-write granularity of the daemon's disk (`None`: atomic writes).
     pub block_size: Option<u64>,
     pub max_latency: Duration,
@@ -217,6 +231,7 @@ impl Scenario {
             turns,
             faults,
             aimed,
+            holds: Vec::new(),
             block_size,
             max_latency: Duration::from_millis(rng.random_range(1..=40)),
         }

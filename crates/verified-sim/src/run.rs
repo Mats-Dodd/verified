@@ -1,20 +1,23 @@
 //! One simulated run: build the world from a seed, inject its faults, let the
-//! scripted user finish, crash the daemon one last time, and judge the world.
+//! scripted user finish, crash the daemon one last time, judge the world and
+//! replay the run through the model.
 
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use turmoil::barriers::{Barrier as SimBarrier, Reaction};
+use turmoil::barriers::{Barrier as SimBarrier, Reaction, Triggered};
+use verified_model::{Observed, Replayed};
 use verified_server::shell::Planted;
-use verified_server::shim::Barrier;
+use verified_server::shim::{Barrier, Observation};
 
 use crate::check::{self, Violation};
 use crate::driver;
 use crate::hosts::{self, ANTHROPIC, DAEMON, TUI};
 use crate::ledger::{Entry, Ledger};
-use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
+use crate::model;
+use crate::scenario::{Aim, AimedCrash, Fault, Hold, Scenario};
 
 /// The most entries one run's ledger holds.
 const LEDGER_CAPACITY: usize = 100_000;
@@ -22,6 +25,10 @@ const LEDGER_CAPACITY: usize = 100_000;
 const RUN_LIMIT: Duration = Duration::from_mins(15);
 /// The most steps the daemon gets to recover after the final crash.
 const RECOVERY_STEPS: usize = 20_000;
+/// The longest a hold keeps a run waiting, in simulated time: a run whose
+/// ordering never comes is released (and its directed scenario then
+/// misses its target, which fails it), not stuck.
+const HOLD_LIMIT: Duration = Duration::from_secs(30);
 
 /// What a finished run produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +36,12 @@ pub struct Outcome {
     pub scenario: Scenario,
     /// The ledger as text, one line per entry: the determinism trace.
     pub trace: Vec<String>,
+    /// Every broken invariant, the model's replay (`model`) among them.
     pub violations: Vec<Violation>,
+    /// The run as the model replays it.
+    pub observed: Vec<Observed>,
+    /// What the replay walked through, if the run is a path of the model.
+    pub replayed: Option<Replayed>,
 }
 
 /// Why a run did not finish.
@@ -58,11 +70,21 @@ struct Aimed {
     passed: u32,
 }
 
+/// A hold while it keeps its ordering: the points it caught, waiting.
+struct Held {
+    hold: Hold,
+    barrier: SimBarrier<Barrier>,
+    waiting: Vec<Triggered<Barrier>>,
+    /// When the first point was caught.
+    since: Option<Duration>,
+}
+
 /// The faults of a run, applied as simulated time passes.
 struct Faults {
     due: VecDeque<(Duration, Fault)>,
     undo: Vec<(Duration, Undo)>,
     aimed: Option<Aimed>,
+    held: Vec<Held>,
     daemon_up: bool,
     /// Partitions of the TUI's link in force (they may overlap).
     partitioned: usize,
@@ -98,10 +120,23 @@ impl Faults {
             }),
             passed: 0,
         });
+        let held = scenario
+            .holds
+            .iter()
+            .map(|hold| Held {
+                hold: *hold,
+                barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
+                    Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
+                }),
+                waiting: Vec::new(),
+                since: None,
+            })
+            .collect();
         Self {
             due: scenario.faults.iter().copied().collect(),
             undo: Vec::new(),
             aimed,
+            held,
             daemon_up: true,
             partitioned: 0,
             model_partitioned: 0,
@@ -199,6 +234,41 @@ impl Faults {
             }
         }
         self.aim(sim, ledger);
+        self.hold(sim, ledger);
+    }
+
+    /// Keeps each hold's points waiting until its ordering is met (or
+    /// [`HOLD_LIMIT`] passes), then releases them all and forgets it.
+    fn hold(&mut self, sim: &turmoil::Sim<'_>, ledger: &Ledger) {
+        let now = sim.elapsed();
+        let mut index = 0;
+        while let Some(held) = self.held.get_mut(index) {
+            while let Some(hit) = poll_once(held.barrier.wait()).flatten() {
+                ledger.record_at(now, Entry::Fault(format!("held at {:?}", *hit)));
+                held.waiting.push(hit);
+                held.since.get_or_insert(now);
+            }
+            let met = match held.hold {
+                Hold::RanTogether => held.waiting.len() >= 2,
+            };
+            let expired = held
+                .since
+                .is_some_and(|since| now.saturating_sub(since) >= HOLD_LIMIT);
+            if met || expired {
+                ledger.record_at(
+                    now,
+                    Entry::Fault(format!(
+                        "{:?} {}: {} released",
+                        held.hold,
+                        if met { "kept" } else { "expired" },
+                        held.waiting.len()
+                    )),
+                );
+                self.held.remove(index);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
     }
 
     /// Releases each barrier hit until the aimed one, then crashes there.
@@ -232,6 +302,7 @@ impl Faults {
     /// Undoes everything still in force.
     fn heal(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger) {
         self.aimed = None;
+        self.held.clear();
         self.due.clear();
         for (_, undo) in core::mem::take(&mut self.undo) {
             self.undo(sim, ledger, undo);
@@ -267,6 +338,20 @@ fn crash_daemon(sim: &mut turmoil::Sim<'_>, partitioned: Links) {
     }
 }
 
+/// Records each [`Observation`] of the daemon's shell in `ledger`.
+///
+/// A barrier's condition runs inside the shell's trigger, on the daemon's
+/// task, so recording there puts the observation in the ledger's order
+/// exactly where it happened. It then declines it: an observation never
+/// wakes a barrier, and the shell never waits on one.
+fn observer(ledger: &Ledger) -> SimBarrier<Observation> {
+    let ledger = ledger.clone();
+    SimBarrier::new(move |observation: &Observation| {
+        ledger.record(Entry::Shell(observation.clone()));
+        false
+    })
+}
+
 fn failed(seed: u64, sim: &turmoil::Sim<'_>, ledger: &Ledger, reason: String) -> RunError {
     RunError {
         seed,
@@ -291,7 +376,16 @@ pub fn simulate(seed: u64) -> Result<Outcome, RunError> {
 /// # Errors
 /// As [`simulate`].
 pub fn simulate_with(seed: u64, planted: Planted) -> Result<Outcome, RunError> {
-    let scenario = Scenario::from_seed(seed);
+    simulate_scenario(Scenario::from_seed(seed), planted)
+}
+
+/// Runs `scenario` (its seed draws everything it leaves open), with
+/// defects `planted` in the daemon, and judges it.
+///
+/// # Errors
+/// As [`simulate`].
+pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome, RunError> {
+    let seed = scenario.seed;
     let ledger = Ledger::new(LEDGER_CAPACITY);
     let mut builder = turmoil::Builder::new();
     builder
@@ -304,6 +398,7 @@ pub fn simulate_with(seed: u64, planted: Planted) -> Result<Outcome, RunError> {
         builder.fs().block_size(block_size);
     }
     let mut sim = builder.build();
+    let _observer = observer(&ledger);
     sim.host(ANTHROPIC, hosts::anthropic());
     sim.host(DAEMON, hosts::daemon(ledger.clone(), seed, planted));
     sim.client(
@@ -345,11 +440,25 @@ pub fn simulate_with(seed: u64, planted: Planted) -> Result<Outcome, RunError> {
             .map_err(|error| failed(seed, &sim, &ledger, error.to_string()))?;
         steps = steps.saturating_add(1);
     }
-    let violations = check::world(&ledger.entries(), &scenario);
+    let entries = ledger.entries();
+    let mut violations = check::world(&entries, &scenario);
+    let observed = model::observed(&entries);
+    let replayed = match model::replay(&observed) {
+        Ok(replayed) => Some(replayed),
+        Err(mismatch) => {
+            violations.push(Violation {
+                invariant: "model",
+                detail: mismatch.to_string(),
+            });
+            None
+        }
+    };
     Ok(Outcome {
         scenario,
         trace: ledger.trace(),
         violations,
+        observed,
+        replayed,
     })
 }
 
@@ -359,8 +468,17 @@ pub fn simulate_with(seed: u64, planted: Planted) -> Result<Outcome, RunError> {
 /// Either run failed, or the traces differ (the `reason` names the first
 /// differing line).
 pub fn twice(seed: u64) -> Result<Outcome, RunError> {
-    let first = simulate(seed)?;
-    let second = simulate(seed)?;
+    twice_scenario(&Scenario::from_seed(seed))
+}
+
+/// Runs `scenario` twice and compares the traces.
+///
+/// # Errors
+/// As [`twice`].
+pub fn twice_scenario(scenario: &Scenario) -> Result<Outcome, RunError> {
+    let seed = scenario.seed;
+    let first = simulate_scenario(scenario.clone(), Planted::default())?;
+    let second = simulate_scenario(scenario.clone(), Planted::default())?;
     if first.trace != second.trace {
         let at = first
             .trace

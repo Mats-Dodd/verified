@@ -45,6 +45,12 @@ sim:
 sweep from="0" count="1000":
     cargo run --quiet --profile sim-release -p verified-sim -- sweep --from {{from}} --count {{count}}
 
+# Model coverage: the coverage keys the seeds reach (each run replayed
+# through the model) against those BFS reaches under the model checks'
+# bounds, and each gap classified (over-approximation, fidelity, test).
+coverage from="0" count="200":
+    cargo run --quiet --profile sim-release -p verified-sim -- coverage --from {{from}} --count {{count}}
+
 # Each seed traced in two fresh processes.
 processes from="0" count="100":
     cargo run --quiet --profile sim-release -p verified-sim -- processes --from {{from}} --count {{count}}

@@ -101,6 +101,15 @@ pub struct Planted {
     /// persist before acting). The world check I1 must catch it.
     #[cfg(feature = "sim")]
     pub run_before_persist: bool,
+    /// Run each tool twice, reporting once (breaks at-most-once inside one
+    /// dispatch). The model's replay must catch the second act.
+    #[cfg(feature = "sim")]
+    pub run_twice: bool,
+    /// Persist an `Unknown` result as `Interrupted` (breaks U4 in the shell,
+    /// below the core). The replay must catch the durable records differing
+    /// from the decided ones.
+    #[cfg(feature = "sim")]
+    pub unknown_as_interrupted: bool,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -455,6 +464,10 @@ impl Session {
 
     async fn run(mut self, mut receiver: mpsc::Receiver<Input>) -> Result<(), ShellError> {
         let resumed = self.core.resume();
+        #[cfg(feature = "sim")]
+        crate::shim::observe(crate::shim::Observation::Resumed {
+            records: resumed.records.clone(),
+        });
         if let Persisted::Done(_, effects) = self.persist(resumed).await? {
             self.start_effects(effects).await;
         }
@@ -480,6 +493,12 @@ impl Session {
             effects,
             outcome,
         } = decision;
+        #[cfg(feature = "sim")]
+        let records = if self.config.planted.unknown_as_interrupted {
+            unknown_as_interrupted(records)
+        } else {
+            records
+        };
         #[cfg(feature = "sim")]
         let effects = if self.config.planted.run_before_persist {
             self.run_before_persist(effects).await
@@ -538,7 +557,14 @@ impl Session {
     }
 
     async fn decide(&mut self, event: Event<Parsed>) -> Result<Persisted, ShellError> {
+        #[cfg(feature = "sim")]
+        let observed = event.clone();
         let decision = self.core.decide(event);
+        #[cfg(feature = "sim")]
+        crate::shim::observe(crate::shim::Observation::Decided {
+            event: observed,
+            records: decision.records.clone(),
+        });
         self.persist(decision).await
     }
 
@@ -873,6 +899,20 @@ impl Session {
     }
 }
 
+/// The planted defect: `records` with every `Unknown` result made
+/// `Interrupted`, as if the shell knew the call never ran.
+#[cfg(feature = "sim")]
+fn unknown_as_interrupted(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
+    for record in &mut records {
+        if let Record::ToolResult { exit, .. } = record
+            && *exit == Exit::Err(Cause::Unknown)
+        {
+            *exit = Exit::Err(Cause::Interrupted);
+        }
+    }
+    records
+}
+
 /// Sends a completion to the shell. A gone shell means the daemon is
 /// stopping; the completion is moot.
 async fn report(inbox: &mpsc::Sender<Input>, event: Event<Parsed>) {
@@ -888,6 +928,10 @@ async fn run_tool(
     cancel: CancellationToken,
     config: Arc<ShellConfig>,
 ) {
+    #[cfg(feature = "sim")]
+    if config.planted.run_twice {
+        let (_, _) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
+    }
     let (exit, output) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
     barrier(Barrier::ToolRan {
         epoch: id.epoch.0,

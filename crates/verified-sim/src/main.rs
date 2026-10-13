@@ -5,6 +5,8 @@
 //! verified-sim replay --seed 42 --trace      # one seed, with its full trace
 //! verified-sim trace --seed 42               # one run of one seed, its trace only
 //! verified-sim processes --from 0 --count 8  # each seed in two fresh processes
+//! verified-sim coverage --from 0 --count 200 # model coverage: the gap table
+//! verified-sim directed --name NAME --trace  # one directed scenario, twice
 //! ```
 //!
 //! `processes` catches what running a seed twice in one process cannot:
@@ -15,6 +17,7 @@ use std::io::{self, Write as _};
 
 use clap::{Parser, Subcommand};
 use verified_sim::run::{self, Outcome, RunError};
+use verified_sim::{coverage, directed};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Deterministic simulation of verified")]
@@ -47,6 +50,23 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         count: u64,
     },
+    /// Prints the coverage keys BFS reaches under the model checks' bounds
+    /// against those the seeds reach, and each gap classified.
+    Coverage {
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = 200)]
+        count: u64,
+    },
+    /// Compiles one directed scenario from its BFS witness, runs it twice
+    /// and reports it, with the coverage keys its replay reached.
+    Directed {
+        #[arg(long)]
+        name: String,
+        /// Prints the whole trace.
+        #[arg(long)]
+        trace: bool,
+    },
     /// Runs one seed once and prints its trace (diff two of these to find
     /// nondeterminism).
     Trace {
@@ -68,6 +88,14 @@ enum Failure {
     Io(#[from] io::Error),
     #[error("tracing seed {seed} in a fresh process failed")]
     Child { seed: u64 },
+    #[error(transparent)]
+    Coverage(#[from] coverage::CoverageError),
+    #[error(transparent)]
+    Compile(#[from] directed::CompileError),
+    #[error("no directed scenario is named {0}")]
+    NoDirected(String),
+    #[error("directed scenario {0} missed its target")]
+    Missed(String),
     #[error("seed {seed} traced differently in two processes, from line {line}")]
     Diverged { seed: u64, line: usize },
 }
@@ -96,6 +124,13 @@ fn report(out: &mut impl io::Write, outcome: &Outcome) -> Result<(), Failure> {
         outcome.trace.len(),
         outcome.violations.len()
     )?;
+    if let Some(replayed) = &outcome.replayed {
+        writeln!(
+            out,
+            "  replayed {} observations through the model (frontier at most {}): {:?}",
+            replayed.observations, replayed.max_frontier, replayed.actions
+        )?;
+    }
     for violation in &outcome.violations {
         writeln!(out, "  {violation}")?;
     }
@@ -153,6 +188,42 @@ fn main() -> Result<(), Failure> {
                 writeln!(out, "seed {seed}: the same in two processes")?;
             }
             Ok(())
+        }
+        Command::Coverage { from, count } => {
+            let simulated = coverage::simulated(from, count)?;
+            let modelled = coverage::modelled();
+            coverage::table(&mut out, (from, count), &modelled, &simulated)?;
+            Ok(())
+        }
+        Command::Directed { name, trace } => {
+            let Some(chosen) = directed::all()
+                .into_iter()
+                .find(|chosen| chosen.name == name)
+            else {
+                return Err(Failure::NoDirected(name));
+            };
+            let witness = directed::witness(&chosen)?;
+            writeln!(out, "target: {}\nwitness: {witness:?}", chosen.target)?;
+            let scenario = directed::compile(&chosen.harness, &witness, chosen.seed)?;
+            let outcome = run::twice_scenario(&scenario)?;
+            writeln!(out, "{:#?}", outcome.scenario)?;
+            if trace {
+                for line in &outcome.trace {
+                    writeln!(out, "{line}")?;
+                }
+            }
+            let reached = outcome.replayed.as_ref().map(|replayed| &replayed.keys);
+            if let Some(keys) = reached {
+                for key in keys {
+                    writeln!(out, "  reached {key}")?;
+                }
+            }
+            report(&mut out, &outcome)?;
+            if reached.is_some_and(|keys| keys.contains(&chosen.target)) {
+                Ok(())
+            } else {
+                Err(Failure::Missed(name))
+            }
         }
         Command::Trace { seed, runs } => {
             for run in 0..runs {

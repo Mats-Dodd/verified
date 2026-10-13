@@ -12,6 +12,7 @@ default-members = [
     "crates/verified-cli",
     "crates/verified-core",
     "crates/verified-domain",
+    "crates/verified-model",
     "crates/verified-server",
     "crates/verified-tui",
     "crates/verified-wire",
@@ -27,6 +28,7 @@ repository = "https://github.com/Mats-Dodd/verified"
 # Workspace crates.
 verified-domain = { path = "crates/verified-domain", version = "0.1.0" }
 verified-core = { path = "crates/verified-core", version = "0.1.0" }
+verified-model = { path = "crates/verified-model", version = "0.1.0" }
 verified-wire = { path = "crates/verified-wire", version = "0.1.0" }
 verified-server = { path = "crates/verified-server", version = "0.1.0" }
 verified-tui = { path = "crates/verified-tui", version = "0.1.0" }

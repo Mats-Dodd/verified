@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use verified_domain::{EffectId, Record};
 use verified_server::payload::Parsed;
+use verified_server::shim::Observation;
 use verified_wire::chunk::UiChunk;
 
 /// What a fake tool did to the world.
@@ -62,6 +63,10 @@ pub enum Entry {
         next: u64,
         chunks: Vec<UiChunk>,
     },
+    /// The daemon's shell, seen through its sim-only hook: an input
+    /// entering the core, the boot's resume, or a barrier reached. Recorded
+    /// on the daemon's task as it happens.
+    Shell(Observation),
     /// The TUI was quiescent: caught up, settled, no turn running. Its folded
     /// transcript then, and the offset just past what it had folded.
     Caught {
@@ -191,6 +196,7 @@ impl Ledger {
                 | Entry::Fault(_)
                 | Entry::User(_)
                 | Entry::Read { .. }
+                | Entry::Shell(_)
                 | Entry::Caught { .. } => {}
             }
         }
