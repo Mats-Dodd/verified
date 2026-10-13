@@ -417,11 +417,10 @@ fn live(app: &App, handle: SessionHandle, from: ReadFrom, echoed: Option<Cursor>
     )
 }
 
-/// Feeds one live response: each read as a `data` event (when it has
-/// chunks) and a `control` event, then waits for the next commit. Ends when
-/// the client goes away (noticed at the next send: a commit or a
-/// keep-alive), the session stops, or the lifetime runs out; its follower
-/// `slots` are released then.
+/// Feeds one live response for at most its lifetime, then ends it. Its
+/// follower `slots` are released then, or earlier when the client goes away
+/// (noticed at the next send: a commit or a keep-alive) or the session
+/// stops.
 async fn follow(
     handle: SessionHandle,
     from: ReadFrom,
@@ -432,9 +431,25 @@ async fn follow(
     slots: Slots,
 ) {
     let _slots = slots;
+    tokio::select! {
+        biased;
+        () = clock.sleep(limits.sse_lifetime) => {}
+        () = feed(&handle, from, cursor, &sender, clock.as_ref(), &limits) => {}
+    }
+}
+
+/// Each read as a `data` event (when it has chunks) and a `control` event,
+/// then waits for the next commit, with keep-alives while idle.
+async fn feed(
+    handle: &SessionHandle,
+    from: ReadFrom,
+    cursor: Cursor,
+    sender: &mpsc::Sender<Bytes>,
+    clock: &dyn Clock,
+    limits: &ServerLimits,
+) {
     let tail = handle.tail();
     let mut position = from;
-    let mut lifetime = clock.sleep(limits.sse_lifetime);
     loop {
         let Ok(read) = handle.read(position).await else {
             return;
@@ -473,7 +488,6 @@ async fn follow(
                         return;
                     }
                 }
-                () = &mut lifetime => return,
             }
         }
     }
@@ -489,5 +503,97 @@ impl futures_core::Stream for Chunks {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx).map(|chunk| chunk.map(Ok))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{Semaphore, mpsc};
+    use verified_domain::Millis;
+    use verified_domain::id::{SessionId, UnixMillis};
+    use verified_wire::stream::{Cursor, Jitter, Offset, ReadFrom};
+
+    use super::{Slots, follow};
+    use crate::daemon;
+    use crate::env::LocalEnv;
+    use crate::limits::ServerLimits;
+    use crate::log::{MemDisk, MemLogStore};
+    use crate::model::fake::FakeModel;
+    use crate::seam::{Clock, OsEntropy, SystemClock, World};
+    use crate::shell::{Planted, Seams, ShellConfig};
+
+    #[tokio::test]
+    async fn a_follower_ends_within_its_lifetime_though_the_client_stops_reading() {
+        let limits = ServerLimits {
+            sse_lifetime: Millis::new(100),
+            sse_keep_alive: Millis::new(10),
+            ..ServerLimits::v0()
+        };
+        let world = World::new();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let seams = Seams {
+            model: Arc::new(FakeModel::new(
+                Arc::clone(&clock),
+                limits.model_parts_per_call,
+            )),
+            env: Arc::new(LocalEnv::new(
+                PathBuf::from("."),
+                Arc::clone(&clock),
+                world.groups().clone(),
+            )),
+            clock: Arc::clone(&clock),
+            entropy: Arc::new(OsEntropy),
+            world: world.clone(),
+        };
+        let config = Arc::new(ShellConfig {
+            limits: limits.clone(),
+            model: "fake".to_owned(),
+            system: "You are a test.".to_owned(),
+            planted: Planted::default(),
+        });
+        let store = Arc::new(MemLogStore::new(
+            MemDisk::new(),
+            limits.log_line_bytes,
+            limits.log_file_bytes,
+        ));
+        let (fatal, _failed) = mpsc::channel(1);
+        let registry = daemon::boot(store, seams, config, fatal)
+            .await
+            .expect("the daemon boots");
+        let session = SessionId::from_parts(
+            UnixMillis::new(1_700_000_000_000).expect("a time"),
+            &[7; 10],
+        );
+        let (_, handle) = registry.create(session).await.expect("created");
+        // The first read fills the queue, and nobody reads it: the next
+        // keep-alive's send waits forever.
+        let (sender, _unread) = mpsc::channel(1);
+        let slots = Arc::new(Semaphore::new(2));
+        let follower = follow(
+            handle,
+            ReadFrom::Offset(Offset::BEGINNING),
+            Cursor::next(clock.now(), None, Jitter::from_entropy(0)),
+            sender,
+            Arc::clone(&clock),
+            Arc::new(limits),
+            Slots {
+                _session: Arc::clone(&slots).try_acquire_owned().expect("a slot"),
+                _daemon: Arc::clone(&slots).try_acquire_owned().expect("a slot"),
+            },
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own deadline on waiting, not a timeout inside the code under test"
+        )]
+        let ended = tokio::time::timeout(Duration::from_secs(2), follower).await;
+        assert!(
+            ended.is_ok(),
+            "the follower outlived its 100 ms lifetime by 2 s"
+        );
+        world.shutdown().cancel();
     }
 }
