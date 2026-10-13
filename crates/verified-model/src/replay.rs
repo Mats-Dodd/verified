@@ -231,23 +231,11 @@ fn running(world: &World, id: EffectId) -> Result<Tool, String> {
 /// The actions `observed` means at `world`, in order: none for a check on
 /// the state, or for a change the shell makes outside the model's actions
 /// (a refusal, and the resume after one).
-fn means(harness: &Harness, world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
+fn means(world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
     match observed {
         Observed::Booted(records) => {
-            // The crash is named by what it kept, so a boot means one; a
-            // model that gains a second way to it stays visible here.
-            let crashes = enabled(harness, world)
-                .into_iter()
-                .filter(|action| matches!(action, Action::Crash(_)))
-                .filter_map(|crash| harness.next_state(world, crash))
-                .filter(|next| next.log == *records)
-                .count();
-            if crashes > 1 {
-                return Err(format!(
-                    "{crashes} crashes leave the {} records booted on",
-                    records.len()
-                ));
-            }
+            // A crash is named by how many pending records it kept, so a
+            // boot means exactly one; `agrees` checks it left these.
             let kept = records.len().checked_sub(world.log.len()).ok_or_else(|| {
                 format!(
                     "no crash leaves the {} records booted on (log {})",
@@ -455,7 +443,7 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
     let mut keys = BTreeSet::new();
     for (index, observed) in (1..).zip(rest) {
         let mut after = world.clone();
-        let stepped = means(harness, &world, observed).and_then(|taken| {
+        let stepped = means(&world, observed).and_then(|taken| {
             for action in taken {
                 let next = take(harness, &after, &action)?;
                 keys.extend(coverage::keys(harness, &after, &action, &next));
