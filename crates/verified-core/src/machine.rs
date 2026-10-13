@@ -1189,6 +1189,43 @@ impl<P: Payload> Core<P> {
         Err(Corrupt { seq: self.seq, violation })
     }
 
+    /// The running turn, for a record that needs one.
+    const fn open(&self) -> (open: Result<Open, Corrupt>)
+        ensures
+            match open {
+                Ok(open) => self@.turn == Turn::Open(open),
+                Err(_) => self@.turn is Idle,
+            },
+    {
+        match self.turn {
+            Turn::Open(open) => Ok(open),
+            Turn::Idle => Err(Corrupt { seq: self.seq, violation: Violation::NoTurn }),
+        }
+    }
+
+    /// The index of `call`, for a record that names a call of the current
+    /// step.
+    const fn current_call(&self, open: Open, call: CallIx) -> (index: Result<usize, Corrupt>)
+        requires
+            self.wf(),
+        ensures
+            match index {
+                Ok(index) => {
+                    &&& index == call.0
+                    &&& open.first_call <= index < self@.calls.len()
+                    &&& mirrors(self.calls@[index as int], self.ledger@[index as int])
+                },
+                Err(_) => !(open.first_call <= call.0 < self@.calls.len()),
+            },
+    {
+        let index = call.0;
+        if index < open.first_call || index >= self.calls.len() {
+            return Err(Corrupt { seq: self.seq, violation: Violation::UnknownCall });
+        }
+        assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+        Ok(index)
+    }
+
     /// Whether every call from `from` on is resolved.
     fn all_resolved(&self, from: usize) -> (all: bool)
         requires
@@ -1259,10 +1296,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::StepStarted { step } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !step.turn.same(open.turn) {
                     return self.refuse(Violation::WrongTurn);
                 }
@@ -1301,10 +1335,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::ModelOutput { step, parts } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Model { .. })) {
                     return self.refuse(Violation::WrongStage);
                 }
@@ -1316,10 +1347,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::StepReset { step, reason } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Model { .. })) {
                     return self.refuse(Violation::WrongStage);
                 }
@@ -1346,10 +1374,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::StepFinished { step, calls } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Model { .. })) {
                     return self.refuse(Violation::WrongStage);
                 }
@@ -1403,21 +1428,14 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::Approved { call, by } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Tools)) {
                     return self.refuse(Violation::WrongStage);
                 }
                 if matches!(open.intent, Intent::Cancel) {
                     return self.refuse(Violation::Cancelling);
                 }
-                let index = call.0;
-                if index < open.first_call || index >= self.calls.len() {
-                    return self.refuse(Violation::UnknownCall);
-                }
-                assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+                let index = self.current_call(open, *call)?;
                 if !(matches!(self.calls[index].phase, Phase::Proposed)) {
                     return self.refuse(Violation::WrongPhase);
                 }
@@ -1444,21 +1462,14 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::Dispatched { call } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Tools)) {
                     return self.refuse(Violation::WrongStage);
                 }
                 if matches!(open.intent, Intent::Cancel) {
                     return self.refuse(Violation::Cancelling);
                 }
-                let index = call.0;
-                if index < open.first_call || index >= self.calls.len() {
-                    return self.refuse(Violation::UnknownCall);
-                }
-                assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+                let index = self.current_call(open, *call)?;
                 if !(matches!(self.calls[index].phase, Phase::Approved)) {
                     return self.refuse(Violation::WrongPhase);
                 }
@@ -1479,18 +1490,11 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::ToolResult { call, exit: _, output } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !(matches!(open.stage, Stage::Tools)) {
                     return self.refuse(Violation::WrongStage);
                 }
-                let index = call.0;
-                if index < open.first_call || index >= self.calls.len() {
-                    return self.refuse(Violation::UnknownCall);
-                }
-                assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+                let index = self.current_call(open, *call)?;
                 if matches!(self.calls[index].phase, Phase::Resolved) {
                     return self.refuse(Violation::WrongPhase);
                 }
@@ -1508,10 +1512,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::CancelRequested { turn } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !turn.same(open.turn) {
                     return self.refuse(Violation::WrongTurn);
                 }
@@ -1523,10 +1524,7 @@ impl<P: Payload> Core<P> {
                 Ok(())
             },
             Record::TurnEnded { turn, outcome } => {
-                let open = match self.turn {
-                    Turn::Open(open) => open,
-                    Turn::Idle => return self.refuse(Violation::NoTurn),
-                };
+                let open = self.open()?;
                 if !turn.same(open.turn) {
                     return self.refuse(Violation::WrongTurn);
                 }
