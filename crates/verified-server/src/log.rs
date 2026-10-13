@@ -210,19 +210,9 @@ fn frame(line: &[u8]) -> Option<Frame<'_>> {
 pub struct Scan {
     /// The records, in seq order from 0.
     pub records: Vec<Record<Parsed>>,
-    /// Bytes holding exactly those records.
+    /// Bytes holding exactly those records: any after them are an
+    /// unacknowledged group commit cut short.
     pub valid_len: u64,
-    pub tail: Tail,
-}
-
-/// What follows the valid records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tail {
-    Clean,
-    /// An unacknowledged group commit was cut short; `bytes` are dropped.
-    Torn {
-        bytes: u64,
-    },
 }
 
 /// Why bytes are not a log, with the position of the problem.
@@ -230,6 +220,17 @@ pub enum Tail {
 pub enum ScanError {
     Corrupt { offset: u64, seq: u64 },
     Unparseable { seq: u64, reason: String },
+}
+
+impl ScanError {
+    /// This error, in the log at `path`.
+    #[must_use]
+    pub fn at(self, path: String) -> LogError {
+        match self {
+            Self::Corrupt { offset, seq } => LogError::Corrupt { path, offset, seq },
+            Self::Unparseable { seq, reason } => LogError::Unparseable { path, seq, reason },
+        }
+    }
 }
 
 fn to_u64(value: usize) -> u64 {
@@ -282,7 +283,6 @@ pub fn scan(bytes: &[u8], max_line: usize) -> Result<Scan, ScanError> {
     Ok(Scan {
         records,
         valid_len: to_u64(offset),
-        tail: Tail::Clean,
     })
 }
 
@@ -308,9 +308,6 @@ fn torn_or_corrupt(
     Ok(Scan {
         records,
         valid_len: to_u64(offset),
-        tail: Tail::Torn {
-            bytes: to_u64(rest.len()),
-        },
     })
 }
 
@@ -422,13 +419,13 @@ impl FileLog {
         max_line: usize,
         max_file: u64,
     ) -> Result<(Self, Vec<Record<Parsed>>), LogError> {
-        let scan = read_scan(path, max_line, max_file).await?;
+        let bytes = read(path, max_file).await?;
+        let scan = scan(&bytes, max_line).map_err(|error| error.at(path.display().to_string()))?;
         let file = fs::open_append(path).await.map_err(io_error(path))?;
-        match scan.tail {
-            Tail::Clean => {}
-            Tail::Torn { .. } => fs::truncate(&file, scan.valid_len)
+        if scan.valid_len < to_u64(bytes.len()) {
+            fs::truncate(&file, scan.valid_len)
                 .await
-                .map_err(io_error(path))?,
+                .map_err(io_error(path))?;
         }
         let log = Self {
             path: path.to_owned(),
@@ -442,30 +439,18 @@ impl FileLog {
     }
 }
 
-async fn read_scan(path: &Path, max_line: usize, max_file: u64) -> Result<Scan, LogError> {
-    let shown = || path.display().to_string();
+/// The log's bytes, refused when the file is longer than recovery reads.
+async fn read(path: &Path, max_file: u64) -> Result<Vec<u8>, LogError> {
     if let Some((_, length)) = fs::stat(path).await.map_err(io_error(path))?
         && length > max_file
     {
         return Err(LogError::TooLarge {
-            path: shown(),
+            path: path.display().to_string(),
             length,
             limit: max_file,
         });
     }
-    let bytes = fs::read(path).await.map_err(io_error(path))?;
-    scan(&bytes, max_line).map_err(|error| match error {
-        ScanError::Corrupt { offset, seq } => LogError::Corrupt {
-            path: shown(),
-            offset,
-            seq,
-        },
-        ScanError::Unparseable { seq, reason } => LogError::Unparseable {
-            path: shown(),
-            seq,
-            reason,
-        },
-    })
+    fs::read(path).await.map_err(io_error(path))
 }
 
 #[async_trait]
@@ -492,7 +477,9 @@ impl Log for FileLog {
     }
 
     async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError> {
-        let scan = read_scan(&self.path, self.max_line, self.max_file).await?;
+        let bytes = read(&self.path, self.max_file).await?;
+        let scan = scan(&bytes, self.max_line)
+            .map_err(|error| error.at(self.path.display().to_string()))?;
         Ok(scan
             .records
             .into_iter()
@@ -596,21 +583,14 @@ impl Log for MemLog {
 
     async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError> {
         let bytes = self.disk.bytes(self.session).unwrap_or_default();
-        let scan = mem_scan(self.session, &bytes, self.max_line)?;
+        let scan = scan(&bytes, self.max_line)
+            .map_err(|error| error.at(format!("mem:{}", self.session)))?;
         Ok(scan
             .records
             .into_iter()
             .skip(usize::try_from(seq).unwrap_or(usize::MAX))
             .collect())
     }
-}
-
-fn mem_scan(session: SessionId, bytes: &[u8], max_line: usize) -> Result<Scan, LogError> {
-    let path = format!("mem:{session}");
-    scan(bytes, max_line).map_err(|error| match error {
-        ScanError::Corrupt { offset, seq } => LogError::Corrupt { path, offset, seq },
-        ScanError::Unparseable { seq, reason } => LogError::Unparseable { path, seq, reason },
-    })
 }
 
 /// Where sessions' logs live.
@@ -740,7 +720,8 @@ impl LogStore for MemLogStore {
         session: SessionId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
         let bytes = self.disk.bytes(session).unwrap_or_default();
-        let scan = mem_scan(session, &bytes, self.max_line)?;
+        let scan =
+            scan(&bytes, self.max_line).map_err(|error| error.at(format!("mem:{session}")))?;
         let kept = bytes
             .get(..usize::try_from(scan.valid_len).unwrap_or(usize::MAX))
             .unwrap_or_default()
@@ -769,7 +750,8 @@ mod tests {
     use verified_domain::{Epoch, Record};
 
     use super::{
-        LogError, LogStore as _, MemDisk, MemLogStore, ScanError, Tail, crc32c, encode_frame, scan,
+        LogError, LogStore as _, MemDisk, MemLogStore, ScanError, crc32c, encode_frame, scan,
+        to_u64,
     };
     use crate::payload::{Parsed, measure};
 
@@ -850,7 +832,7 @@ mod tests {
         }
         let bytes = disk.bytes(session()).unwrap_or_default();
         let replayed = scan(&bytes, max_line).expect("the log replays");
-        assert_eq!(replayed.tail, Tail::Clean, "nothing torn");
+        assert_eq!(replayed.valid_len, to_u64(bytes.len()), "nothing torn");
         assert!(
             u64::try_from(bytes.len()).expect("small") <= max_file,
             "the file stays within its bound"
@@ -917,7 +899,7 @@ mod tests {
         let bytes = framed(&records, &[2, 3]);
         let scanned = scan(&bytes, MAX_LINE).expect("replays");
         assert_eq!(scanned.records, records, "every record");
-        assert_eq!(scanned.tail, Tail::Clean, "nothing torn");
+        assert_eq!(scanned.valid_len, to_u64(bytes.len()), "nothing torn");
     }
 
     #[test]
@@ -963,7 +945,7 @@ mod tests {
                     Err(ScanError::Unparseable { seq: 1, .. })
                 ),
                 "{groups:?}: {:?}",
-                scan(&bytes, 1_000).map(|scanned| scanned.tail)
+                scan(&bytes, 1_000).map(|scanned| scanned.valid_len)
             );
         }
     }
@@ -997,7 +979,7 @@ mod tests {
             prop_assert_eq!(&scanned.records[..], &records[..scanned.records.len()]);
             prop_assert!(scanned.records.len() < count, "the cut group is not whole");
             let valid = usize::try_from(scanned.valid_len).expect("small");
-            prop_assert_eq!(scan(&bytes[..valid], MAX_LINE).map(|clean| clean.tail), Ok(Tail::Clean));
+            prop_assert_eq!(scan(&bytes[..valid], MAX_LINE).map(|clean| clean.valid_len), Ok(scanned.valid_len));
         }
 
         /// Damage to any acknowledged group, followed by a later group, is
