@@ -16,7 +16,7 @@ use verified_model::replay::harness;
 use verified_model::{Bug, Harness, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
 use verified_server::shell::Planted;
-use verified_sim::directed::{self, Directed};
+use verified_sim::directed::{self, Directed, DirectedError};
 use verified_sim::scenario::{Fault, Scenario};
 use verified_sim::{hosts, run};
 
@@ -410,79 +410,36 @@ fn a_full_log_ends_the_running_turn_and_replays() {
     }
 }
 
-/// The directed scenario `name`.
-fn directed_scenario(name: &str) -> Directed {
-    directed::all()
-        .into_iter()
-        .find(|directed| directed.name == name)
-        .expect("a directed scenario of that name")
+/// Each directed scenario reaches its target, deterministically and
+/// without breaking an invariant: the gaps no seed in 0..500 reaches
+/// (`just coverage 0 500`).
+#[test]
+fn directed_scenarios_reach_their_targets() {
+    for directed in directed::all() {
+        directed::run(&directed)
+            .map_err(|error| error.to_string())
+            .expect("the directed scenario reaches its target");
+    }
 }
 
-/// Runs `directed`'s scenario (compiled from its BFS witness) twice,
-/// judges it, and asserts that its replay reached the target.
-fn directed(name: &str) {
-    let directed = directed_scenario(name);
-    let scenario = directed::scenario(&directed)
-        .map_err(|error| error.to_string())
-        .expect("the witness compiles");
-    let outcome = run::twice_scenario(&scenario)
-        .map_err(|error| error.to_string())
-        .expect("the run finishes, deterministically");
-    assert!(
-        outcome.violations.is_empty(),
-        "{name} ({scenario:?}) broke invariants:\n{:#?}",
-        outcome.violations
-    );
-    let replayed = outcome.replayed.expect("a run without violations replays");
-    assert!(
-        replayed.keys.contains(&directed.target),
-        "{name} missed its target {}; it reached {:?}",
-        directed.target,
-        replayed.keys
-    );
-}
-
-macro_rules! directed {
-    ($($name:ident;)*) => {
-        $(
-            #[test]
-            fn $name() {
-                directed(stringify!($name));
-            }
-        )*
-
-        /// Every directed scenario has its test above.
-        #[test]
-        fn every_directed_scenario_is_run() {
-            let tested = [$(stringify!($name)),*];
-            for directed in directed::all() {
-                assert!(tested.contains(&directed.name), "{} is never run", directed.name);
-            }
-        }
-    };
-}
-
-// Gaps no seed in 0..500 reaches (`just coverage 0 500`), each reached by
-// a scenario compiled from a BFS witness.
-directed! {
-    two_unsafe_runs_act_at_once;
-    a_call_past_the_step_bound;
-}
-
-/// The hold is the witness's essential ordering, not decoration: without
-/// it the same turn runs its two `Unsafe` calls one after the other.
+/// Running together is the scenario's essential ordering, not decoration:
+/// without it the same turn runs its two `Unsafe` calls one after the other.
 #[test]
 fn without_its_hold_a_directed_scenario_misses_its_target() {
-    let directed = directed_scenario("two_unsafe_runs_act_at_once");
-    let mut scenario = directed::scenario(&directed)
-        .map_err(|error| error.to_string())
-        .expect("the witness compiles");
-    assert!(!scenario.holds.is_empty(), "the witness compiles to a hold");
-    scenario.holds.clear();
-    let outcome = run::simulate_scenario(scenario, Planted::default()).expect("the run finishes");
-    let replayed = outcome.replayed.expect("the run replays");
+    let directed = directed::named("two_unsafe_runs_act_at_once").expect("a directed scenario");
     assert!(
-        !replayed.keys.contains(&directed.target),
+        directed.scenario.ran_together,
+        "the scenario holds its runs"
+    );
+    let apart = Directed {
+        scenario: Scenario {
+            ran_together: false,
+            ..directed.scenario
+        },
+        ..directed
+    };
+    assert!(
+        matches!(directed::run(&apart), Err(DirectedError::Missed { .. })),
         "the target is reached without the hold, so the hold proves nothing"
     );
 }

@@ -13,9 +13,8 @@ use std::io;
 use verified_model::coverage::{Gap, Key, classify, explore};
 use verified_model::replay::kind;
 use verified_model::{Action, suite};
-use verified_server::shell::Planted;
 
-use crate::directed::{self, CompileError};
+use crate::directed::{self, DirectedError};
 use crate::run::{self, RunError};
 
 /// What BFS reached under every bound: each key, the bounds that reach
@@ -53,11 +52,9 @@ pub enum CoverageError {
     #[error(transparent)]
     Run(#[from] RunError),
     #[error(transparent)]
-    Compile(#[from] CompileError),
+    Directed(#[from] DirectedError),
     #[error("seed {seed} broke invariants, so its coverage means nothing: {violations}")]
     Violated { seed: u64, violations: String },
-    #[error("the directed scenario {name} missed its target {target}")]
-    Missed { name: &'static str, target: Key },
 }
 
 /// What the simulation reached: each key with the seeds that reach it,
@@ -84,7 +81,7 @@ fn reached(seed: u64, outcome: run::Outcome) -> Result<BTreeSet<Key>, CoverageEr
 ///
 /// # Errors
 /// A run failed or broke an invariant (the model's replay among them), or
-/// a directed scenario did not compile or missed its target.
+/// a directed scenario failed ([`directed::run`]).
 pub fn simulated(from: u64, count: u64) -> Result<Simulated, CoverageError> {
     let mut simulated = Simulated::default();
     for seed in from..from.saturating_add(count) {
@@ -93,17 +90,7 @@ pub fn simulated(from: u64, count: u64) -> Result<Simulated, CoverageError> {
         }
     }
     for chosen in directed::all() {
-        let scenario = directed::scenario(&chosen)?;
-        let seed = scenario.seed;
-        let outcome = run::simulate_scenario(scenario, Planted::default())?;
-        let keys = reached(seed, outcome)?;
-        if !keys.contains(&chosen.target) {
-            return Err(CoverageError::Missed {
-                name: chosen.name,
-                target: chosen.target,
-            });
-        }
-        for key in keys {
+        for key in directed::run(&chosen)?.keys {
             simulated.directed.entry(key).or_default().push(chosen.name);
         }
     }

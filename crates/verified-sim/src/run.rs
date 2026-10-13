@@ -17,7 +17,7 @@ use crate::driver;
 use crate::hosts::{self, ANTHROPIC, DAEMON, TUI};
 use crate::ledger::{Entry, Ledger};
 use crate::model;
-use crate::scenario::{Aim, AimedCrash, Fault, Hold, Scenario};
+use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
 
 /// The most entries one run's ledger holds.
 const LEDGER_CAPACITY: usize = 100_000;
@@ -25,10 +25,6 @@ const LEDGER_CAPACITY: usize = 100_000;
 const RUN_LIMIT: Duration = Duration::from_mins(15);
 /// The most steps the daemon gets to recover after the final crash.
 const RECOVERY_STEPS: usize = 20_000;
-/// The longest a hold keeps a run waiting, in simulated time: a run whose
-/// ordering never comes is released (and its directed scenario then
-/// misses its target, which fails it), not stuck.
-const HOLD_LIMIT: Duration = Duration::from_secs(30);
 
 /// What a finished run produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,13 +66,11 @@ struct Aimed {
     passed: u32,
 }
 
-/// A hold while it keeps its ordering: the points it caught, waiting.
-struct Held {
-    hold: Hold,
+/// [`Scenario::ran_together`] until two runs have acted: the runs caught
+/// acting, each waiting before it reports.
+struct Together {
     barrier: SimBarrier<Barrier>,
     waiting: Vec<Triggered<Barrier>>,
-    /// When the first point was caught.
-    since: Option<Duration>,
 }
 
 /// The faults of a run, applied as simulated time passes.
@@ -84,7 +78,7 @@ struct Faults {
     due: VecDeque<(Duration, Fault)>,
     undo: Vec<(Duration, Undo)>,
     aimed: Option<Aimed>,
-    held: Vec<Held>,
+    together: Option<Together>,
     daemon_up: bool,
     /// Partitions of the TUI's link in force (they may overlap).
     partitioned: usize,
@@ -120,23 +114,17 @@ impl Faults {
             }),
             passed: 0,
         });
-        let held = scenario
-            .holds
-            .iter()
-            .map(|hold| Held {
-                hold: *hold,
-                barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
-                    Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
-                }),
-                waiting: Vec::new(),
-                since: None,
-            })
-            .collect();
+        let together = scenario.ran_together.then(|| Together {
+            barrier: SimBarrier::build(Reaction::Suspend, |point: &Barrier| {
+                matches!(point, Barrier::ToolRan { .. })
+            }),
+            waiting: Vec::new(),
+        });
         Self {
             due: scenario.faults.iter().copied().collect(),
             undo: Vec::new(),
             aimed,
-            held,
+            together,
             daemon_up: true,
             partitioned: 0,
             model_partitioned: 0,
@@ -237,37 +225,21 @@ impl Faults {
         self.hold(sim, ledger);
     }
 
-    /// Keeps each hold's points waiting until its ordering is met (or
-    /// [`HOLD_LIMIT`] passes), then releases them all and forgets it.
+    /// Keeps each run caught acting waiting until two have acted, then
+    /// releases both and forgets the barrier. A second run that never comes
+    /// holds the first until the run's time limit fails it.
     fn hold(&mut self, sim: &turmoil::Sim<'_>, ledger: &Ledger) {
         let now = sim.elapsed();
-        let mut index = 0;
-        while let Some(held) = self.held.get_mut(index) {
-            while let Some(hit) = poll_once(held.barrier.wait()).flatten() {
-                ledger.record_at(now, Entry::Fault(format!("held at {:?}", *hit)));
-                held.waiting.push(hit);
-                held.since.get_or_insert(now);
-            }
-            let met = match held.hold {
-                Hold::RanTogether => held.waiting.len() >= 2,
-            };
-            let expired = held
-                .since
-                .is_some_and(|since| now.saturating_sub(since) >= HOLD_LIMIT);
-            if met || expired {
-                ledger.record_at(
-                    now,
-                    Entry::Fault(format!(
-                        "{:?} {}: {} released",
-                        held.hold,
-                        if met { "kept" } else { "expired" },
-                        held.waiting.len()
-                    )),
-                );
-                self.held.remove(index);
-            } else {
-                index = index.saturating_add(1);
-            }
+        let Some(together) = self.together.as_mut() else {
+            return;
+        };
+        while let Some(hit) = poll_once(together.barrier.wait()).flatten() {
+            ledger.record_at(now, Entry::Fault(format!("held at {:?}", *hit)));
+            together.waiting.push(hit);
+        }
+        if together.waiting.len() >= 2 {
+            ledger.record_at(now, Entry::Fault("two runs acted together".to_owned()));
+            self.together = None;
         }
     }
 
@@ -302,7 +274,7 @@ impl Faults {
     /// Undoes everything still in force.
     fn heal(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger) {
         self.aimed = None;
-        self.held.clear();
+        self.together = None;
         self.due.clear();
         for (_, undo) in core::mem::take(&mut self.undo) {
             self.undo(sim, ledger, undo);

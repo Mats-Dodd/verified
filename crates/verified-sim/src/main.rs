@@ -6,7 +6,7 @@
 //! verified-sim trace --seed 42               # one run of one seed, its trace only
 //! verified-sim processes --from 0 --count 8  # each seed in two fresh processes
 //! verified-sim coverage --from 0 --count 200 # model coverage: the gap table
-//! verified-sim directed --name NAME --trace  # one directed scenario, twice
+//! verified-sim directed --name NAME         # one directed scenario, twice
 //! ```
 //!
 //! `processes` catches what running a seed twice in one process cannot:
@@ -58,14 +58,11 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         count: u64,
     },
-    /// Compiles one directed scenario from its BFS witness, runs it twice
-    /// and reports it, with the coverage keys its replay reached.
+    /// Runs one directed scenario twice and prints the coverage keys its
+    /// replay reached.
     Directed {
         #[arg(long)]
         name: String,
-        /// Prints the whole trace.
-        #[arg(long)]
-        trace: bool,
     },
     /// Runs one seed once and prints its trace (diff two of these to find
     /// nondeterminism).
@@ -91,11 +88,9 @@ enum Failure {
     #[error(transparent)]
     Coverage(#[from] coverage::CoverageError),
     #[error(transparent)]
-    Compile(#[from] directed::CompileError),
+    Directed(#[from] directed::DirectedError),
     #[error("no directed scenario is named {0}")]
     NoDirected(String),
-    #[error("directed scenario {0} missed its target")]
-    Missed(String),
     #[error("seed {seed} traced differently in two processes, from line {line}")]
     Diverged { seed: u64, line: usize },
 }
@@ -195,35 +190,13 @@ fn main() -> Result<(), Failure> {
             coverage::table(&mut out, (from, count), &modelled, &simulated)?;
             Ok(())
         }
-        Command::Directed { name, trace } => {
-            let Some(chosen) = directed::all()
-                .into_iter()
-                .find(|chosen| chosen.name == name)
-            else {
-                return Err(Failure::NoDirected(name));
-            };
-            let witness = directed::witness(&chosen)?;
-            writeln!(out, "target: {}\nwitness: {witness:?}", chosen.target)?;
-            let scenario = directed::compile(&chosen.harness, &witness, chosen.seed)?;
-            let outcome = run::twice_scenario(&scenario)?;
-            writeln!(out, "{:#?}", outcome.scenario)?;
-            if trace {
-                for line in &outcome.trace {
-                    writeln!(out, "{line}")?;
-                }
+        Command::Directed { name } => {
+            let chosen = directed::named(&name).ok_or(Failure::NoDirected(name))?;
+            writeln!(out, "target: {}\n{:#?}", chosen.target, chosen.scenario)?;
+            for key in directed::run(&chosen)?.keys {
+                writeln!(out, "  reached {key}")?;
             }
-            let reached = outcome.replayed.as_ref().map(|replayed| &replayed.keys);
-            if let Some(keys) = reached {
-                for key in keys {
-                    writeln!(out, "  reached {key}")?;
-                }
-            }
-            report(&mut out, &outcome)?;
-            if reached.is_some_and(|keys| keys.contains(&chosen.target)) {
-                Ok(())
-            } else {
-                Err(Failure::Missed(name))
-            }
+            Ok(())
         }
         Command::Trace { seed, runs } => {
             for run in 0..runs {
