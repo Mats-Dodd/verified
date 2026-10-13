@@ -902,3 +902,49 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
     assert_eq!(found.index, booted, "{found:?}");
     assert!(found.why.contains("no crash leaves"), "{found:?}");
 }
+
+/// A run stopped before it acted did not act: its return, observed
+/// `stopped`, takes no `Execute`, so the call resolves `Interrupted` while
+/// still `Dispatched`. The same return not stopped is the run acting.
+#[test]
+fn a_stopped_run_did_not_act() {
+    let harness = Harness::bounded(
+        suite::limits(1),
+        Bounded {
+            max_interrupts: 1,
+            ..suite::bounded(vec![vec![Tool::Read]], 1)
+        },
+    );
+    let key = Key::Call {
+        class: Class::Safe,
+        phase: Phase::Dispatched,
+        crossed: false,
+        resolved: Resolved::Interrupted,
+    };
+    let path = explore(&harness)
+        .witnesses
+        .remove(&key)
+        .expect("BFS interrupts a dispatched read");
+    let id = if let Some(Action::Deliver(Event::ToolDone { id, .. })) = path.last() {
+        Some(*id)
+    } else {
+        None
+    }
+    .expect("the witness ends at the read's report");
+    for stopped in [true, false] {
+        let mut taken = path.clone();
+        if !stopped {
+            taken.insert(taken.len().saturating_sub(1), Action::Execute(id));
+        }
+        let mut trace = observations(&harness, &path);
+        let done = trace.len().saturating_sub(1);
+        trace.insert(done, Observed::Ran { id, stopped });
+        let replayed = replay(&trace_mode(&harness, &trace), &trace).expect("the run replays");
+        assert_eq!(
+            replayed.keys,
+            path_keys(&harness, &taken),
+            "stopped {stopped}: the replay takes {taken:?}"
+        );
+        assert_eq!(replayed.keys.contains(&key), stopped, "stopped {stopped}");
+    }
+}
