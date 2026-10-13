@@ -202,3 +202,44 @@ pub enum Record<P: Payload> {
 }
 
 } // verus!
+
+/// The call table: each record of `log` with the call it names, if any.
+///
+/// An `Approved`, `Dispatched` or `ToolResult` names the call its `CallIx`
+/// points at among those its turn proposed; a call is its number among the
+/// log's proposals, in order, and its proposal. Every other record, and one
+/// pointing past its turn's calls, names none.
+pub fn named<'log, P, L>(
+    log: L,
+) -> impl Iterator<Item = (&'log Record<P>, Option<(usize, &'log Proposal<P>)>)>
+where
+    P: Payload + 'log,
+    L: IntoIterator<Item = &'log Record<P>>,
+{
+    let mut proposals: Vec<&'log Proposal<P>> = Vec::new();
+    let mut turn = 0usize;
+    log.into_iter().map(move |record| {
+        let call = match record {
+            Record::TurnStarted { .. } => {
+                turn = proposals.len();
+                None
+            }
+            Record::StepFinished { calls, .. } => {
+                proposals.extend(calls);
+                None
+            }
+            Record::Approved { call, .. }
+            | Record::Dispatched { call }
+            | Record::ToolResult { call, .. } => turn
+                .checked_add(call.0)
+                .and_then(|number| Some((number, *proposals.get(number)?))),
+            Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => None,
+        };
+        (record, call)
+    })
+}

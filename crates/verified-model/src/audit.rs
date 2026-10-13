@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use verified_domain::{
-    Abstract, CallId, CallIx, Cause, Exit, Fault, Limits, Record, Request, Rerun, Tool, TurnId,
+    Abstract, CallId, CallIx, Cause, Exit, Fault, Limits, Proposal, Record, Request, Rerun, TurnId,
+    named,
 };
 
 /// Facts read back from the log.
@@ -29,37 +30,32 @@ pub(crate) enum Breach {
 
 pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
     let mut audit = Audit::default();
-    let mut tools: Vec<Tool> = Vec::new();
+    // The turn's calls so far, and those of them past a bound.
+    let mut proposed = 0usize;
     let mut over: BTreeSet<usize> = BTreeSet::new();
     // Unsafe calls dispatched and unresolved, and those of them a crash
-    // (an `EpochBumped`) came between dispatch and result for.
+    // (an `EpochBumped`) came between dispatch and result for, by number.
     let mut unsafe_live: BTreeSet<usize> = BTreeSet::new();
     let mut crossed: BTreeSet<usize> = BTreeSet::new();
     let mut stopping: BTreeSet<TurnId> = BTreeSet::new();
-    for record in log {
+    for (record, target) in named(log) {
         match record {
             Record::TurnStarted { .. } => {
-                tools.clear();
+                proposed = 0;
                 over.clear();
-                unsafe_live.clear();
-                crossed.clear();
             }
             Record::StepFinished { calls, step } => {
                 if stopping.contains(&step.turn) {
                     audit.cancelled_after_finish = Some(step.turn);
                 }
-                let first = tools.len();
+                let first = proposed;
                 for proposal in calls {
-                    let index = tools.len();
-                    if index.saturating_sub(first) >= limits.calls_per_step()
-                        || index >= limits.calls_per_turn()
+                    if proposed.saturating_sub(first) >= limits.calls_per_step()
+                        || proposed >= limits.calls_per_turn()
                     {
-                        over.insert(index);
+                        over.insert(proposed);
                     }
-                    tools.push(match &proposal.request {
-                        Request::Run { args } => *args,
-                        Request::Invalid { .. } => Tool::Read,
-                    });
+                    proposed = proposed.saturating_add(1);
                     audit.proposed.insert(proposal.id.clone());
                 }
             }
@@ -72,21 +68,21 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 if over.contains(index) {
                     audit.breaches.insert(Breach::OverBoundDispatched);
                 }
-                if tools.get(*index).map(|tool| tool.rerun()) == Some(Rerun::Unsafe) {
-                    unsafe_live.insert(*index);
+                if let Some((number, proposal)) = target
+                    && rerun(proposal) == Some(Rerun::Unsafe)
+                {
+                    unsafe_live.insert(number);
                 }
             }
-            Record::ToolResult {
-                call: CallIx(index),
-                exit,
-                ..
-            } => {
+            Record::ToolResult { exit, .. } => {
                 if *exit == Exit::Err(Cause::Failed(Fault::TooManyCalls)) {
                     audit.limited = audit.limited.saturating_add(1);
                 }
-                unsafe_live.remove(index);
-                if crossed.remove(index) && *exit != Exit::Err(Cause::Unknown) {
-                    audit.breaches.insert(Breach::UnsafeKnownAfterCrash);
+                if let Some((number, _)) = target {
+                    unsafe_live.remove(&number);
+                    if crossed.remove(&number) && *exit != Exit::Err(Cause::Unknown) {
+                        audit.breaches.insert(Breach::UnsafeKnownAfterCrash);
+                    }
                 }
             }
             Record::EpochBumped { .. } => {
@@ -100,4 +96,12 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
         }
     }
     audit
+}
+
+/// The rerun class of the tool `proposal` asks for, if it asks for one.
+const fn rerun(proposal: &Proposal<Abstract>) -> Option<Rerun> {
+    match proposal.request {
+        Request::Run { args } => Some(args.rerun()),
+        Request::Invalid { .. } => None,
+    }
 }

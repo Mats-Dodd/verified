@@ -30,7 +30,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-use verified_domain::{EffectId, Exit, Record, Request};
+use verified_domain::{EffectId, Exit, Record, Request, named};
 use verified_server::payload::{Parsed, ToolArgs};
 use verified_server::projection::Projector;
 use verified_wire::WireLimits;
@@ -61,7 +61,6 @@ const fn violation(invariant: &'static str, detail: String) -> Violation {
 /// One tool call as a log tells it.
 #[derive(Debug, Clone)]
 struct Call {
-    turn: usize,
     id: String,
     args: Option<ToolArgs>,
     /// The seq of each of its `Dispatched` records: its effects' seqs.
@@ -69,68 +68,54 @@ struct Call {
     results: Vec<Exit>,
 }
 
-/// The calls of `log`, in order, and any record naming a call that is not
-/// there.
+/// The calls of `log`, in order, and any record naming a call its turn did
+/// not propose.
 fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
     let mut calls: Vec<Call> = Vec::new();
-    let mut base = 0usize;
-    let mut turn = 0usize;
-    for (seq, record) in (0u64..).zip(log) {
-        let ix = match record {
-            Record::TurnStarted { .. } => {
-                base = calls.len();
-                turn = turn.saturating_add(1);
-                None
-            }
+    for (seq, (record, target)) in (0u64..).zip(named(log)) {
+        match record {
             Record::StepFinished {
                 calls: proposed, ..
-            } => {
-                for proposal in proposed {
-                    let args = match &proposal.request {
-                        Request::Run { args } => Some(args.clone()),
-                        Request::Invalid { .. } => None,
-                    };
-                    calls.push(Call {
-                        turn,
-                        id: proposal.id.as_str().to_owned(),
-                        args,
-                        effects: Vec::new(),
-                        results: Vec::new(),
-                    });
+            } => calls.extend(proposed.iter().map(|proposal| Call {
+                id: proposal.id.as_str().to_owned(),
+                args: match &proposal.request {
+                    Request::Run { args } => Some(args.clone()),
+                    Request::Invalid { .. } => None,
+                },
+                effects: Vec::new(),
+                results: Vec::new(),
+            })),
+            Record::Approved { call: ix, .. }
+            | Record::Dispatched { call: ix }
+            | Record::ToolResult { call: ix, .. } => {
+                let Some(call) = target.and_then(|(number, _)| calls.get_mut(number)) else {
+                    found.push(violation(
+                        "log",
+                        format!(
+                            "record {seq} names call {}, which its turn never proposed",
+                            ix.0
+                        ),
+                    ));
+                    continue;
+                };
+                match record {
+                    Record::Dispatched { .. } => call.effects.push(seq),
+                    Record::ToolResult { exit, .. } => call.results.push(*exit),
+                    Record::Approved { .. }
+                    | Record::TurnStarted { .. }
+                    | Record::StepStarted { .. }
+                    | Record::ModelOutput { .. }
+                    | Record::StepReset { .. }
+                    | Record::StepFinished { .. }
+                    | Record::CancelRequested { .. }
+                    | Record::TurnEnded { .. }
+                    | Record::EpochBumped { .. } => {}
                 }
-                None
             }
-            Record::Approved { call, .. }
-            | Record::Dispatched { call }
-            | Record::ToolResult { call, .. } => Some(call.0),
-            Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::CancelRequested { .. }
-            | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
-        };
-        let Some(ix) = ix else { continue };
-        let Some(call) = base
-            .checked_add(ix)
-            .and_then(|at| calls.get_mut(at))
-            .filter(|call| call.turn == turn)
-        else {
-            found.push(violation(
-                "log",
-                format!("a record names call {ix} of turn {turn}, which was never proposed"),
-            ));
-            continue;
-        };
-        match record {
-            Record::Dispatched { .. } => call.effects.push(seq),
-            Record::ToolResult { exit, .. } => call.results.push(*exit),
-            Record::Approved { .. }
-            | Record::TurnStarted { .. }
+            Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
-            | Record::StepFinished { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
             | Record::EpochBumped { .. } => {}

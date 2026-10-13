@@ -52,7 +52,7 @@ use verified_core::{
 };
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
 use verified_domain::{
-    Approver, Cause, EffectId, Exit, Fault, Measured, Proposal, Record, TurnOutcome,
+    Approver, Cause, EffectId, Exit, Fault, Measured, Proposal, Record, TurnOutcome, named,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -1285,38 +1285,29 @@ fn held(record: &Record<Parsed>, projected: &Projected) -> usize {
 
 /// The verdict the user gave `call` in any turn, if any.
 fn verdict_of(records: &[Record<Parsed>], call: &CallId) -> Option<WireVerdict> {
-    let mut calls: Vec<&CallId> = Vec::new();
-    let mut verdict = None;
-    let named = |calls: &[&CallId], index: usize| calls.get(index).is_some_and(|id| *id == call);
-    for record in records {
-        match record {
-            Record::TurnStarted { .. } => calls.clear(),
-            Record::StepFinished {
-                calls: proposed, ..
-            } => {
-                calls.extend(proposed.iter().map(|proposal| &proposal.id));
-            }
+    named(records)
+        .filter(|(_, target)| target.is_some_and(|(_, proposal)| proposal.id == *call))
+        .filter_map(|(record, _)| match record {
             Record::Approved {
-                call: index,
-                by: Approver::User,
-            } if named(&calls, index.0) => verdict = Some(WireVerdict::Grant),
+                by: Approver::User, ..
+            } => Some(WireVerdict::Grant),
             Record::ToolResult {
-                call: index,
                 exit: Exit::Err(Cause::Denied),
                 ..
-            } if named(&calls, index.0) => verdict = Some(WireVerdict::Deny),
+            } => Some(WireVerdict::Deny),
             Record::Approved { .. }
             | Record::ToolResult { .. }
+            | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
+            | Record::StepFinished { .. }
             | Record::Dispatched { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
-        }
-    }
-    verdict
+            | Record::EpochBumped { .. } => None,
+        })
+        .last()
 }
 
 /// Whether `turn` was asked to stop or ended cancelled.

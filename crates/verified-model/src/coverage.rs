@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use stateright::Model as _;
 use verified_core::Event;
 use verified_domain::{
-    Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome,
+    Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome, named,
 };
 
 use crate::harness::{Action, Harness, Kind};
@@ -180,74 +180,54 @@ impl fmt::Display for Key {
     }
 }
 
-/// A call of the turn, as far as the records show.
-struct Call {
-    class: Class,
-    name: Option<verified_domain::CallId>,
-    approved: bool,
-    /// The position of its last `Dispatched`.
-    dispatched: Option<usize>,
-}
-
 /// The keys of the decision `after` holds (its records from `after.log`
 /// on), read against every record before it.
 fn decided(after: &World, keys: &mut BTreeSet<Key>) {
     let start = after.log.len();
-    let mut calls: Vec<Call> = Vec::new();
+    // Calls approved, and the position of each call's last `Dispatched`,
+    // by number.
+    let mut approved: BTreeSet<usize> = BTreeSet::new();
+    let mut dispatched: BTreeMap<usize, usize> = BTreeMap::new();
     let mut bumped: Option<usize> = None;
-    for (at, record) in after.log.iter().chain(&after.pending).enumerate() {
+    for (at, (record, target)) in named(after.log.iter().chain(&after.pending)).enumerate() {
         let new = at >= start;
         match record {
-            Record::TurnStarted { .. } => calls.clear(),
-            Record::StepFinished {
-                calls: proposed, ..
-            } => {
-                calls.extend(proposed.iter().map(|proposal| match &proposal.request {
-                    Request::Run { args } => Call {
-                        class: Class::of(*args),
-                        name: Some(proposal.id.clone()),
-                        approved: false,
-                        dispatched: None,
-                    },
-                    Request::Invalid { .. } => Call {
-                        class: Class::Invalid,
-                        name: None,
-                        approved: false,
-                        dispatched: None,
-                    },
-                }));
-            }
-            Record::Approved { call, .. } => {
-                if let Some(call) = calls.get_mut(call.0) {
-                    call.approved = true;
+            Record::Approved { .. } => {
+                if let Some((number, _)) = target {
+                    approved.insert(number);
                 }
             }
-            Record::Dispatched { call } => {
-                if let Some(call) = calls.get_mut(call.0) {
-                    call.dispatched = Some(at);
+            Record::Dispatched { .. } => {
+                if let Some((number, _)) = target {
+                    dispatched.insert(number, at);
                 }
             }
-            Record::ToolResult { call, exit, .. } => {
-                if let (true, Some(call)) = (new, calls.get(call.0)) {
-                    let ran = call
-                        .name
-                        .as_ref()
-                        .and_then(|name| after.runs.get(name))
-                        .is_some_and(|(_, count)| *count > 0);
+            Record::ToolResult { exit, .. } => {
+                if let (true, Some((number, proposal))) = (new, target) {
+                    let (class, ran) = match proposal.request {
+                        Request::Run { args } => (
+                            Class::of(args),
+                            after
+                                .runs
+                                .get(&proposal.id)
+                                .is_some_and(|(_, count)| *count > 0),
+                        ),
+                        Request::Invalid { .. } => (Class::Invalid, false),
+                    };
+                    let dispatched = dispatched.get(&number).copied();
                     let phase = if ran {
                         Phase::Ran
-                    } else if call.dispatched.is_some() {
+                    } else if dispatched.is_some() {
                         Phase::Dispatched
-                    } else if call.approved {
+                    } else if approved.contains(&number) {
                         Phase::Approved
                     } else {
                         Phase::Proposed
                     };
                     keys.insert(Key::Call {
-                        class: call.class,
+                        class,
                         phase,
-                        crossed: call
-                            .dispatched
+                        crossed: dispatched
                             .is_some_and(|dispatched| bumped.is_some_and(|bump| bump > dispatched)),
                         resolved: Resolved::of(*exit),
                     });
@@ -267,7 +247,9 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
                     }));
                 }
             }
-            Record::StepStarted { .. }
+            Record::TurnStarted { .. }
+            | Record::StepFinished { .. }
+            | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::CancelRequested { .. } => {}
         }

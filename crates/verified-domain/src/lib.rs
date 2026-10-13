@@ -24,5 +24,5 @@ pub use limits::{Limits, LimitsConfig, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit, alpha};
 pub use record::{
     Approver, Cause, Exit, Failure, Fault, Limit, Proposal, Record, Request, Rerun, Reset, Tool,
-    TurnOutcome,
+    TurnOutcome, named,
 };
