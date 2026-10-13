@@ -1142,14 +1142,24 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     second.world.shutdown().cancel();
 }
 
+/// Both the registry and a session see shutdown before a command already
+/// queued for them: each takes its next input only while the daemon runs.
 #[tokio::test]
 async fn shutdown_wins_over_a_queued_command() {
     let disk = MemDisk::new();
     let daemon = boot(&disk, Arc::new(MemEnv::default())).await;
     let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
     let before = disk.bytes(session_id()).expect("the log");
+    let other = SessionId::from_parts(
+        UnixMillis::new(1_700_000_000_000).expect("a time"),
+        &[8; 10],
+    );
     daemon.world.shutdown().cancel();
-    let reply = handle.send_message(send(1, "after shutdown")).await;
+    // Both commands are queued before either task runs again.
+    let (created, reply) = tokio::join!(
+        daemon.registry.create(other),
+        handle.send_message(send(1, "after shutdown")),
+    );
     assert!(
         reply.is_err(),
         "a stopping daemon takes no command: {reply:?}"
@@ -1159,6 +1169,11 @@ async fn shutdown_wins_over_a_queued_command() {
         Some(before),
         "a stopping daemon appends nothing"
     );
+    assert!(
+        created.is_err(),
+        "a stopping daemon creates no session: {created:?}"
+    );
+    assert_eq!(disk.bytes(other), None, "a stopping daemon makes no log");
 }
 
 /// A crash mid-turn on a log too full to carry the turn on: the restart
