@@ -481,24 +481,26 @@ fn directed_scenarios_reach_their_targets() {
     }
 }
 
-/// Running together is the scenario's essential ordering, not decoration:
-/// without it the same turn runs its two `Unsafe` calls one after the other.
+/// Each hold is the scenario's essential ordering, not decoration: without
+/// it the same turn runs its two `Unsafe` calls one after the other, and
+/// its read starts before the interrupt can stop it.
 #[test]
 fn without_its_hold_a_directed_scenario_misses_its_target() {
-    let directed = directed::named("two_unsafe_runs_act_at_once").expect("a directed scenario");
-    assert!(
-        directed.scenario.ran_together,
-        "the scenario holds its runs"
-    );
-    let apart = Directed {
-        scenario: Scenario {
-            ran_together: false,
-            ..directed.scenario
-        },
-        ..directed
-    };
-    assert!(
-        matches!(directed::run(&apart), Err(DirectedError::Missed { .. })),
-        "the target is reached without the hold, so the hold proves nothing"
-    );
+    for directed in directed::all() {
+        if directed.scenario.hold.is_none() {
+            continue;
+        }
+        let name = directed.name;
+        let apart = Directed {
+            scenario: Scenario {
+                hold: None,
+                ..directed.scenario
+            },
+            ..directed
+        };
+        assert!(
+            matches!(directed::run(&apart), Err(DirectedError::Missed { .. })),
+            "{name} reaches its target without its hold, so the hold proves nothing"
+        );
+    }
 }

@@ -4,8 +4,8 @@
 //! Each is a BFS witness to its target, written out as the simulation runs
 //! it: what the user sends (each turn's text names the calls the fake model
 //! proposes), how the user answers each prompt, and the one ordering no
-//! seed's schedule promises, two runs acting together
-//! ([`Scenario::ran_together`]). Everything else (ids, sizes, exits,
+//! seed's schedule promises ([`Scenario::hold`]): two runs acting
+//! together, or an interrupt durable before a run starts. Everything else (ids, sizes, exits,
 //! latencies, when records become durable) is the run's. [`run()`] fails a
 //! scenario whose replay misses its target, so a scenario the model or the
 //! daemon drifted away from is caught.
@@ -19,7 +19,7 @@ use verified_wire::command::Verdict;
 
 use crate::hosts;
 use crate::run::{self, Broken, RunError};
-use crate::scenario::{Scenario, TurnPlan};
+use crate::scenario::{CancelAt, Hold, Scenario, TurnPlan};
 
 /// A gap random seeds miss, and the scenario that reaches it.
 #[derive(Debug, Clone)]
@@ -30,17 +30,13 @@ pub struct Directed {
 }
 
 /// A scenario of seed 0: one turn, no faults.
-fn one_turn(text: String, verdicts: Vec<Verdict>, ran_together: bool) -> Scenario {
+fn one_turn(turn: TurnPlan, hold: Option<Hold>) -> Scenario {
     Scenario {
         seed: 0,
-        turns: vec![TurnPlan {
-            text,
-            verdicts,
-            cancel: None,
-        }],
+        turns: vec![turn],
         faults: Vec::new(),
         aimed: None,
-        ran_together,
+        hold,
         block_size: None,
         max_latency: Duration::from_millis(5),
         limits: hosts::limits(),
@@ -58,9 +54,33 @@ pub fn all() -> Vec<Directed> {
             name: "two_unsafe_runs_act_at_once",
             target: Key::Situation(Situation::UnsafeTogether),
             scenario: one_turn(
-                "edit notes.txt alpha d0 ; bash touch d1".to_owned(),
-                vec![Verdict::Grant, Verdict::Grant],
-                true,
+                TurnPlan {
+                    text: "edit notes.txt alpha d0 ; bash touch d1".to_owned(),
+                    verdicts: vec![Verdict::Grant, Verdict::Grant],
+                    cancel: None,
+                },
+                Some(Hold::RanTogether),
+            ),
+        },
+        // A `Safe` run interrupted before it acts: it reports `Interrupted`
+        // and the replay counts no act (its `stopped`). Seeds 0..500 never
+        // do: a read starts as soon as it is dispatched, before any
+        // interrupt can cancel it.
+        Directed {
+            name: "a_safe_run_stopped_before_it_acts",
+            target: Key::Call {
+                class: Class::Safe,
+                phase: Phase::Dispatched,
+                crossed: false,
+                resolved: Resolved::Interrupted,
+            },
+            scenario: one_turn(
+                TurnPlan {
+                    text: "read notes.txt".to_owned(),
+                    verdicts: Vec::new(),
+                    cancel: Some(CancelAt::ToolRunning),
+                },
+                Some(Hold::InterruptedFirst),
             ),
         },
         // A call past v0's 16 calls a step fails by the limit and never
@@ -74,12 +94,15 @@ pub fn all() -> Vec<Directed> {
                 resolved: Resolved::Limited,
             },
             scenario: one_turn(
-                format!(
-                    "read notes.txt ; {}edit notes.txt alpha d16",
-                    "read other.txt ; ".repeat(15)
-                ),
-                Vec::new(),
-                false,
+                TurnPlan {
+                    text: format!(
+                        "read notes.txt ; {}edit notes.txt alpha d16",
+                        "read other.txt ; ".repeat(15)
+                    ),
+                    verdicts: Vec::new(),
+                    cancel: None,
+                },
+                None,
             ),
         },
     ]

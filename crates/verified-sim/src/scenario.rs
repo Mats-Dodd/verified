@@ -74,6 +74,17 @@ pub struct AimedCrash {
     pub down: Duration,
 }
 
+/// An ordering a directed scenario keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// The first tool run to act waits, before it reports, until a second
+    /// has acted too: two runs act before either reports.
+    RanTogether,
+    /// A tool run waits, before it starts, until the user's interrupt is
+    /// durable (and so its run is cancelled): it is stopped before it acts.
+    InterruptedFirst,
+}
+
 /// Everything one simulated run does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scenario {
@@ -82,12 +93,10 @@ pub struct Scenario {
     /// Faults by the simulated time they strike, in order.
     pub faults: Vec<(Duration, Fault)>,
     pub aimed: Option<AimedCrash>,
-    /// The first tool run to act waits, before it reports, until a second
-    /// has acted too: two runs act before either reports. Kept with a
-    /// barrier, it orders two points of the run and leaves the rest of its
-    /// schedule to the seed. Only a directed scenario
-    /// ([`crate::directed`]) asks for it.
-    pub ran_together: bool,
+    /// The one ordering of two points of the run that no seed's schedule
+    /// promises, kept with a barrier; the rest of the schedule is the
+    /// seed's. Only a directed scenario ([`crate::directed`]) asks for one.
+    pub hold: Option<Hold>,
     /// Torn-write granularity of the daemon's disk (`None`: atomic writes).
     pub block_size: Option<u64>,
     pub max_latency: Duration,
@@ -229,7 +238,7 @@ impl Scenario {
             turns,
             faults,
             aimed,
-            ran_together: false,
+            hold: None,
             block_size,
             max_latency: Duration::from_millis(rng.random_range(1..=40)),
             limits: hosts::limits(),

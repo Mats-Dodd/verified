@@ -477,7 +477,7 @@ impl Session {
             resumed = self.resume().await?;
         }
         if let Persisted::Done(_, effects) = resumed {
-            self.start_effects(effects).await;
+            self.start_effects(effects);
         }
         let shutdown = self.seams.tasks.shutdown().clone();
         loop {
@@ -526,7 +526,7 @@ impl Session {
             if self.config.planted == Planted::RunBeforePersist {
                 for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
                 {
-                    self.start_effect(run).await;
+                    self.start_effect(run);
                 }
             }
             effects
@@ -597,7 +597,7 @@ impl Session {
             records: decision.records.clone(),
         });
         if let Persisted::Done(_, effects) = self.persist(decision).await? {
-            self.start_effects(effects).await;
+            self.start_effects(effects);
         }
         Ok(())
     }
@@ -638,7 +638,7 @@ impl Session {
                     (persisted, _) => persisted,
                 };
                 if let Persisted::Done(_, effects) = persisted {
-                    self.start_effects(effects).await;
+                    self.start_effects(effects);
                 }
             }
             Input::Message { command, reply } => {
@@ -668,7 +668,7 @@ impl Session {
                     Persisted::Done(outcome, effects) => {
                         let answer = self.message_answer(outcome, &command, turn, &text);
                         drop(reply.send(answer));
-                        self.start_effects(effects).await;
+                        self.start_effects(effects);
                     }
                     Persisted::Refused => drop(reply.send(Err(self.full()))),
                 }
@@ -686,7 +686,7 @@ impl Session {
                     Persisted::Done(outcome, effects) => {
                         let answer = self.approve_answer(outcome, &command);
                         drop(reply.send(answer));
-                        self.start_effects(effects).await;
+                        self.start_effects(effects);
                     }
                     Persisted::Refused => drop(reply.send(Err(self.full()))),
                 }
@@ -697,7 +697,7 @@ impl Session {
                     Persisted::Done(outcome, effects) => {
                         let answer = self.cancel_answer(outcome, turn);
                         drop(reply.send(answer));
-                        self.start_effects(effects).await;
+                        self.start_effects(effects);
                     }
                     // The refusal closed the running turn: if that was this
                     // one, this cancel is what cancelled it.
@@ -878,13 +878,13 @@ impl Session {
     }
 
     /// Step 5: every effect of a durable, applied decision.
-    async fn start_effects(&mut self, effects: Vec<Effect<Parsed>>) {
+    fn start_effects(&mut self, effects: Vec<Effect<Parsed>>) {
         for effect in effects {
-            self.start_effect(effect).await;
+            self.start_effect(effect);
         }
     }
 
-    async fn start_effect(&mut self, effect: Effect<Parsed>) {
+    fn start_effect(&mut self, effect: Effect<Parsed>) {
         match effect {
             Effect::CallModel { id, .. } => {
                 let request = history::request(
@@ -916,7 +916,6 @@ impl Session {
             }
             Effect::RunTool { call } => {
                 let id = call.effect();
-                barrier(Barrier::Dispatched(id)).await;
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 self.seams.tasks.spawn(run_tool(
@@ -1040,6 +1039,7 @@ async fn run_tool(
     cancel: CancellationToken,
     config: Arc<ShellConfig>,
 ) {
+    barrier(Barrier::Dispatched(id)).await;
     #[cfg(feature = "sim")]
     if config.planted == Planted::RunTwice {
         let (_, _) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;

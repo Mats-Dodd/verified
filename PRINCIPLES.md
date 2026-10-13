@@ -225,7 +225,8 @@ described in `AGENTS.md` and the code.
   coverage A B` prints what BFS reaches and seeds `A..A+B` do not, each gap
   classified, and the directed scenarios that close test gaps: each a BFS
   witness written out as a scenario, with the one ordering no seed promises
-  (two runs acting together) kept by a barrier.
+  (two runs acting together, or an interrupt durable before a run
+  starts) kept by a barrier.
 
 ## Deciding new work
 

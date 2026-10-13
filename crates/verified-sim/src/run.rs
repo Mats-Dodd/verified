@@ -8,6 +8,7 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use turmoil::barriers::{Barrier as SimBarrier, Reaction, Triggered};
+use verified_domain::Record;
 use verified_model::{Mismatch, Observed, Replayed};
 use verified_server::shell::Planted;
 use verified_server::shim::{Barrier, Observation};
@@ -17,7 +18,7 @@ use crate::driver;
 use crate::hosts::{self, ANTHROPIC, DAEMON, TUI};
 use crate::ledger::{self, Entry, Ledger, Stamped};
 use crate::model;
-use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
+use crate::scenario::{Aim, AimedCrash, Fault, Hold, Scenario};
 
 /// The seeds the simulation's tests run, each for a path it reaches
 /// (`tests/dst.rs`), and the seeds `processes` traces by default.
@@ -140,9 +141,10 @@ struct Aimed {
     passed: u32,
 }
 
-/// [`Scenario::ran_together`] until two runs have acted: the runs caught
-/// acting, each waiting before it reports.
-struct Together {
+/// [`Scenario::hold`] until its ordering is kept: the runs caught at its
+/// barrier, each waiting there.
+struct Held {
+    hold: Hold,
     barrier: SimBarrier<Barrier>,
     waiting: Vec<Triggered<Barrier>>,
 }
@@ -152,7 +154,7 @@ struct Faults {
     /// Every step still to take, by time (at one time, as scheduled).
     steps: VecDeque<(Duration, Step)>,
     aimed: Option<Aimed>,
-    together: Option<Together>,
+    held: Option<Held>,
     daemon_up: bool,
     /// Partitions of the TUI's link in force (they may overlap).
     partitioned: usize,
@@ -188,16 +190,18 @@ impl Faults {
             }),
             passed: 0,
         });
-        let together = scenario.ran_together.then(|| Together {
-            barrier: SimBarrier::build(Reaction::Suspend, |point: &Barrier| {
-                matches!(point, Barrier::ToolRan { .. })
+        let held = scenario.hold.map(|hold| Held {
+            hold,
+            barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
+                Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
+                Hold::InterruptedFirst => matches!(point, Barrier::Dispatched(_)),
             }),
             waiting: Vec::new(),
         });
         let mut faults = Self {
             steps: VecDeque::new(),
             aimed,
-            together,
+            held,
             daemon_up: true,
             partitioned: 0,
             model_partitioned: 0,
@@ -296,21 +300,27 @@ impl Faults {
         self.hold(sim, ledger);
     }
 
-    /// Keeps each run caught acting waiting until two have acted, then
-    /// releases both and forgets the barrier. A second run that never comes
-    /// holds the first until the run's time limit fails it.
+    /// Keeps each run caught at the hold's barrier waiting until its
+    /// ordering is kept, then releases them all and forgets the barrier:
+    /// two runs have acted, or the user's interrupt is durable. An ordering
+    /// never kept holds its runs until the run's time limit fails it.
     fn hold(&mut self, sim: &turmoil::Sim<'_>, ledger: &Ledger) {
         let now = sim.elapsed();
-        let Some(together) = self.together.as_mut() else {
+        let Some(held) = self.held.as_mut() else {
             return;
         };
-        while let Some(hit) = poll_once(together.barrier.wait()).flatten() {
+        while let Some(hit) = poll_once(held.barrier.wait()).flatten() {
             ledger.record_at(now, Entry::Fault(format!("held at {:?}", *hit)));
-            together.waiting.push(hit);
+            held.waiting.push(hit);
         }
-        if together.waiting.len() >= 2 {
-            ledger.record_at(now, Entry::Fault("two runs acted together".to_owned()));
-            self.together = None;
+        let kept = match held.hold {
+            Hold::RanTogether => (held.waiting.len() >= 2).then_some("two runs acted together"),
+            Hold::InterruptedFirst => (!held.waiting.is_empty() && ledger.with(interrupted))
+                .then_some("the interrupt is durable before the run starts"),
+        };
+        if let Some(kept) = kept {
+            ledger.record_at(now, Entry::Fault(kept.to_owned()));
+            self.held = None;
         }
     }
 
@@ -345,7 +355,7 @@ impl Faults {
     /// Ends every fault still in force, and strikes no more.
     fn heal(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger) {
         self.aimed = None;
-        self.together = None;
+        self.held = None;
         for (_, step) in core::mem::take(&mut self.steps) {
             match step {
                 Step::Strike(_) => {}
@@ -353,6 +363,15 @@ impl Faults {
             }
         }
     }
+}
+
+/// Whether a turn's `CancelRequested` is durable: the shell cancels the
+/// turn's runs as soon as it is.
+fn interrupted(entries: &[Stamped]) -> bool {
+    entries.iter().any(|stamped| {
+        matches!(&stamped.entry, Entry::Acked { records, .. }
+            if records.iter().any(|record| matches!(record, Record::CancelRequested { .. })))
+    })
 }
 
 /// Which of the daemon's links a fault holds partitioned.
