@@ -325,12 +325,6 @@ pub trait Log: Send + fmt::Debug {
     /// # Errors
     /// Any IO error; the caller crashes.
     async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError>;
-
-    /// Rereads the durable records from `seq` on.
-    ///
-    /// # Errors
-    /// IO errors, or a log that no longer replays.
-    async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError>;
 }
 
 /// The framed lines of a group commit from `first`, refused when a line
@@ -475,17 +469,6 @@ impl Log for FileLog {
         self.length = self.length.saturating_add(to_u64(bytes.len()));
         Ok(())
     }
-
-    async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError> {
-        let bytes = read(&self.path, self.max_file).await?;
-        let scan = scan(&bytes, self.max_line)
-            .map_err(|error| error.at(self.path.display().to_string()))?;
-        Ok(scan
-            .records
-            .into_iter()
-            .skip(usize::try_from(seq).unwrap_or(usize::MAX))
-            .collect())
-    }
 }
 
 /// Shared bytes standing in for a disk: what survives a simulated restart.
@@ -579,17 +562,6 @@ impl Log for MemLog {
         self.disk.append(self.session, &bytes);
         self.next = advance(self.next, records);
         Ok(())
-    }
-
-    async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError> {
-        let bytes = self.disk.bytes(self.session).unwrap_or_default();
-        let scan = scan(&bytes, self.max_line)
-            .map_err(|error| error.at(format!("mem:{}", self.session)))?;
-        Ok(scan
-            .records
-            .into_iter()
-            .skip(usize::try_from(seq).unwrap_or(usize::MAX))
-            .collect())
     }
 }
 

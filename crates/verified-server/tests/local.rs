@@ -390,13 +390,12 @@ async fn file_log_survives_reopen_and_cuts_a_torn_tail() {
     log.append(&[group(4)], 0)
         .await
         .expect("appends after the cut");
-    assert_eq!(
-        log.read_from(2).await.expect("rereads"),
-        vec![group(3), group(4)],
-        "read_from"
-    );
     let (_, records) = FileLog::open(&path, 1 << 20, 1 << 30).await.expect("clean");
-    assert_eq!(records.len(), 4, "clean after the cut");
+    assert_eq!(
+        records,
+        vec![group(1), group(2), group(3), group(4)],
+        "clean after the cut, holding what was appended after it"
+    );
 }
 
 #[tokio::test]

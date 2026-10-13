@@ -114,8 +114,4 @@ impl Log for WatchedLog {
         });
         Ok(())
     }
-
-    async fn read_from(&mut self, seq: u64) -> Result<Vec<Record<Parsed>>, LogError> {
-        self.inner.read_from(seq).await
-    }
 }
