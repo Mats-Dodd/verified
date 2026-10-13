@@ -57,13 +57,15 @@ impl Limits {
         self.steps_per_turn
     }
 
-    /// Tool calls one model response may have run; the rest fail by the limit.
+    /// Tool calls one model response may propose; those past the bound fail
+    /// without running.
     #[must_use]
     pub const fn calls_per_step(&self) -> usize {
         self.calls_per_step
     }
 
-    /// Tool calls one turn may have run across its steps.
+    /// Tool calls one turn may propose across its steps; those past the bound
+    /// fail without running.
     #[must_use]
     pub const fn calls_per_turn(&self) -> usize {
         self.calls_per_turn

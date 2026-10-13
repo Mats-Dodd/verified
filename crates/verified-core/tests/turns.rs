@@ -816,6 +816,36 @@ fn a_discarded_attempt_does_not_count_against_context() {
 }
 
 #[test]
+fn the_turn_budget_counts_proposals() {
+    let mut driver = Driver::new(limits(LimitsConfig {
+        calls_per_step: count(1),
+        calls_per_turn: count(2),
+        ..small_config()
+    }));
+    let call = driver.start();
+    let (_, effects) = driver.finish(
+        call,
+        vec![propose("read-a", Tool::Read), propose("read-b", Tool::Read)],
+    );
+    let read = single_run(&effects, "read-a");
+    let (_, effects) = driver.tool_done(read, Exit::Ok);
+    let from = driver.log.len();
+    let (_, effects) = driver.finish(model_call(&effects), vec![propose("read-c", Tool::Read)]);
+    assert!(
+        tool_runs(&effects).is_empty(),
+        "one call ran, but two were proposed: the turn's budget is spent"
+    );
+    assert!(
+        driver.since(from).contains(&result(
+            2,
+            Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))),
+            None
+        )),
+        "step 2's read fails by the limit"
+    );
+}
+
+#[test]
 fn calls_past_the_step_bound_are_recorded_and_fail() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
