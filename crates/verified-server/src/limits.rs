@@ -11,7 +11,7 @@ use verified_wire::WireLimits;
 pub struct ServerLimits {
     /// What the core enforces: turns, steps, calls, context, retries, group commit.
     pub core: Limits,
-    /// What the wire codecs enforce: bodies, SSE lines, chunks per read.
+    /// What the wire codecs enforce: bodies, SSE lines and events.
     pub wire: WireLimits,
     /// Sessions one daemon hosts.
     pub sessions: usize,
@@ -86,6 +86,12 @@ pub const RECORD_OVERHEAD: usize = 1024;
 /// omitted bytes and how the call ended.
 pub const OUTPUT_TRAILER: usize = 1024;
 
+/// How much larger a record's projected chunks may be than its log line:
+/// each chunk carries one of the record's payloads, escaped the same way,
+/// and its keys and ids at most double the record's. Tiny records' chunks
+/// may be larger still, within [`RECORD_OVERHEAD`].
+const PROJECTION_GROWTH: usize = 2;
+
 /// Records that end a turn besides one result per call of its step: its
 /// `CancelRequested`, a restart's `EpochBumped` and its `TurnEnded`.
 const CLOSING_RECORDS: usize = 3;
@@ -148,7 +154,9 @@ impl ServerLimits {
     /// their bounds, escaped. Model output has no bound of its own small
     /// enough; the shell splits it into batches within
     /// [`ServerLimits::record_budget`] and fails a call whose single part
-    /// or whose calls do not fit (`Limit::Record`).
+    /// or whose calls do not fit (`Limit::Record`). And that any record's
+    /// projection fits one stream read, so a client can follow every
+    /// record.
     ///
     /// # Errors
     /// A bound that does not fit, or a log file smaller than one line and
@@ -171,6 +179,13 @@ impl ServerLimits {
             "a record's frame",
             RECORD_OVERHEAD.checked_add(1),
             self.log_line_bytes,
+        )?;
+        fits(
+            "a record's projection in one stream read",
+            self.log_line_bytes
+                .checked_mul(PROJECTION_GROWTH)
+                .and_then(|bytes| bytes.checked_add(RECORD_OVERHEAD)),
+            self.wire.max_data_bytes(),
         )?;
         let file = usize::try_from(self.log_file_bytes).unwrap_or(usize::MAX);
         fits(
@@ -198,7 +213,7 @@ impl ServerLimits {
             model_response_timeout: Millis::new(60_000),
             model_idle_timeout: Millis::new(90_000),
             model_total_timeout: Millis::new(900_000),
-            log_line_bytes: 8 << 20,
+            log_line_bytes: 7 << 18,
             log_file_bytes: 1 << 30,
             file_bytes: 4 << 20,
             dir_entries: 1_000,

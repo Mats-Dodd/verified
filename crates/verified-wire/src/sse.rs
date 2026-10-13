@@ -32,6 +32,9 @@ pub enum SseError {
 /// The event name a stream uses when an event has no `event:` field.
 pub const DEFAULT_EVENT: &str = "message";
 
+/// What starts each line of an event's data.
+pub(crate) const DATA_FIELD: &str = "data: ";
+
 /// A comment line servers send to keep idle connections open.
 pub const KEEP_ALIVE: &str = ":\n\n";
 
@@ -79,7 +82,7 @@ impl SseEvent {
         out.push_str(&self.name);
         out.push('\n');
         for line in self.payload.split('\n') {
-            out.push_str("data: ");
+            out.push_str(DATA_FIELD);
             out.push_str(line);
             out.push('\n');
         }

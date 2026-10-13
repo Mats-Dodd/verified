@@ -66,8 +66,8 @@ pub enum ClientError {
     TooLarge { limit: usize },
     #[error("broken stream: {0}")]
     Stream(#[from] StreamError),
-    #[error("a read carried more than {limit} chunks before its control event")]
-    TooManyPending { limit: usize },
+    #[error("a read carried a second data event before its control event")]
+    UnpairedData,
     #[error("the daemon closed the stream before any read")]
     ClosedEarly,
     #[error("a read from offset {from} ended at {next} with {chunks} chunks")]
@@ -123,7 +123,7 @@ impl ClientError {
             | Self::Reply(_)
             | Self::TooLarge { .. }
             | Self::Stream(_)
-            | Self::TooManyPending { .. }
+            | Self::UnpairedData
             | Self::Offset { .. } => Recovery::GiveUp,
         }
     }
@@ -467,26 +467,24 @@ impl Client {
                 return Ok(LiveEnd::InboxClosed);
             }
             let mut decoder = SseDecoder::new(&wire);
-            let mut pending: Vec<UiChunk> = Vec::new();
+            // The server sends each read as at most one data event, then
+            // its control event: so at most one event is ever pending.
+            let mut pending: Option<Vec<UiChunk>> = None;
             while let Some(frame) = self.within(idle, async { Ok(body.frame().await) }).await? {
                 let Ok(bytes) = frame?.into_data() else {
                     continue;
                 };
                 for event in decoder.feed(&bytes) {
-                    match StreamEvent::from_sse(&event?, &wire)? {
+                    match StreamEvent::from_sse(&event?)? {
                         StreamEvent::Data(chunks) => {
-                            if pending.len().saturating_add(chunks.len()) > wire.max_chunks_per_read
-                            {
-                                return Err(ClientError::TooManyPending {
-                                    limit: wire.max_chunks_per_read,
-                                });
+                            if pending.replace(chunks).is_some() {
+                                return Err(ClientError::UnpairedData);
                             }
-                            pending.extend(chunks);
                         }
                         StreamEvent::Control(control) => {
                             let from = position.offset;
                             let next = control.stream_next_offset;
-                            let chunks = core::mem::take(&mut pending);
+                            let chunks = pending.take().unwrap_or_default();
                             // A read ends at or past its start, and one with
                             // chunks covers at least one record.
                             if next < from || (next == from && !chunks.is_empty()) {

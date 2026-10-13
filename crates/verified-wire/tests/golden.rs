@@ -233,7 +233,7 @@ fn over_the_wire(chunks: &[UiChunk], groups: &[usize], cuts: &[usize]) -> Vec<Ui
     for end in ends {
         for event in decoder.feed(bytes.get(start..end).unwrap_or_default()) {
             let event = event.expect("a well-formed stream");
-            match StreamEvent::from_sse(&event, &WireLimits::DEFAULT).expect("a stream event") {
+            match StreamEvent::from_sse(&event).expect("a stream event") {
                 StreamEvent::Data(group) => received.extend(group),
                 StreamEvent::Control(_) => {}
             }
@@ -268,6 +268,6 @@ proptest! {
         let (_, stream, _) = FIXTURES.get(fixture_index).copied().expect("in range");
         let sent = chunks(stream);
         let body = verified_wire::stream::encode_chunks(&sent);
-        prop_assert_eq!(decode_chunks(&body, &WireLimits::DEFAULT).ok(), Some(sent));
+        prop_assert_eq!(decode_chunks(&body).ok(), Some(sent));
     }
 }

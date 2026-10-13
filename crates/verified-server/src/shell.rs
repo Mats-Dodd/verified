@@ -378,7 +378,7 @@ pub struct Session {
     core: Core<Parsed>,
     log: Box<dyn Log>,
     records: Vec<Record<Parsed>>,
-    chunks: Vec<Vec<UiChunk>>,
+    chunks: Vec<Projected>,
     projector: Projector,
     seams: Seams,
     config: Arc<ShellConfig>,
@@ -434,7 +434,7 @@ impl Session {
         let mut held_bytes: usize = 0;
         let mut chunks = Vec::with_capacity(records.len());
         for record in &records {
-            let projected = projector.project(record);
+            let projected = Projected::new(projector.project(record));
             held_bytes = held_bytes
                 .checked_add(held(record, &projected))
                 .unwrap_or_else(|| defect("a session's bytes fit in usize"));
@@ -546,7 +546,7 @@ impl Session {
                 if let Err(corrupt) = self.core.apply(&record) {
                     defect(&format!("apply refused a decided record: {corrupt:?}"));
                 }
-                let projected = self.projector.project(&record);
+                let projected = Projected::new(self.projector.project(&record));
                 self.held_bytes = self
                     .held_bytes
                     .checked_add(held(&record, &projected))
@@ -851,18 +851,23 @@ impl Session {
             ReadFrom::Now => tail,
             ReadFrom::Offset(offset) => offset.seq().min(tail),
         };
-        let max = self.config.limits.wire.max_chunks_per_read;
+        // Records' arrays merged into one cost at most their lengths
+        // together. `ServerLimits::check` makes sure one record's fits.
+        let budget = self.config.limits.wire.max_data_bytes();
         let mut chunks = Vec::new();
+        let mut bytes: usize = 0;
         let mut next = start;
         while next < tail {
             let index = usize::try_from(next).expect("records in memory fit in usize");
-            let Some(record_chunks) = self.chunks.get(index) else {
+            let Some(projected) = self.chunks.get(index) else {
                 break;
             };
-            if !chunks.is_empty() && chunks.len().saturating_add(record_chunks.len()) > max {
+            let grown = bytes.saturating_add(projected.bytes);
+            if next > start && grown > budget {
                 break;
             }
-            chunks.extend(record_chunks.iter().cloned());
+            chunks.extend(projected.chunks.iter().cloned());
+            bytes = grown;
             next = next.saturating_add(1);
         }
         StreamRead {
@@ -1255,11 +1260,25 @@ impl ModelTask {
     }
 }
 
+/// One record's projected chunks, and their length as a JSON array: what
+/// they add to a read.
+struct Projected {
+    chunks: Vec<UiChunk>,
+    bytes: usize,
+}
+
+impl Projected {
+    fn new(chunks: Vec<UiChunk>) -> Self {
+        let bytes = encode_chunks(&chunks).len();
+        Self { chunks, bytes }
+    }
+}
+
 /// What `record` and its projected chunks hold in memory, as JSON bytes.
 /// A record that does not serialize is a defect: every payload has string
 /// keys.
-fn held(record: &Record<Parsed>, chunks: &[UiChunk]) -> usize {
-    json_len(record).saturating_add(encode_chunks(chunks).len())
+fn held(record: &Record<Parsed>, projected: &Projected) -> usize {
+    json_len(record).saturating_add(projected.bytes)
 }
 
 /// The verdict the user gave `call` in any turn, if any.

@@ -4,6 +4,8 @@
 //! parsed at startup and pass it in. Exceeding a bound is a typed error at the
 //! point of decoding, never silent growth.
 
+use crate::sse::DATA_FIELD;
+
 /// Size bounds for wire decoding and the transcript fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireLimits {
@@ -15,9 +17,6 @@ pub struct WireLimits {
     pub max_sse_line_bytes: usize,
     /// Largest SSE event data (all `data:` lines joined), in bytes.
     pub max_sse_event_bytes: usize,
-    /// Most chunks one Durable Streams read (an SSE `data` event or a
-    /// catch-up body) may carry.
-    pub max_chunks_per_read: usize,
     /// Most turns a transcript holds.
     pub max_turns: usize,
     /// Most parts one assistant reply holds.
@@ -35,10 +34,21 @@ impl WireLimits {
         max_message_text_bytes: 256 << 10,
         max_sse_line_bytes: 4 << 20,
         max_sse_event_bytes: 4 << 20,
-        max_chunks_per_read: 4096,
         max_turns: 1024,
         max_parts_per_reply: 1024,
         max_part_bytes: 1 << 20,
         max_errors_per_turn: 64,
     };
+
+    /// The most JSON one Durable Streams read (an SSE `data` event or a
+    /// catch-up body) carries: one `data:` line, within both SSE bounds.
+    #[must_use]
+    pub const fn max_data_bytes(&self) -> usize {
+        let line = self.max_sse_line_bytes.saturating_sub(DATA_FIELD.len());
+        if line < self.max_sse_event_bytes {
+            line
+        } else {
+            self.max_sse_event_bytes
+        }
+    }
 }

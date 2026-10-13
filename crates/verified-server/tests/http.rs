@@ -244,8 +244,7 @@ async fn commands_and_streams_over_http() {
             continue;
         };
         for event in decoder.feed(&bytes) {
-            match StreamEvent::from_sse(&event.expect("an event"), &limits).expect("a stream event")
-            {
+            match StreamEvent::from_sse(&event.expect("an event")).expect("a stream event") {
                 StreamEvent::Data(chunks) => {
                     for chunk in &chunks {
                         transcript.apply(chunk).expect("folds");
@@ -287,7 +286,7 @@ async fn commands_and_streams_over_http() {
     let (status, headers, body) =
         call(&client, Method::GET, stream.clone(), Vec::new(), None).await;
     assert_eq!(status, StatusCode::OK, "catch-up");
-    let chunks = decode_chunks(&body, &limits).expect("chunks");
+    let chunks = decode_chunks(&body).expect("chunks");
     let mut caught_up = Transcript::new(&limits);
     for chunk in &chunks {
         caught_up.apply(chunk).expect("folds");
@@ -489,7 +488,7 @@ async fn capacity_limits_answer_typed_rejections() {
     let mut ended = false;
     for _ in 0..500u32 {
         let (_, _, body) = call(&client, Method::GET, stream.clone(), Vec::new(), None).await;
-        let chunks = decode_chunks(&body, &wire).expect("chunks");
+        let chunks = decode_chunks(&body).expect("chunks");
         if chunks
             .iter()
             .any(|chunk| matches!(chunk, UiChunk::TurnEnded { .. }))

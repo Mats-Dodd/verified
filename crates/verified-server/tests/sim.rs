@@ -27,7 +27,8 @@ use verified_server::shim::{Barrier, fs, net};
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{CreateSession, MessageText, SendMessage};
-use verified_wire::stream::decode_chunks;
+use verified_wire::sse::SseDecoder;
+use verified_wire::stream::{Freshness, StreamEvent, decode_chunks};
 
 use std::time::Duration;
 
@@ -54,17 +55,35 @@ fn session() -> SessionId {
     SessionId::from_parts(epoch(), &[5; 10])
 }
 
-fn daemon_host() -> impl Fn() -> std::pin::Pin<Box<dyn Future<Output = turmoil::Result> + 'static>>
-{
-    daemon_host_with(|clock| Arc::new(FakeModel::new(clock, 1000)))
+type Host = std::pin::Pin<Box<dyn Future<Output = turmoil::Result> + 'static>>;
+
+fn fake(clock: Arc<dyn Clock>) -> Arc<dyn Model> {
+    Arc::new(FakeModel::new(clock, 1000))
 }
 
-fn daemon_host_with(
+fn daemon_host() -> impl Fn() -> Host {
+    daemon_host_with(fake)
+}
+
+fn daemon_host_with(model: fn(Arc<dyn Clock>) -> Arc<dyn Model>) -> impl Fn() -> Host {
+    daemon_host_of(model, ServerLimits::v0(), &[])
+}
+
+/// The daemon under `limits`, its project holding `files` (a name and a
+/// size each, filled with `x`).
+fn daemon_host_of(
     model: fn(Arc<dyn Clock>) -> Arc<dyn Model>,
-) -> impl Fn() -> std::pin::Pin<Box<dyn Future<Output = turmoil::Result> + 'static>> {
+    limits: ServerLimits,
+    files: &'static [(&'static str, usize)],
+) -> impl Fn() -> Host {
     move || {
+        let limits = limits.clone();
         Box::pin(async move {
             fs::create_dir_all("/project".as_ref()).await?;
+            for (name, size) in files {
+                let path = std::path::Path::new("/project").join(name);
+                fs::write_synced(&path, &vec![b'x'; *size]).await?;
+            }
             fs::sync_dir("/".as_ref()).await?;
             let world = World::new();
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
@@ -80,7 +99,7 @@ fn daemon_host_with(
                 world,
             };
             let config = ShellConfig {
-                limits: ServerLimits::v0(),
+                limits,
                 model: "fake".to_owned(),
                 system: String::new(),
                 planted: verified_server::shell::Planted::default(),
@@ -121,7 +140,38 @@ async fn chunks(client: &HttpClient) -> turmoil::Result<Vec<UiChunk>> {
         .body(Full::new(Bytes::new()))?;
     let response = client.request(request).await?;
     let body = response.into_body().collect().await?.to_bytes();
-    Ok(decode_chunks(&body, &WireLimits::DEFAULT)?)
+    Ok(decode_chunks(&body)?)
+}
+
+/// Follows the stream live from the start, through the real SSE decoder,
+/// until a control event says it is up to date: every chunk.
+async fn follow(client: &HttpClient) -> turmoil::Result<Vec<UiChunk>> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "http://daemon:{PORT}/sessions/{}/stream?offset=-1&live=sse",
+            session()
+        ))
+        .body(Full::new(Bytes::new()))?;
+    let mut body = client.request(request).await?.into_body();
+    let mut decoder = SseDecoder::new(&WireLimits::DEFAULT);
+    let mut chunks = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(bytes) = frame?.into_data() else {
+            continue;
+        };
+        for event in decoder.feed(&bytes) {
+            match StreamEvent::from_sse(&event?)? {
+                StreamEvent::Data(read) => chunks.extend(read),
+                StreamEvent::Control(control) => {
+                    if control.up_to_date == Freshness::UpToDate {
+                        return Ok(chunks);
+                    }
+                }
+            }
+        }
+    }
+    Err("the stream ended before it was up to date".into())
 }
 
 fn turn_ended(chunks: &[UiChunk]) -> bool {
@@ -239,6 +289,70 @@ fn crash_mid_group_commit_recovers() -> turmoil::Result {
                 return Ok(());
             }
             tokio::task::yield_now().await;
+        }
+    });
+    sim.run()
+}
+
+/// Over 4 MiB of tool output (70 reads of 64 KiB) is followed live from
+/// the start: no read is a data event too large for the client to decode.
+#[test]
+fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
+    let mut limits = ServerLimits::v0();
+    limits.core = verified_domain::Limits::parse(verified_domain::LimitsConfig {
+        context_bytes: core::num::NonZeroU64::new(64u64 << 20u32).expect("non-zero"),
+        ..verified_domain::LimitsConfig::v0()
+    })?;
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(600))
+        .build();
+    sim.host(
+        "daemon",
+        daemon_host_of(fake, limits, &[("big.txt", 64usize << 10u32)]),
+    );
+    sim.client("tui", async {
+        let client = client();
+        post(
+            &client,
+            "/sessions",
+            CreateSession {
+                session_id: session(),
+            }
+            .encode(),
+        )
+        .await?;
+        let reads = vec!["read big.txt"; 14].join(" ; ");
+        for turn in 1..=5u8 {
+            let message = SendMessage {
+                message_id: MessageId::from_parts(epoch(), &[turn; 10]),
+                text: MessageText::parse(reads.clone(), &WireLimits::DEFAULT)?,
+            };
+            // Refused while the last turn runs.
+            while post(
+                &client,
+                &format!("/sessions/{}/messages", session()),
+                message.encode(),
+            )
+            .await?
+                != 201
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        loop {
+            let chunks = follow(&client).await?;
+            let ended = chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, UiChunk::TurnEnded { .. }))
+                .count();
+            if ended == 5 {
+                let outputs = chunks
+                    .iter()
+                    .filter(|chunk| matches!(chunk, UiChunk::ToolOutputAvailable { .. }))
+                    .count();
+                assert_eq!(outputs, 70, "every read's output is followed");
+                return Ok(());
+            }
         }
     });
     sim.run()

@@ -604,7 +604,7 @@ fn explain(error: &ClientError) -> String {
         | ClientError::Reply(_)
         | ClientError::TooLarge { .. }
         | ClientError::Stream(_)
-        | ClientError::TooManyPending { .. }
+        | ClientError::UnpairedData
         | ClientError::ClosedEarly
         | ClientError::Offset { .. }
         | ClientError::TimedOut { .. } => error.to_string(),

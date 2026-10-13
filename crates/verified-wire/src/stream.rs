@@ -20,10 +20,9 @@
 use core::fmt;
 use core::str::FromStr;
 
-use serde::de::{self, DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::WireLimits;
 use crate::chunk::UiChunk;
 use crate::sse::{SseError, SseEvent};
 use verified_domain::id::{SessionId, UnixMillis};
@@ -79,8 +78,6 @@ pub enum StreamError {
     BadCursor,
     #[error("unknown stream event `{name}`")]
     UnknownEvent { name: String },
-    #[error("a read carries more than {limit} chunks")]
-    TooManyChunks { limit: usize },
     #[error("malformed stream JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -383,14 +380,14 @@ impl StreamEvent {
             .expect("event names are fixed tokens and JSON escapes carriage returns")
     }
 
-    /// The stream event an SSE event carries.
+    /// The stream event an SSE event carries; the decoder already bounded
+    /// its size.
     ///
     /// # Errors
-    /// An unknown event name, malformed JSON, or more chunks than
-    /// `limits.max_chunks_per_read`.
-    pub fn from_sse(event: &SseEvent, limits: &WireLimits) -> Result<Self, StreamError> {
+    /// An unknown event name, or malformed JSON.
+    pub fn from_sse(event: &SseEvent) -> Result<Self, StreamError> {
         match event.name() {
-            EVENT_DATA => decode_chunks(event.payload().as_bytes(), limits).map(Self::Data),
+            EVENT_DATA => decode_chunks(event.payload().as_bytes()).map(Self::Data),
             EVENT_CONTROL => Ok(Self::Control(serde_json::from_str(event.payload())?)),
             name => Err(StreamError::UnknownEvent {
                 name: name.to_owned(),
@@ -399,21 +396,12 @@ impl StreamEvent {
     }
 }
 
-/// A JSON array of chunks (an SSE `data` event or a catch-up body), at most
-/// `limits.max_chunks_per_read` long; checked while decoding.
+/// A JSON array of chunks (an SSE `data` event or a catch-up body).
 ///
 /// # Errors
-/// Malformed JSON, a malformed known chunk, or too many chunks.
-pub fn decode_chunks(json: &[u8], limits: &WireLimits) -> Result<Vec<UiChunk>, StreamError> {
-    let mut deserializer = serde_json::Deserializer::from_slice(json);
-    let chunks = BoundedChunks {
-        limit: limits.max_chunks_per_read,
-    }
-    .deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    chunks.ok_or(StreamError::TooManyChunks {
-        limit: limits.max_chunks_per_read,
-    })
+/// Malformed JSON, or a malformed known chunk.
+pub fn decode_chunks(json: &[u8]) -> Result<Vec<UiChunk>, StreamError> {
+    Ok(serde_json::from_slice(json)?)
 }
 
 /// Encodes chunks as a JSON array (a catch-up body).
@@ -423,43 +411,6 @@ pub fn decode_chunks(json: &[u8], limits: &WireLimits) -> Result<Vec<UiChunk>, S
 #[must_use]
 pub fn encode_chunks(chunks: &[UiChunk]) -> Vec<u8> {
     serde_json::to_vec(chunks).expect("chunks have string keys and serialize infallibly")
-}
-
-/// Decodes at most `limit` chunks; `None` when there are more (the rest are
-/// skipped without being kept).
-struct BoundedChunks {
-    limit: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for BoundedChunks {
-    type Value = Option<Vec<UiChunk>>;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_seq(self)
-    }
-}
-
-impl<'de> Visitor<'de> for BoundedChunks {
-    type Value = Option<Vec<UiChunk>>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an array of chunks")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut chunks = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.limit));
-        while chunks.len() < self.limit {
-            match seq.next_element()? {
-                Some(chunk) => chunks.push(chunk),
-                None => return Ok(Some(chunks)),
-            }
-        }
-        if seq.next_element::<IgnoredAny>()?.is_none() {
-            return Ok(Some(chunks));
-        }
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -511,37 +462,19 @@ mod tests {
             sse.payload(),
             r#"{"streamNextOffset":"0000000000000003","streamCursor":"9","upToDate":true}"#
         );
-        assert_eq!(
-            StreamEvent::from_sse(&sse, &WireLimits::DEFAULT).ok(),
-            Some(control)
-        );
+        assert_eq!(StreamEvent::from_sse(&sse).ok(), Some(control));
     }
 
     #[test]
-    fn data_events_are_bounded_and_unknown_events_rejected() {
-        let limits = WireLimits {
-            max_chunks_per_read: 2,
-            ..WireLimits::DEFAULT
-        };
+    fn data_events_round_trip_and_unknown_events_are_rejected() {
         let two = StreamEvent::Data(vec![UiChunk::StartStep, UiChunk::FinishStep]);
-        assert_eq!(
-            StreamEvent::from_sse(&two.to_sse(), &limits).ok(),
-            Some(two)
-        );
-        let three = StreamEvent::Data(vec![UiChunk::StartStep; 3]);
-        assert!(matches!(
-            StreamEvent::from_sse(&three.to_sse(), &limits),
-            Err(StreamError::TooManyChunks { limit: 2 })
-        ));
+        assert_eq!(StreamEvent::from_sse(&two.to_sse()).ok(), Some(two));
         let other = SseEvent::new("other".to_owned(), "[]".to_owned()).expect("an event");
         assert!(matches!(
-            StreamEvent::from_sse(&other, &limits),
+            StreamEvent::from_sse(&other),
             Err(StreamError::UnknownEvent { .. })
         ));
-        assert!(matches!(
-            decode_chunks(b"[] x", &limits),
-            Err(StreamError::Json(_))
-        ));
+        assert!(matches!(decode_chunks(b"[] x"), Err(StreamError::Json(_))));
     }
 
     #[test]
