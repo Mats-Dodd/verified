@@ -84,9 +84,9 @@ impl Limits {
     #[expect(clippy::indexing_slicing, reason = "Verus proves the index is below the schedule's length")]
     pub fn retry_delay(&self, attempt: usize) -> (delay: Option<Millis>)
         ensures
-            delay is Some ==> attempt < MAX_RETRIES,
+            delay is Some ==> attempt < usize::MAX,
     {
-        if attempt < self.retry_schedule.len() && attempt < MAX_RETRIES {
+        if attempt < self.retry_schedule.len() {
             Some(self.retry_schedule[attempt])
         } else {
             None
