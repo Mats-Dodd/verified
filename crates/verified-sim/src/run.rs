@@ -123,9 +123,11 @@ impl RunError {
     }
 }
 
-/// What the harness must undo later.
+/// What the harness does at a simulated time: a fault strikes, or one it
+/// struck ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Undo {
+enum Step {
+    Strike(Fault),
     Bounce,
     Repair,
     RepairModel,
@@ -147,8 +149,8 @@ struct Together {
 
 /// The faults of a run, applied as simulated time passes.
 struct Faults {
-    due: VecDeque<(Duration, Fault)>,
-    undo: Vec<(Duration, Undo)>,
+    /// Every step still to take, by time (at one time, as scheduled).
+    steps: VecDeque<(Duration, Step)>,
     aimed: Option<Aimed>,
     together: Option<Together>,
     daemon_up: bool,
@@ -192,15 +194,24 @@ impl Faults {
             }),
             waiting: Vec::new(),
         });
-        Self {
-            due: scenario.faults.iter().copied().collect(),
-            undo: Vec::new(),
+        let mut faults = Self {
+            steps: VecDeque::new(),
             aimed,
             together,
             daemon_up: true,
             partitioned: 0,
             model_partitioned: 0,
+        };
+        for (at, fault) in &scenario.faults {
+            faults.schedule(*at, Step::Strike(*fault));
         }
+        faults
+    }
+
+    /// Schedules `step` at `at`, after every step already due by then.
+    fn schedule(&mut self, at: Duration, step: Step) {
+        let index = self.steps.partition_point(|(other, _)| *other <= at);
+        self.steps.insert(index, (at, step));
     }
 
     const fn links(&self) -> Links {
@@ -215,27 +226,54 @@ impl Faults {
         crash_daemon(sim, self.links());
         self.daemon_up = false;
         ledger.record_at(now, Entry::Fault(why));
-        self.undo.push((now.saturating_add(down), Undo::Bounce));
+        self.schedule(now.saturating_add(down), Step::Bounce);
     }
 
-    fn undo(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger, undo: Undo) {
+    fn take(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger, step: Step) {
         let now = sim.elapsed();
-        match undo {
-            Undo::Bounce => {
+        match step {
+            Step::Strike(Fault::Crash { down }) => {
+                if self.daemon_up {
+                    self.crash(sim, ledger, format!("daemon crashes for {down:?}"), down);
+                }
+            }
+            Step::Strike(Fault::Partition { lasting }) => {
+                if self.partitioned == 0 {
+                    sim.partition(TUI, DAEMON);
+                }
+                self.partitioned = self.partitioned.saturating_add(1);
+                ledger.record_at(
+                    now,
+                    Entry::Fault(format!("the TUI link partitions for {lasting:?}")),
+                );
+                self.schedule(now.saturating_add(lasting), Step::Repair);
+            }
+            Step::Strike(Fault::ModelPartition { lasting }) => {
+                if self.model_partitioned == 0 {
+                    sim.partition(DAEMON, ANTHROPIC);
+                }
+                self.model_partitioned = self.model_partitioned.saturating_add(1);
+                ledger.record_at(
+                    now,
+                    Entry::Fault(format!("the model link partitions for {lasting:?}")),
+                );
+                self.schedule(now.saturating_add(lasting), Step::RepairModel);
+            }
+            Step::Bounce => {
                 if !self.daemon_up {
                     sim.bounce(DAEMON);
                     self.daemon_up = true;
                     ledger.record_at(now, Entry::Fault("daemon restarts".to_owned()));
                 }
             }
-            Undo::Repair => {
+            Step::Repair => {
                 self.partitioned = self.partitioned.saturating_sub(1);
                 if self.partitioned == 0 {
                     sim.repair(TUI, DAEMON);
                     ledger.record_at(now, Entry::Fault("the TUI link heals".to_owned()));
                 }
             }
-            Undo::RepairModel => {
+            Step::RepairModel => {
                 self.model_partitioned = self.model_partitioned.saturating_sub(1);
                 if self.model_partitioned == 0 {
                     sim.repair(DAEMON, ANTHROPIC);
@@ -245,53 +283,14 @@ impl Faults {
         }
     }
 
-    /// Applies what is due at the simulation's current time.
+    /// Takes every step due at the simulation's current time.
     fn tick(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger) {
         let now = sim.elapsed();
-        while let Some((at, fault)) = self.due.front().copied() {
-            if at > now {
-                break;
-            }
-            self.due.pop_front();
-            match fault {
-                Fault::Crash { down } => {
-                    if self.daemon_up {
-                        self.crash(sim, ledger, format!("daemon crashes for {down:?}"), down);
-                    }
-                }
-                Fault::Partition { lasting } => {
-                    if self.partitioned == 0 {
-                        sim.partition(TUI, DAEMON);
-                    }
-                    self.partitioned = self.partitioned.saturating_add(1);
-                    ledger.record_at(
-                        now,
-                        Entry::Fault(format!("the TUI link partitions for {lasting:?}")),
-                    );
-                    self.undo.push((now.saturating_add(lasting), Undo::Repair));
-                }
-                Fault::ModelPartition { lasting } => {
-                    if self.model_partitioned == 0 {
-                        sim.partition(DAEMON, ANTHROPIC);
-                    }
-                    self.model_partitioned = self.model_partitioned.saturating_add(1);
-                    ledger.record_at(
-                        now,
-                        Entry::Fault(format!("the model link partitions for {lasting:?}")),
-                    );
-                    self.undo
-                        .push((now.saturating_add(lasting), Undo::RepairModel));
-                }
-            }
-        }
-        let mut index = 0;
-        while let Some((at, undo)) = self.undo.get(index).copied() {
-            if at <= now {
-                self.undo.remove(index);
-                self.undo(sim, ledger, undo);
-            } else {
-                index = index.saturating_add(1);
-            }
+        while let Some((at, step)) = self.steps.front().copied()
+            && at <= now
+        {
+            self.steps.pop_front();
+            self.take(sim, ledger, step);
         }
         self.aim(sim, ledger);
         self.hold(sim, ledger);
@@ -343,13 +342,15 @@ impl Faults {
         }
     }
 
-    /// Undoes everything still in force.
+    /// Ends every fault still in force, and strikes no more.
     fn heal(&mut self, sim: &mut turmoil::Sim<'_>, ledger: &Ledger) {
         self.aimed = None;
         self.together = None;
-        self.due.clear();
-        for (_, undo) in core::mem::take(&mut self.undo) {
-            self.undo(sim, ledger, undo);
+        for (_, step) in core::mem::take(&mut self.steps) {
+            match step {
+                Step::Strike(_) => {}
+                Step::Bounce | Step::Repair | Step::RepairModel => self.take(sim, ledger, step),
+            }
         }
     }
 }
