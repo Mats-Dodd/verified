@@ -19,6 +19,10 @@ use crate::ledger::{self, Entry, Ledger, Stamped};
 use crate::model;
 use crate::scenario::{Aim, AimedCrash, Fault, Scenario};
 
+/// The seeds the simulation's tests run, each for a path it reaches
+/// (`tests/dst.rs`), and the seeds `processes` traces by default.
+pub const FIXED: [u64; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 342, 818];
+
 /// The most entries one run's ledger holds.
 const LEDGER_CAPACITY: usize = 100_000;
 /// The longest a run may take, in simulated time, before it counts as stuck.

@@ -4,10 +4,11 @@
 //! Every seed runs twice and the two traces must match before any invariant
 //! is judged: a check over a nondeterministic run proves nothing.
 //!
-//! Replay a failing seed with `cargo run -p verified-sim -- replay --seed N --trace`.
-//! Two runs in one process cannot see randomness drawn once per process;
-//! `just sim` also runs `verified-sim processes`, which traces each fixed
-//! seed in two fresh processes.
+//! Run a failing seed again with `cargo run -p verified-sim -- run --from N
+//! --count 1`, and see its trace with `cargo run -p verified-sim -- trace
+//! --seed N`. Two runs in one process cannot see randomness drawn once per
+//! process; `just sim` also runs `verified-sim processes`, which traces each
+//! fixed seed in two fresh processes.
 
 use core::time::Duration;
 use std::collections::BTreeMap;
@@ -105,9 +106,6 @@ seeds! {
     // world goes on during a sync, and only a run seen doing so pins that.
     seed_342 = 342;
 }
-
-/// The seeds the suite runs, each in its own test above.
-const FIXED: [u64; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 342, 818];
 
 /// Whether the scripted user did `what`.
 fn user(outcome: &Outcome, what: &str) -> bool {
@@ -243,7 +241,7 @@ fn the_fixed_seeds_reach_every_fault_path() {
             command_and_two_edits_act,
         ),
     ];
-    let outcomes: Vec<Outcome> = FIXED
+    let outcomes: Vec<Outcome> = run::FIXED
         .iter()
         .map(|seed| once(*seed, Planted::default()))
         .collect();
@@ -383,7 +381,7 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
 #[test]
 fn the_fixed_seeds_replay_every_kind_of_step() {
     let mut taken = std::collections::BTreeSet::new();
-    for seed in FIXED {
+    for seed in run::FIXED {
         let replayed = once(seed, Planted::default())
             .verdict()
             .map_err(|broken| broken.to_string())
@@ -516,15 +514,4 @@ fn without_its_hold_a_directed_scenario_misses_its_target() {
         matches!(directed::run(&apart), Err(DirectedError::Missed { .. })),
         "the target is reached without the hold, so the hold proves nothing"
     );
-}
-
-/// How many seeds the nightly sweep runs.
-const SWEEP: u64 = 500;
-
-#[test]
-#[ignore = "nightly sweep; run with --ignored, or `just sweep`"]
-fn sweep() {
-    for index in 0..SWEEP {
-        seed(1_000u64.saturating_add(index));
-    }
 }

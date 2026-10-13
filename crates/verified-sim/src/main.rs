@@ -1,12 +1,11 @@
 //! `verified-sim`: run simulation seeds outside the test harness.
 //!
 //! ```text
-//! verified-sim sweep --from 0 --count 1000   # nightly (`just sweep`): many seeds, each run twice
-//! verified-sim replay --seed 42 --trace      # one seed, with its full trace
-//! verified-sim trace --seed 42               # one run of one seed, its trace only
-//! verified-sim processes --from 0 --count 8  # each seed in two fresh processes
-//! verified-sim coverage --from 0 --count 200 # model coverage: the gap table
-//! verified-sim directed --name NAME         # one directed scenario, twice
+//! verified-sim run --from 0 --count 1000     # nightly (`just sweep`): many seeds, each run twice
+//! verified-sim run --directed NAME           # one directed scenario, twice
+//! verified-sim trace --seed 42               # one run of one seed, its trace
+//! verified-sim processes                     # each fixed seed in two fresh processes
+//! verified-sim coverage --count 200          # model coverage: the gap table
 //! ```
 //!
 //! `processes` catches what running a seed twice in one process cannot:
@@ -30,50 +29,43 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Runs `count` seeds from `from`, each twice, and stops at the first failure.
-    Sweep {
-        #[arg(long, default_value_t = 0)]
+    /// Runs `count` seeds from `from`, each twice, and stops at the first
+    /// failure; or one directed scenario, twice.
+    Run {
+        #[arg(long, default_value_t = 0, conflicts_with = "directed")]
         from: u64,
-        #[arg(long, default_value_t = 100)]
-        count: u64,
-    },
-    /// Runs one seed twice and reports it.
-    Replay {
+        #[arg(
+            long,
+            required_unless_present = "directed",
+            conflicts_with = "directed"
+        )]
+        count: Option<u64>,
+        /// The directed scenario to run, by name.
         #[arg(long)]
-        seed: u64,
-        /// Prints the whole trace.
-        #[arg(long)]
-        trace: bool,
-    },
-    /// Traces each seed in two fresh processes and compares them.
-    Processes {
-        #[arg(long, default_value_t = 0)]
-        from: u64,
-        #[arg(long, default_value_t = 8)]
-        count: u64,
-    },
-    /// Prints the coverage keys BFS reaches under the model checks' bounds
-    /// against those the seeds reach, and each gap classified.
-    Coverage {
-        #[arg(long, default_value_t = 0)]
-        from: u64,
-        #[arg(long, default_value_t = 200)]
-        count: u64,
-    },
-    /// Runs one directed scenario twice and prints the coverage keys its
-    /// replay reached.
-    Directed {
-        #[arg(long)]
-        name: String,
+        directed: Option<String>,
     },
     /// Runs one seed once and prints its trace (diff two of these to find
     /// nondeterminism).
     Trace {
         #[arg(long)]
         seed: u64,
-        /// Runs it this many times in this process, one trace after another.
-        #[arg(long, default_value_t = 1)]
-        runs: u32,
+    },
+    /// Traces each seed in two fresh processes and compares them: the
+    /// fixed seeds, or `count` from `from`.
+    Processes {
+        #[arg(long, requires = "count")]
+        from: Option<u64>,
+        #[arg(long, requires = "from")]
+        count: Option<u64>,
+    },
+    /// Prints the coverage keys BFS reaches under the model checks' bounds
+    /// against those `count` seeds from `from` reach, and each gap
+    /// classified.
+    Coverage {
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long)]
+        count: u64,
     },
 }
 
@@ -141,33 +133,43 @@ fn main() -> Result<(), Failure> {
     let args = Args::parse();
     let mut out = io::stdout().lock();
     match args.command {
-        Command::Sweep { from, count } => {
-            for seed in from..from.saturating_add(count) {
-                let outcome = run::twice(&Scenario::from_seed(seed))?;
-                report(&mut out, outcome)?;
+        Command::Run {
+            directed: Some(name),
+            ..
+        } => {
+            let chosen = directed::named(&name).ok_or(Failure::NoDirected(name))?;
+            writeln!(out, "target: {}\n{:#?}", chosen.target, chosen.scenario)?;
+            for key in directed::run(&chosen)?.keys {
+                writeln!(out, "  reached {key}")?;
             }
             Ok(())
         }
-        Command::Replay { seed, trace } => {
-            let outcome = match run::twice(&Scenario::from_seed(seed)) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    for line in error.trace() {
-                        writeln!(out, "{line}")?;
-                    }
-                    return Err(error.into());
-                }
-            };
-            writeln!(out, "{:#?}", outcome.scenario)?;
-            if trace {
-                for line in outcome.trace() {
-                    writeln!(out, "{line}")?;
-                }
+        Command::Run {
+            from,
+            count,
+            directed: None,
+        } => {
+            for seed in from..from.saturating_add(count.unwrap_or_default()) {
+                report(&mut out, run::twice(&Scenario::from_seed(seed))?)?;
             }
-            report(&mut out, outcome)
+            Ok(())
+        }
+        Command::Trace { seed } => {
+            let trace = match run::once(&Scenario::from_seed(seed), Planted::default()) {
+                Ok(outcome) => outcome.trace(),
+                Err(error) => error.trace().to_vec(),
+            };
+            for line in &trace {
+                writeln!(out, "{line}")?;
+            }
+            Ok(())
         }
         Command::Processes { from, count } => {
-            for seed in from..from.saturating_add(count) {
+            let seeds: Vec<u64> = match from.zip(count) {
+                Some((from, count)) => (from..from.saturating_add(count)).collect(),
+                None => run::FIXED.to_vec(),
+            };
+            for seed in seeds {
                 let first = trace_in_process(seed)?;
                 let second = trace_in_process(seed)?;
                 if first != second {
@@ -186,27 +188,6 @@ fn main() -> Result<(), Failure> {
             let simulated = coverage::simulated(from, count)?;
             let modelled = coverage::modelled();
             coverage::table(&mut out, (from, count), &modelled, &simulated)?;
-            Ok(())
-        }
-        Command::Directed { name } => {
-            let chosen = directed::named(&name).ok_or(Failure::NoDirected(name))?;
-            writeln!(out, "target: {}\n{:#?}", chosen.target, chosen.scenario)?;
-            for key in directed::run(&chosen)?.keys {
-                writeln!(out, "  reached {key}")?;
-            }
-            Ok(())
-        }
-        Command::Trace { seed, runs } => {
-            for run in 0..runs {
-                let trace = match run::once(&Scenario::from_seed(seed), Planted::default()) {
-                    Ok(outcome) => outcome.trace(),
-                    Err(error) => error.trace().to_vec(),
-                };
-                writeln!(out, "run {run}")?;
-                for line in &trace {
-                    writeln!(out, "{line}")?;
-                }
-            }
             Ok(())
         }
     }

@@ -33,17 +33,17 @@ test-ci:
 # Deterministic simulation first: every fixed seed runs twice and the two
 # traces must match before any world invariant is judged, then the same seeds
 # run in two fresh processes (randomness drawn per process would make a
-# failing seed impossible to replay). The nightly sweep is `just sweep`;
-# replay a seed with `cargo run -p verified-sim -- replay --seed N --trace`.
+# failing seed impossible to replay). The nightly sweep is `just sweep`; see
+# a seed's trace with `cargo run -p verified-sim -- trace --seed N`.
 sim:
     cargo nextest run -p verified-sim --profile ci
-    cargo run --quiet -p verified-sim -- processes --from 0 --count 8
+    cargo run --quiet -p verified-sim -- processes
 
 # Many seeds, each run twice, optimized but unwinding (`sim-release`: a
 # daemon panic crashes its simulated host and fails the seed, where the
 # release profile's `panic = "abort"` would end the sweep).
 sweep from="0" count="1000":
-    cargo run --quiet --profile sim-release -p verified-sim -- sweep --from {{from}} --count {{count}}
+    cargo run --quiet --profile sim-release -p verified-sim -- run --from {{from}} --count {{count}}
 
 # Model coverage: the coverage keys the seeds reach (each run replayed
 # through the model) against those BFS reaches under the model checks'
@@ -51,8 +51,8 @@ sweep from="0" count="1000":
 coverage from="0" count="200":
     cargo run --quiet --profile sim-release -p verified-sim -- coverage --from {{from}} --count {{count}}
 
-# Each seed traced in two fresh processes.
-processes from="0" count="100":
+# Each of `count` seeds from `from` traced in two fresh processes.
+processes from count:
     cargo run --quiet --profile sim-release -p verified-sim -- processes --from {{from}} --count {{count}}
 
 # The shipped binary never links the simulation shims (the `sim` features of
