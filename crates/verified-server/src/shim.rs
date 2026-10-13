@@ -28,6 +28,10 @@ pub mod net {
     }
 
     #[cfg(not(feature = "sim"))]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the shim is where the daemon's real listener is bound"
+    )]
     mod real {
         use std::io;
         use std::net::SocketAddr;
@@ -41,10 +45,6 @@ pub mod net {
         }
 
         impl Listener {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the shim is where the daemon's real listener is bound"
-            )]
             pub(super) async fn bind(addr: SocketAddr) -> io::Result<Self> {
                 tokio::net::TcpListener::bind(addr)
                     .await
@@ -205,6 +205,7 @@ pub mod net {
     not(feature = "sim"),
     expect(
         clippy::disallowed_methods,
+        clippy::disallowed_types,
         reason = "the shim is where the real filesystem is used; under sim it is turmoil's"
     )
 )]
@@ -219,7 +220,9 @@ pub mod fs {
     #[cfg(feature = "sim")]
     use turmoil::fs::shim::tokio::fs as backend;
 
-    pub use backend::File;
+    /// An open file. An alias, not a re-export, so naming it outside the
+    /// shim is not naming the backend's type.
+    pub type File = backend::File;
 
     /// What a directory entry is.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

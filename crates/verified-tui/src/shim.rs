@@ -5,10 +5,16 @@
 /// shipped binary refuses to compile when it is true.
 pub const SIMULATED: bool = cfg!(feature = "sim");
 
+/// The client's TCP stream. An alias, not a re-export, so naming it outside
+/// the shim is not naming tokio's type.
 #[cfg(not(feature = "sim"))]
-pub use tokio::net::TcpStream;
+#[expect(
+    clippy::disallowed_types,
+    reason = "the shim is where the client's real stream is chosen"
+)]
+pub type TcpStream = tokio::net::TcpStream;
 #[cfg(feature = "sim")]
-pub use turmoil::net::TcpStream;
+pub type TcpStream = turmoil::net::TcpStream;
 
 #[cfg(feature = "sim")]
 pub use sim::SimClock;
