@@ -143,7 +143,7 @@ fn main() -> Result<(), Failure> {
             Ok(())
         }
         Command::Trace { seed } => {
-            let trace = match run::once(&Scenario::from_seed(seed), Planted::default()) {
+            let trace = match run::once(&Scenario::from_seed(seed), Planted::None) {
                 Ok(outcome) => outcome.trace(),
                 Err(error) => error.trace().to_vec(),
             };

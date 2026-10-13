@@ -91,28 +91,31 @@ pub struct ShellConfig {
     pub model: String,
     /// The system prompt.
     pub system: String,
-    /// Deliberate defects a simulation plants to show its checks catch
-    /// them. Empty without the `sim` feature.
+    /// A deliberate defect a simulation plants to show its checks catch it.
+    /// Always [`Planted::None`] without the `sim` feature.
     pub planted: Planted,
 }
 
-/// Deliberate defects, for the simulation's mutation tests. Without the
-/// `sim` feature there are none: the shipped daemon cannot plant one.
+/// A deliberate defect, for the simulation's mutation tests. Without the
+/// `sim` feature there is none: the shipped daemon cannot plant one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Planted {
+pub enum Planted {
+    #[default]
+    None,
     /// Start tool runs before their decision is durable (breaks Law 2:
-    /// persist before acting). The world check I1 must catch it.
+    /// persist before acting). The model's replay must catch the run it
+    /// has not started.
     #[cfg(feature = "sim")]
-    pub run_before_persist: bool,
+    RunBeforePersist,
     /// Run each tool twice, reporting once (breaks at-most-once inside one
-    /// dispatch). The model's replay must catch the second act.
+    /// dispatch). The replay must catch the second act.
     #[cfg(feature = "sim")]
-    pub run_twice: bool,
+    RunTwice,
     /// Persist an `Unknown` result as `Interrupted` (breaks U4 in the shell,
     /// below the core). The replay must catch the durable records differing
     /// from the decided ones.
     #[cfg(feature = "sim")]
-    pub unknown_as_interrupted: bool,
+    UnknownAsInterrupted,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -511,7 +514,7 @@ impl Session {
             outcome,
         } = decision;
         #[cfg(feature = "sim")]
-        let records = if self.config.planted.unknown_as_interrupted {
+        let records = if self.config.planted == Planted::UnknownAsInterrupted {
             unknown_as_interrupted(records)
         } else {
             records
@@ -521,7 +524,7 @@ impl Session {
         #[cfg(feature = "sim")]
         let effects = {
             let mut effects = effects;
-            if self.config.planted.run_before_persist {
+            if self.config.planted == Planted::RunBeforePersist {
                 for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
                 {
                     self.start_effect(run).await;
@@ -1036,7 +1039,7 @@ async fn run_tool(
     config: Arc<ShellConfig>,
 ) {
     #[cfg(feature = "sim")]
-    if config.planted.run_twice {
+    if config.planted == Planted::RunTwice {
         let (_, _) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
     }
     let (exit, output) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;

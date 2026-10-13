@@ -418,7 +418,7 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
         limits: ServerLimits::v0(),
         model: "fake".to_owned(),
         system: String::new(),
-        planted: verified_server::shell::Planted::default(),
+        planted: verified_server::shell::Planted::None,
     };
     let listener = net::bind("127.0.0.1:0".parse().expect("an addr"))
         .await
@@ -507,7 +507,7 @@ fn panicking_daemon() {
             limits: limits.clone(),
             model: "fake".to_owned(),
             system: String::new(),
-            planted: verified_server::shell::Planted::default(),
+            planted: verified_server::shell::Planted::None,
         };
         let store = Arc::new(verified_server::log::MemLogStore::new(
             verified_server::log::MemDisk::new(),

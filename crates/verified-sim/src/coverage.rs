@@ -76,7 +76,7 @@ pub struct Simulated {
 pub fn simulated(from: u64, count: u64) -> Result<Simulated, CoverageError> {
     let mut simulated = Simulated::default();
     for seed in from..from.saturating_add(count) {
-        let outcome = run::once(&Scenario::from_seed(seed), Planted::default())?;
+        let outcome = run::once(&Scenario::from_seed(seed), Planted::None)?;
         for key in outcome.verdict()?.keys {
             simulated.seeds.entry(key).or_default().push(seed);
         }

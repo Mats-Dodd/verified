@@ -101,7 +101,7 @@ async fn start_with(limits: ServerLimits) -> (SocketAddr, World) {
         limits: limits.clone(),
         model: "claude-test".to_owned(),
         system: "test".to_owned(),
-        planted: verified_server::shell::Planted::default(),
+        planted: verified_server::shell::Planted::None,
     };
     let store = Arc::new(MemLogStore::new(
         MemDisk::new(),

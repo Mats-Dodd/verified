@@ -167,7 +167,7 @@ async fn run_daemon(project: PathBuf, model: String, api_key: ApiKey) -> Result<
         limits,
         model,
         system: SYSTEM.to_owned(),
-        planted: verified_server::shell::Planted::default(),
+        planted: verified_server::shell::Planted::None,
     };
     daemon::run(listener, &Layout { project }, &FileLock, seams, config).await?;
     Ok(())

@@ -218,7 +218,7 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
         limits: limits.clone(),
         model: "fake".to_owned(),
         system: "You are a test.".to_owned(),
-        planted: verified_server::shell::Planted::default(),
+        planted: verified_server::shell::Planted::None,
     });
     let (fatal, failed) = mpsc::channel(1);
     let store = Arc::new(MemLogStore::new(
@@ -823,7 +823,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
         limits: limits(),
         model: "fake".to_owned(),
         system: String::new(),
-        planted: verified_server::shell::Planted::default(),
+        planted: verified_server::shell::Planted::None,
     });
     let refused = daemon::boot(
         Arc::new(MemLogStore::new(disk.clone(), 1 << 20, 1 << 30)),

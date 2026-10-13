@@ -102,7 +102,7 @@ fn daemon_host_of(
                 limits,
                 model: "fake".to_owned(),
                 system: String::new(),
-                planted: verified_server::shell::Planted::default(),
+                planted: verified_server::shell::Planted::None,
             };
             let listener =
                 net::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT)).await?;

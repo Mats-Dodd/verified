@@ -424,7 +424,7 @@ mod tests {
             limits: limits.clone(),
             model: "fake".to_owned(),
             system: "You are a test.".to_owned(),
-            planted: Planted::default(),
+            planted: Planted::None,
         });
         let store = Arc::new(MemLogStore::new(
             MemDisk::new(),

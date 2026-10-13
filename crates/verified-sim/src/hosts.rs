@@ -102,7 +102,7 @@ async fn project_files() -> turmoil::Result<BTreeMap<String, String>> {
 }
 
 /// The daemon under `limits`, booting (and rebooting after each crash) from
-/// its disk, with the defects `planted` (none, but in the simulation's
+/// its disk, with the defect `planted` (none, but in the simulation's
 /// mutation tests).
 pub fn daemon(
     ledger: Ledger,

@@ -406,9 +406,9 @@ fn failed(seed: u64, sim: &turmoil::Sim<'_>, ledger: &Ledger, reason: String) ->
     }
 }
 
-/// Runs `scenario` (its seed draws everything it leaves open), with defects
-/// `planted` in the daemon (none, but in the mutation tests), and judges
-/// it.
+/// Runs `scenario` (its seed draws everything it leaves open), with the
+/// defect `planted` in the daemon (none, but in the mutation tests), and
+/// judges it.
 ///
 /// # Errors
 /// A host failed (the daemon returned an error or the TUI stopped early),
@@ -490,8 +490,8 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
 /// # Errors
 /// Either run failed, or the traces differ.
 pub fn twice(scenario: &Scenario) -> Result<Outcome, RunError> {
-    let first = once(scenario, Planted::default())?;
-    let second = once(scenario, Planted::default())?;
+    let first = once(scenario, Planted::None)?;
+    let second = once(scenario, Planted::None)?;
     let (trace, other) = (first.trace(), second.trace());
     if trace == other {
         return Ok(first);

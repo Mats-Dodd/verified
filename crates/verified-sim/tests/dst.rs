@@ -44,7 +44,7 @@ fn seed(seed: u64) {
         .expect("the run breaks nothing");
 }
 
-/// One run of `seed`, with the defects `planted` in the daemon.
+/// One run of `seed`, with the defect `planted` in the daemon.
 fn once(seed: u64, planted: Planted) -> Outcome {
     run::once(&Scenario::from_seed(seed), planted)
         .map_err(|error| error.to_string())
@@ -55,8 +55,8 @@ fn once(seed: u64, planted: Planted) -> Outcome {
 /// reaching it.
 #[test]
 fn seeds_steer_the_world() {
-    let first = once(1, Planted::default());
-    let second = once(2, Planted::default());
+    let first = once(1, Planted::None);
+    let second = once(2, Planted::None);
     assert_ne!(
         first.trace(),
         second.trace(),
@@ -242,7 +242,7 @@ fn the_fixed_seeds_reach_every_fault_path() {
     ];
     let outcomes: Vec<Outcome> = run::FIXED
         .iter()
-        .map(|seed| once(*seed, Planted::default()))
+        .map(|seed| once(*seed, Planted::None))
         .collect();
     for (path, reaches) in paths {
         assert!(
@@ -258,13 +258,9 @@ fn the_fixed_seeds_reach_every_fault_path() {
 /// not started, because its decision is not durable yet.
 #[test]
 fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
-    let planted = Planted {
-        run_before_persist: true,
-        ..Planted::default()
-    };
     let caught = (0..16u64).any(|seed| {
         matches!(
-            once(seed, planted).replayed,
+            once(seed, Planted::RunBeforePersist).replayed,
             Err(Mismatch::Diverged(divergence))
                 if matches!(divergence.observed, Observed::Dispatched(_) | Observed::Mutated(_))
         )
@@ -277,12 +273,8 @@ fn running_tools_before_their_dispatch_is_durable_fails_the_replay() {
 /// act on the world, though the shell's own `ToolRan` is passed only once.
 #[test]
 fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
-    let planted = Planted {
-        run_twice: true,
-        ..Planted::default()
-    };
     let caught = (0..16u64).any(|seed| {
-        let outcome = once(seed, planted);
+        let outcome = once(seed, Planted::RunTwice);
         let Err(Mismatch::Diverged(divergence)) = &outcome.replayed else {
             return false;
         };
@@ -302,7 +294,7 @@ fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
 /// returns, so the crash comes after the `Unsafe` run acted.
 #[test]
 fn a_crash_while_a_command_runs_is_after_it_acted() {
-    let outcome = once(37, Planted::default());
+    let outcome = once(37, Planted::None);
     assert!(
         reached(
             &outcome,
@@ -322,11 +314,7 @@ fn a_crash_while_a_command_runs_is_after_it_acted() {
 /// durable holding other records than the model's.
 #[test]
 fn persisting_unknown_as_interrupted_fails_the_replay() {
-    let planted = Planted {
-        unknown_as_interrupted: true,
-        ..Planted::default()
-    };
-    let outcome = once(37, planted);
+    let outcome = once(37, Planted::UnknownAsInterrupted);
     let interrupted = |record: &Record<_>| {
         matches!(
             record,
@@ -354,7 +342,7 @@ fn persisting_unknown_as_interrupted_fails_the_replay() {
 /// true model.
 #[test]
 fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
-    let outcome = once(37, Planted::default());
+    let outcome = once(37, Planted::None);
     assert!(
         outcome.replayed.is_ok(),
         "seed 37 replays: {:?}",
@@ -381,7 +369,7 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
 fn the_fixed_seeds_replay_every_kind_of_step() {
     let mut taken = std::collections::BTreeSet::new();
     for seed in run::FIXED {
-        let replayed = once(seed, Planted::default())
+        let replayed = once(seed, Planted::None)
             .verdict()
             .map_err(|broken| broken.to_string())
             .expect("the run breaks nothing");
