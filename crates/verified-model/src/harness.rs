@@ -272,6 +272,15 @@ impl Harness {
         }
     }
 
+    /// The one state the world boots into: persisting `resume()` of the
+    /// empty log.
+    pub(crate) fn boot(&self) -> World {
+        let mut world = World::default();
+        let boot = Core::<Abstract>::new(self.limits.clone()).resume();
+        self.stage(&mut world, &boot);
+        world
+    }
+
     /// `world` with the shell's resume staged without a crash: the boot's
     /// resume was refused by a full log, and is decided again once the
     /// running turn is interrupted. `None` if the log does not recover.
@@ -532,10 +541,7 @@ impl Model for Harness {
     type Action = Action;
 
     fn init_states(&self) -> Vec<Self::State> {
-        let mut world = World::default();
-        let boot = Core::<Abstract>::new(self.limits.clone()).resume();
-        self.stage(&mut world, &boot);
-        vec![world]
+        vec![self.boot()]
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {

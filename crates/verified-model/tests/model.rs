@@ -626,15 +626,14 @@ fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
     let trace = observations(&bounded, &path);
     let replayed =
         replay(&harness(bounded.limits.clone(), &trace), &trace).expect("an observed path replays");
-    assert_eq!(replayed.max_frontier, 1, "the observations pin each state");
     assert_eq!(
         replayed.keys,
         path_keys(&bounded, &path),
         "the replay keys the steps the path took"
     );
     assert_eq!(
-        replayed.ends,
-        vec![follow(&bounded, &path)],
+        replayed.end,
+        follow(&bounded, &path),
         "the replay ends where the path does"
     );
     // The tool's run, moved to just before the group commit holding its
@@ -668,7 +667,7 @@ fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
     early.insert(acked, moved.clone());
     let divergence = match replay(&harness(bounded.limits.clone(), &early), &early) {
         Err(Mismatch::Diverged(divergence)) => Some(divergence),
-        Ok(_) | Err(Mismatch::Violated { .. } | Mismatch::Unpinned { .. }) => None,
+        Ok(_) | Err(Mismatch::Violated { .. }) => None,
     }
     .expect("a run before persist diverges");
     assert_eq!(divergence.index, acked, "where the run left the model");
@@ -784,7 +783,7 @@ fn coverage_keys_name_what_the_path_did() {
 fn divergence(harness: &Harness, trace: &[Observed]) -> Box<Divergence> {
     match replay(harness, trace) {
         Err(Mismatch::Diverged(divergence)) => Some(divergence),
-        Ok(_) | Err(Mismatch::Violated { .. } | Mismatch::Unpinned { .. }) => None,
+        Ok(_) | Err(Mismatch::Violated { .. }) => None,
     }
     .expect("the tampered trace diverges")
 }

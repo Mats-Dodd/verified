@@ -16,13 +16,13 @@
 //! then it was stopped before it acted. A run that returned and was never
 //! reported (the daemon crashed first) is taken to have acted.
 //!
-//! The model is followed as a frontier: every state consistent with the
-//! observations so far. Each step's values come from the observation (ids,
-//! sizes, what the model proposed, the records decided and made durable),
-//! so the frontier stays small; it is bounded by [`FRONTIER`] all the same,
-//! and a run whose frontier empties has done something the model does not
-//! allow: a [`Mismatch`] says where, what was observed, the state the model
-//! was in and what it allowed there.
+//! The model is followed one state at a time. Each observation names the
+//! actions it means there, with their values (ids, sizes, what the model
+//! proposed, how many pending records a crash kept), and what the state
+//! after them must agree with (the records decided and made durable). A
+//! run is one path, and an observation the model does not allow from the
+//! state the run is in is a [`Mismatch`]: it says where, what was
+//! observed, the state the model was in and what it allowed there.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,11 +34,6 @@ use verified_domain::{Abstract, Cause, EffectId, Exit, Limits, Rerun, Tool};
 use crate::coverage::{self, Key};
 use crate::harness::{Action, Harness, Message, Offers};
 use crate::world::{Flight, Job, Rec, World};
-
-/// The most states the frontier may hold: past it, the observations no
-/// longer pin the model's state, and a replay could hide a bug behind a
-/// state the run was never in.
-pub const FRONTIER: usize = 64;
 
 /// One fact a run observed, in α of its values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -126,25 +121,22 @@ pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
 pub struct Replayed {
     /// The observations replayed.
     pub observations: usize,
-    /// How often each kind of action was taken (on any frontier state).
+    /// How often each kind of action was taken.
     pub actions: BTreeMap<&'static str, usize>,
-    /// The largest frontier.
-    pub max_frontier: usize,
-    /// The coverage keys of every step taken (on any frontier state).
+    /// The coverage keys of every step taken.
     pub keys: BTreeSet<Key>,
-    /// The states the run may have ended in.
-    pub ends: Vec<World>,
+    /// The state the run ended in.
+    pub end: World,
 }
 
-/// Observation `index` is nothing the model allows from any state the run
-/// may have been in.
+/// Observation `index` is nothing the model allows from the state the run
+/// was in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Divergence {
     pub index: usize,
     pub observed: Observed,
-    /// Why, for the first state of the frontier.
     pub why: String,
-    /// That state, summarised.
+    /// The state the run was in, summarised.
     pub state: String,
     /// What the model allowed there.
     pub enabled: Vec<Action>,
@@ -160,11 +152,6 @@ pub enum Mismatch {
         index: Option<usize>,
         property: &'static str,
         state: String,
-    },
-    /// After observation `index` the frontier outgrew [`FRONTIER`].
-    Unpinned {
-        index: usize,
-        states: usize,
     },
 }
 
@@ -192,11 +179,6 @@ impl fmt::Display for Mismatch {
             } => write!(
                 formatter,
                 "after observation {index:?} the model breaks \"{property}\"\n  state: {state}"
-            ),
-            Self::Unpinned { index, states } => write!(
-                formatter,
-                "after observation {index} the run is in any of {states} model states \
-                 (at most {FRONTIER})"
             ),
         }
     }
@@ -286,6 +268,13 @@ fn running(world: &World, id: EffectId) -> Result<Tool, String> {
             executed: false,
             ..
         }) => Ok(*tool),
+        Some(Flight {
+            job: Job::Tool { .. },
+            executed: true,
+            ..
+        }) => Err(format!(
+            "effect {id:?} acts on the world a second time in one run"
+        )),
         Some(flight) => Err(format!(
             "effect {id:?} is {flight:?}, not a tool yet to run"
         )),
@@ -296,160 +285,104 @@ fn running(world: &World, id: EffectId) -> Result<Tool, String> {
     }
 }
 
-/// What the whole trace says about its tool runs, beside the state.
-/// Effect ids are never reused (each boot is a new epoch), so each set is
-/// the run's own.
-struct Runs {
-    /// The runs already seen acting on the world.
-    acted: BTreeSet<EffectId>,
-    /// The runs the trace reports `Interrupted`.
-    interrupted: BTreeSet<EffectId>,
+/// The runs the trace reports `Interrupted`. Effect ids are never reused
+/// (each boot is a new epoch), so each is the run's own.
+fn interrupted(trace: &[Observed]) -> BTreeSet<EffectId> {
+    trace
+        .iter()
+        .filter_map(|observed| match observed {
+            Observed::Decided(
+                Event::ToolDone {
+                    id,
+                    exit: Exit::Err(Cause::Interrupted),
+                    ..
+                },
+                _,
+            ) => Some(*id),
+            Observed::Booted(_)
+            | Observed::Resumed(_)
+            | Observed::Refused
+            | Observed::Decided(..)
+            | Observed::Acked { .. }
+            | Observed::Dispatched(_)
+            | Observed::Mutated(_)
+            | Observed::Ran(_)
+            | Observed::Read(_) => None,
+        })
+        .collect()
 }
 
-impl Runs {
-    fn of(trace: &[Observed]) -> Self {
-        let interrupted = trace
-            .iter()
-            .filter_map(|observed| match observed {
-                Observed::Decided(
-                    Event::ToolDone {
-                        id,
-                        exit: Exit::Err(Cause::Interrupted),
-                        ..
-                    },
-                    _,
-                ) => Some(*id),
-                Observed::Booted(_)
-                | Observed::Resumed(_)
-                | Observed::Refused
-                | Observed::Decided(..)
-                | Observed::Acked { .. }
-                | Observed::Dispatched(_)
-                | Observed::Mutated(_)
-                | Observed::Ran(_)
-                | Observed::Read(_) => None,
-            })
-            .collect();
-        Self {
-            acted: BTreeSet::new(),
-            interrupted,
-        }
-    }
-}
-
-/// The states `observed` leads to from `world`, each with the actions taken.
-fn step(
+/// The actions `observed` means at `world`, in order: none for a check on
+/// the state, or for a change the shell makes outside the model's actions
+/// (a refusal, and the resume after one).
+fn means(
     harness: &Harness,
     world: &World,
     observed: &Observed,
-    runs: &Runs,
-) -> Result<Vec<(World, Vec<Action>)>, String> {
-    let one = |action: Action| -> Result<Vec<(World, Vec<Action>)>, String> {
-        let next = take(harness, world, &action)?;
-        Ok(vec![(next, vec![action])])
-    };
+    interrupted: &BTreeSet<EffectId>,
+) -> Result<Vec<Action>, String> {
     match observed {
         Observed::Booted(records) => {
-            let mut found = Vec::new();
-            for action in enabled(harness, world) {
-                if let Action::Crash(_) = action
-                    && let Some(next) = harness.next_state(world, action.clone())
-                    && next.log == *records
-                {
-                    found.push((next, vec![action]));
-                }
-            }
-            if found.is_empty() {
-                return Err(format!(
-                    "no crash leaves the {} records booted on (log {}, pending {})",
+            // The crash is named by what it kept, so a boot means one; a
+            // model that gains a second way to it stays visible here.
+            assert!(
+                enabled(harness, world)
+                    .into_iter()
+                    .filter(|action| matches!(action, Action::Crash(_)))
+                    .filter_map(|crash| harness.next_state(world, crash))
+                    .filter(|next| next.log == *records)
+                    .count()
+                    <= 1,
+                "at most one crash leaves the log a boot found"
+            );
+            let kept = records.len().checked_sub(world.log.len()).ok_or_else(|| {
+                format!(
+                    "no crash leaves the {} records booted on (log {})",
                     records.len(),
-                    world.log.len(),
-                    world.pending.len()
-                ));
-            }
-            Ok(found)
+                    world.log.len()
+                )
+            })?;
+            Ok(vec![Action::Crash(kept)])
         }
-        Observed::Resumed(records) => {
-            let resumed = if world.refused {
-                harness
-                    .resumed(world)
-                    .ok_or_else(|| "the log the shell resumes on does not recover".to_owned())?
-            } else {
-                world.clone()
-            };
-            if resumed.pending != *records {
-                return Err(format!(
-                    "the model resumed to {:?}, the shell to {records:?}",
-                    resumed.pending
-                ));
-            }
-            Ok(vec![(resumed, Vec::new())])
-        }
+        Observed::Resumed(_) => Ok(Vec::new()),
         Observed::Refused => {
-            if !world.persisting() {
-                return Err("the log refused a resume, but none is being persisted".to_owned());
+            if world.persisting() {
+                Ok(Vec::new())
+            } else {
+                Err("the log refused a resume, but none is being persisted".to_owned())
             }
-            let mut refused = world.clone();
-            refused.pending.clear();
-            refused.staged.clear();
-            refused.refused = true;
-            Ok(vec![(refused, Vec::new())])
         }
-        Observed::Decided(event, records) => {
-            let found = one(action(event))?;
-            for (next, _) in &found {
-                if next.pending != *records {
-                    return Err(format!(
-                        "the model decided {:?}, the shell {records:?}",
-                        next.pending
-                    ));
-                }
-            }
-            Ok(found)
-        }
-        Observed::Acked { first, records } => {
+        Observed::Decided(event, _) => Ok(vec![action(event)]),
+        Observed::Acked { first, .. } => {
             let at = usize::try_from(*first).map_err(|error| error.to_string())?;
-            if at != world.log.len() {
-                return Err(format!(
+            if at == world.log.len() {
+                Ok(vec![Action::Sync])
+            } else {
+                Err(format!(
                     "a group from {at} became durable on a log of {}",
                     world.log.len()
-                ));
+                ))
             }
-            let found = one(Action::Sync)?;
-            for (next, _) in &found {
-                if next.log.get(at..) != Some(records.as_slice()) {
-                    return Err(format!(
-                        "the model made {:?} durable, the log {records:?}",
-                        next.log.get(at..)
-                    ));
-                }
-            }
-            Ok(found)
         }
         Observed::Dispatched(id) => {
             running(world, *id)?;
-            Ok(vec![(world.clone(), Vec::new())])
+            Ok(Vec::new())
         }
         Observed::Mutated(id) => {
-            if runs.acted.contains(id) {
-                return Err(format!(
-                    "effect {id:?} acts on the world a second time in one run"
-                ));
-            }
             let tool = running(world, *id)?;
             if tool.rerun() == Rerun::Safe {
                 return Err(format!(
                     "effect {id:?} is a {tool:?} run, which changes nothing in the world"
                 ));
             }
-            one(Action::Execute(*id))
+            Ok(vec![Action::Execute(*id)])
         }
         Observed::Ran(id) => match world.flights.get(id) {
             Some(flight) if matches!(flight.job, Job::Tool { .. }) => {
-                if flight.executed || runs.interrupted.contains(id) {
-                    Ok(vec![(world.clone(), Vec::new())])
+                if flight.executed || interrupted.contains(id) {
+                    Ok(Vec::new())
                 } else {
-                    one(Action::Execute(*id))
+                    Ok(vec![Action::Execute(*id)])
                 }
             }
             Some(_) | None => Err(format!(
@@ -462,18 +395,94 @@ fn step(
             // down, or the read starts elsewhere than the connection's
             // cursor.
             if world.client.cursor == Some(at) {
-                return one(Action::Read);
+                Ok(vec![Action::Read])
+            } else {
+                Ok(vec![Action::Reconnect, Action::Read])
             }
-            let reconnected = take(harness, world, &Action::Reconnect)?;
-            if reconnected.client.cursor != Some(at) {
-                return Err(format!(
-                    "the client reads {at} but resumes from {:?}",
-                    reconnected.client.cursor
-                ));
-            }
-            let next = take(harness, &reconnected, &Action::Read)?;
-            Ok(vec![(next, vec![Action::Reconnect, Action::Read])])
         }
+    }
+}
+
+/// The state the run is in after `observed`, whose actions took the model
+/// from `before` to `after`: `after` itself, if it agrees with what was
+/// observed, or for a refusal and the resume after one, `after` changed as
+/// the shell changed it.
+fn agrees(
+    harness: &Harness,
+    before: &World,
+    after: World,
+    observed: &Observed,
+) -> Result<World, String> {
+    match observed {
+        Observed::Booted(records) => {
+            if after.log == *records {
+                Ok(after)
+            } else {
+                Err(format!(
+                    "no crash leaves the {} records booted on (log {}, pending {})",
+                    records.len(),
+                    before.log.len(),
+                    before.pending.len()
+                ))
+            }
+        }
+        Observed::Resumed(records) => {
+            let resumed = if after.refused {
+                harness
+                    .resumed(&after)
+                    .ok_or_else(|| "the log the shell resumes on does not recover".to_owned())?
+            } else {
+                after
+            };
+            if resumed.pending == *records {
+                Ok(resumed)
+            } else {
+                Err(format!(
+                    "the model resumed to {:?}, the shell to {records:?}",
+                    resumed.pending
+                ))
+            }
+        }
+        Observed::Refused => {
+            let mut refused = after;
+            refused.pending.clear();
+            refused.staged.clear();
+            refused.refused = true;
+            Ok(refused)
+        }
+        Observed::Decided(_, records) => {
+            if after.pending == *records {
+                Ok(after)
+            } else {
+                Err(format!(
+                    "the model decided {:?}, the shell {records:?}",
+                    after.pending
+                ))
+            }
+        }
+        Observed::Acked { records, .. } => {
+            let made = after.log.get(before.log.len()..);
+            if made == Some(records.as_slice()) {
+                Ok(after)
+            } else {
+                Err(format!(
+                    "the model made {made:?} durable, the log {records:?}"
+                ))
+            }
+        }
+        Observed::Read(seq) => {
+            let read = u64::try_from(after.client.next.saturating_sub(1))
+                .map_err(|error| error.to_string())?;
+            if read == *seq {
+                Ok(after)
+            } else {
+                Err(format!(
+                    "the client reads {seq} but resumes from {:?}",
+                    before.client.next
+                ))
+            }
+        }
+        Observed::Dispatched(_) | Observed::Mutated(_) | Observed::Ran(_) => Ok(after),
     }
 }
 
@@ -493,105 +502,71 @@ fn broken(harness: &Harness, world: &World) -> Option<&'static str> {
 ///
 /// # Errors
 /// The trace does not start with a boot on an empty log, an observation is
-/// nothing the model allows, a state breaks a property, or the
-/// observations stop pinning the model's state.
+/// nothing the model allows, or a state breaks a property.
 pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatch> {
-    let mut actions: BTreeMap<&'static str, usize> = BTreeMap::new();
     // The world boots once before anything is observed: the first
     // observation is that boot, on an empty log.
-    let mut frontier = harness.init_states();
+    let mut world = harness.boot();
+    let diverged = |index: usize, observed: &Observed, why: String, world: &World| {
+        Mismatch::Diverged(Box::new(Divergence {
+            index,
+            observed: observed.clone(),
+            why,
+            state: summary(world),
+            enabled: enabled(harness, world),
+        }))
+    };
     let Some((first, rest)) = trace.split_first() else {
-        return Err(Mismatch::Diverged(Box::new(Divergence {
-            index: 0,
-            observed: Observed::Booted(Vec::new()),
-            why: "the trace is empty".to_owned(),
-            state: frontier.first().map_or_else(String::new, summary),
-            enabled: Vec::new(),
-        })));
+        return Err(diverged(
+            0,
+            &Observed::Booted(Vec::new()),
+            "the trace is empty".to_owned(),
+            &world,
+        ));
     };
     if *first != Observed::Booted(Vec::new()) {
-        return Err(Mismatch::Diverged(Box::new(Divergence {
-            index: 0,
-            observed: first.clone(),
-            why: "a run starts by booting on an empty log".to_owned(),
-            state: frontier.first().map_or_else(String::new, summary),
-            enabled: Vec::new(),
-        })));
+        return Err(diverged(
+            0,
+            first,
+            "a run starts by booting on an empty log".to_owned(),
+            &world,
+        ));
     }
-    for world in &frontier {
-        if let Some(property) = broken(harness, world) {
-            return Err(Mismatch::Violated {
-                index: None,
-                property,
-                state: summary(world),
-            });
-        }
+    if let Some(property) = broken(harness, &world) {
+        return Err(Mismatch::Violated {
+            index: None,
+            property,
+            state: summary(&world),
+        });
     }
-    let mut max_frontier = frontier.len();
-    let mut runs = Runs::of(trace);
+    let interrupted = interrupted(trace);
+    let mut actions: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for (index, observed) in (1..).zip(rest) {
-        let mut next: Vec<World> = Vec::new();
-        let mut why = None;
-        for world in &frontier {
-            match step(harness, world, observed, &runs) {
-                Ok(found) => {
-                    for (state, taken) in found {
-                        let mut at = world.clone();
-                        for action in &taken {
-                            let count = actions.entry(kind(action)).or_default();
-                            *count = count.saturating_add(1);
-                            if let Some(after) = harness.next_state(&at, action.clone()) {
-                                keys.extend(coverage::keys(harness, &at, action, &after));
-                                at = after;
-                            }
-                        }
-                        if !next.contains(&state) {
-                            next.push(state);
-                        }
-                    }
-                }
-                Err(reason) => {
-                    why.get_or_insert(reason);
-                }
+        let mut after = world.clone();
+        let stepped = means(harness, &world, observed, &interrupted).and_then(|taken| {
+            for action in taken {
+                let next = take(harness, &after, &action)?;
+                keys.extend(coverage::keys(harness, &after, &action, &next));
+                let count = actions.entry(kind(&action)).or_default();
+                *count = count.saturating_add(1);
+                after = next;
             }
-        }
-        if next.is_empty() {
-            let world = frontier.first();
-            return Err(Mismatch::Diverged(Box::new(Divergence {
-                index,
-                observed: observed.clone(),
-                why: why.unwrap_or_default(),
-                state: world.map_or_else(String::new, summary),
-                enabled: world.map_or_else(Vec::new, |world| enabled(harness, world)),
-            })));
-        }
-        if next.len() > FRONTIER {
-            return Err(Mismatch::Unpinned {
-                index,
-                states: next.len(),
+            agrees(harness, &world, after, observed)
+        });
+        world = stepped.map_err(|why| diverged(index, observed, why, &world))?;
+        if let Some(property) = broken(harness, &world) {
+            return Err(Mismatch::Violated {
+                index: Some(index),
+                property,
+                state: summary(&world),
             });
-        }
-        for world in &next {
-            if let Some(property) = broken(harness, world) {
-                return Err(Mismatch::Violated {
-                    index: Some(index),
-                    property,
-                    state: summary(world),
-                });
-            }
-        }
-        max_frontier = max_frontier.max(next.len());
-        frontier = next;
-        if let Observed::Mutated(id) = observed {
-            runs.acted.insert(*id);
         }
     }
     Ok(Replayed {
         observations: trace.len(),
         actions,
-        max_frontier,
         keys,
-        ends: frontier,
+        end: world,
     })
 }

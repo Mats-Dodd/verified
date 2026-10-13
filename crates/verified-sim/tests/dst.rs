@@ -246,7 +246,7 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
     };
     let broken = match verified_model::replay(&harness, &outcome.observed) {
         Err(Mismatch::Violated { property, .. }) => Some(property),
-        Ok(_) | Err(Mismatch::Diverged(_) | Mismatch::Unpinned { .. }) => None,
+        Ok(_) | Err(Mismatch::Diverged(_)) => None,
     };
     assert_eq!(
         broken,
@@ -268,10 +268,6 @@ fn the_fixed_seeds_replay_every_kind_of_step() {
             outcome.violations
         );
         let replayed = outcome.replayed.expect("a run without violations replays");
-        assert!(
-            replayed.max_frontier <= 1,
-            "seed {seed}: the run pins the model's state"
-        );
         taken.extend(replayed.actions.into_keys());
     }
     for kind in [

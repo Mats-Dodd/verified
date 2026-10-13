@@ -122,8 +122,8 @@ fn report(out: &mut impl io::Write, outcome: &Outcome) -> Result<(), Failure> {
     if let Some(replayed) = &outcome.replayed {
         writeln!(
             out,
-            "  replayed {} observations through the model (frontier at most {}): {:?}",
-            replayed.observations, replayed.max_frontier, replayed.actions
+            "  replayed {} observations through the model: {:?}",
+            replayed.observations, replayed.actions
         )?;
     }
     for violation in &outcome.violations {
