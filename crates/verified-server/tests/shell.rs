@@ -1106,6 +1106,25 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     second.world.shutdown().cancel();
 }
 
+#[tokio::test]
+async fn shutdown_wins_over_a_queued_command() {
+    let disk = MemDisk::new();
+    let daemon = boot(&disk, Arc::new(MemEnv::default())).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let before = disk.bytes(session_id()).expect("the log");
+    daemon.world.shutdown().cancel();
+    let reply = handle.send_message(send(1, "after shutdown")).await;
+    assert!(
+        reply.is_err(),
+        "a stopping daemon takes no command: {reply:?}"
+    );
+    assert_eq!(
+        disk.bytes(session_id()),
+        Some(before),
+        "a stopping daemon appends nothing"
+    );
+}
+
 /// The first refusal of a new message within two seconds.
 async fn eventually_refused(handle: &SessionHandle) -> Option<CommandError> {
     for seed in 100..=120u8 {

@@ -475,8 +475,8 @@ impl Session {
         loop {
             let input = tokio::select! {
                 biased;
-                input = receiver.recv() => input,
                 () = shutdown.cancelled() => return Ok(()),
+                input = receiver.recv() => input,
             };
             let Some(input) = input else {
                 return Ok(());

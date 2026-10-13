@@ -193,8 +193,8 @@ impl RegistryTask {
         loop {
             let input = tokio::select! {
                 biased;
-                input = inbox.recv() => input,
                 () = shutdown.cancelled() => return,
+                input = inbox.recv() => input,
             };
             match input {
                 None => return,
