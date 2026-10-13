@@ -6,7 +6,7 @@
 //! proposes), how the user answers each prompt, and the one ordering no
 //! seed's schedule promises, two runs acting together
 //! ([`Scenario::ran_together`]). Everything else (ids, sizes, exits,
-//! latencies, when records become durable) is the run's. [`run`] fails a
+//! latencies, when records become durable) is the run's. [`run()`] fails a
 //! scenario whose replay misses its target, so a scenario the model or the
 //! daemon drifted away from is caught.
 
