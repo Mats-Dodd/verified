@@ -1,8 +1,8 @@
 //! The one place IO is chosen.
 //!
-//! Each concern (network, filesystem, simulated
-//! time, barriers) is one submodule; the `sim` feature swaps it from tokio
-//! and the real OS to turmoil's simulated network, filesystem and clock.
+//! Each concern (network, filesystem, crashes, barriers) is one submodule;
+//! the `sim` feature swaps it from tokio and the real OS to turmoil's
+//! simulated network and filesystem.
 //! Nothing outside this module names `tokio::net`, `tokio::fs` or turmoil.
 
 /// Whether this build has the `sim` shims: turmoil instead of the OS. The
@@ -457,51 +457,6 @@ pub mod fs {
         }
         entries.push(entry);
         Ok(())
-    }
-}
-
-/// Simulated wall time: turmoil's elapsed time from a fixed epoch.
-#[cfg(feature = "sim")]
-pub mod time {
-    use async_trait::async_trait;
-    use verified_domain::Millis;
-    use verified_domain::id::UnixMillis;
-
-    use crate::seam::Clock;
-
-    /// Wall time inside a turmoil simulation, from `epoch`.
-    #[derive(Debug, Clone, Copy)]
-    pub struct SimClock {
-        epoch: UnixMillis,
-    }
-
-    impl SimClock {
-        #[must_use]
-        pub const fn new(epoch: UnixMillis) -> Self {
-            Self { epoch }
-        }
-    }
-
-    #[async_trait]
-    impl Clock for SimClock {
-        fn now(&self) -> UnixMillis {
-            let elapsed = u64::try_from(turmoil::elapsed().as_millis())
-                .expect("a simulation runs for fewer than 2^64 milliseconds");
-            let now = self
-                .epoch
-                .get()
-                .checked_add(elapsed)
-                .expect("simulated time stays within 48-bit Unix milliseconds");
-            UnixMillis::new(now).expect("simulated time stays within 48-bit Unix milliseconds")
-        }
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the Clock seam's sim impl; turmoil drives tokio's timer"
-        )]
-        async fn sleep(&self, delay: Millis) {
-            tokio::time::sleep(core::time::Duration::from_millis(delay.get())).await;
-        }
     }
 }
 

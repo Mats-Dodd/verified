@@ -37,6 +37,7 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use verified_domain::Millis;
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -76,8 +77,8 @@ pub enum ClientError {
         next: Offset,
         chunks: usize,
     },
-    #[error("no answer from the daemon within {}ms", .after.as_millis())]
-    TimedOut { after: core::time::Duration },
+    #[error("no answer from the daemon within {}ms", .after.get())]
+    TimedOut { after: Millis },
 }
 
 impl From<SseError> for ClientError {
@@ -190,7 +191,7 @@ pub enum StreamUpdate {
     /// `None` when the reconnect schedule is spent and following stopped.
     Disconnected {
         error: ClientError,
-        retry: Option<core::time::Duration>,
+        retry: Option<Millis>,
     },
     /// The daemon refused the read or sent a broken stream; following stopped.
     Ended { error: ClientError },
@@ -324,7 +325,7 @@ impl Client {
     /// is dropped is a read, never a durable step.
     async fn within<T>(
         &self,
-        limit: core::time::Duration,
+        limit: Millis,
         work: impl Future<Output = Result<T, ClientError>>,
     ) -> Result<T, ClientError> {
         tokio::select! {

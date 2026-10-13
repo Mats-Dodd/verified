@@ -23,7 +23,7 @@ use verified_wire::stream::Offset;
 use crate::Limits;
 use crate::app::{App, Msg, Start};
 use crate::client::{Answer, Client, Command, StreamUpdate};
-use crate::seam::{Clock, Dialer, Entropy, Input, Screen, TerminalError};
+use crate::seam::{Clock, Dialer, Entropy, Input, Screen, TerminalError, id_entropy};
 
 /// When and with what randomness an input event arrived: everything
 /// [`App::update`] needs to mint ids without a clock or a random source.
@@ -239,7 +239,7 @@ pub async fn run(
         input,
         dialer,
         clock,
-        mut entropy,
+        entropy,
     } = seams;
     let (inbox, mut mailbox) = mpsc::channel::<Incoming>(limits.inbox);
     let mut effects = Effects {
@@ -279,7 +279,7 @@ pub async fn run(
                 Incoming::Event(event) => {
                     let stamp = Stamp {
                         at: clock.now(),
-                        entropy: entropy.id_entropy(),
+                        entropy: id_entropy(entropy.as_ref()),
                     };
                     app.on_event(event, stamp)
                 }

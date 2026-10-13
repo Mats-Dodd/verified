@@ -1,23 +1,23 @@
-//! Seeded entropy for the daemon's and the TUI's Entropy seams.
+//! Seeded entropy, for the daemon's and the TUI's Entropy seams alike.
 
 use core::fmt;
 
 use rand::{RngCore as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
-use verified_domain::id::IdEntropy;
 
-/// The daemon's entropy: a seeded stream. The daemon's seam takes `&self`,
-/// so the generator sits behind a lock.
-pub struct DaemonEntropy {
+/// A seeded stream of random bytes: each host draws from its own seed, in
+/// the order it draws. The seams take `&self`, so the generator sits behind
+/// a lock.
+pub struct SeededEntropy {
     #[expect(
         clippy::disallowed_types,
-        reason = "the daemon's Entropy seam takes &self; its session tasks are the writers, \
+        reason = "the Entropy seams take &self; the host's tasks are the writers, \
                   each draw advances one seeded stream, dropped with the host"
     )]
     rng: std::sync::Mutex<ChaCha8Rng>,
 }
 
-impl DaemonEntropy {
+impl SeededEntropy {
     #[must_use]
     #[expect(
         clippy::disallowed_types,
@@ -28,18 +28,9 @@ impl DaemonEntropy {
             rng: std::sync::Mutex::new(ChaCha8Rng::seed_from_u64(seed)),
         }
     }
-}
 
-impl fmt::Debug for DaemonEntropy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DaemonEntropy")
-            .finish_non_exhaustive()
-    }
-}
-
-impl verified_server::seam::Entropy for DaemonEntropy {
-    fn fill(&self, out: &mut [u8]) {
+    /// Fills `out` with the stream's next bytes.
+    fn draw(&self, out: &mut [u8]) {
         self.rng
             .lock()
             .expect("no entropy draw panics while holding the lock")
@@ -47,30 +38,22 @@ impl verified_server::seam::Entropy for DaemonEntropy {
     }
 }
 
-/// The TUI's entropy: a seeded stream.
-pub struct TuiEntropy {
-    rng: ChaCha8Rng,
-}
-
-impl TuiEntropy {
-    #[must_use]
-    pub fn new(seed: u64) -> Self {
-        Self {
-            rng: ChaCha8Rng::seed_from_u64(seed),
-        }
-    }
-}
-
-impl fmt::Debug for TuiEntropy {
+impl fmt::Debug for SeededEntropy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("TuiEntropy").finish_non_exhaustive()
+        formatter
+            .debug_struct("SeededEntropy")
+            .finish_non_exhaustive()
     }
 }
 
-impl verified_tui::seam::Entropy for TuiEntropy {
-    fn id_entropy(&mut self) -> IdEntropy {
-        let mut bytes = IdEntropy::default();
-        self.rng.fill_bytes(&mut bytes);
-        bytes
+impl verified_server::seam::Entropy for SeededEntropy {
+    fn fill(&self, out: &mut [u8]) {
+        self.draw(out);
+    }
+}
+
+impl verified_tui::seam::Entropy for SeededEntropy {
+    fn fill(&self, out: &mut [u8]) {
+        self.draw(out);
     }
 }

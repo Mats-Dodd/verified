@@ -3,7 +3,6 @@
 //! reconnect from the last offset after the daemon closes it, send a message
 //! with a stamp-minted id, and quit.
 
-use core::time::Duration;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -12,7 +11,8 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
-use verified_domain::id::{IdEntropy, MessageId, UnixMillis};
+use verified_domain::Millis;
+use verified_domain::id::{MessageId, UnixMillis};
 use verified_tui::app::Start;
 use verified_tui::seam::{Clock, Dialer, Entropy, Stream};
 use verified_tui::tea::Seams;
@@ -54,8 +54,8 @@ impl Clock for FixedClock {
     /// Retry backoffs pass at once; deadlines (the exchange and stream-idle
     /// timeouts, longer than any backoff) never fire, because the scripted
     /// daemon always answers.
-    async fn sleep(&self, duration: Duration) {
-        if duration >= Limits::DEFAULT.exchange_timeout {
+    async fn sleep(&self, delay: Millis) {
+        if delay >= Limits::DEFAULT.exchange_timeout {
             std::future::pending::<()>().await;
         }
         tokio::task::yield_now().await;
@@ -64,12 +64,22 @@ impl Clock for FixedClock {
 
 /// Entropy `[n; 10]` for the n-th draw, counting from one.
 #[derive(Debug, Default)]
-struct Counting(u8);
+struct Counting {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "test-only draw counter: the Entropy seam takes &self; the runtime is its one writer"
+    )]
+    draws: std::sync::atomic::AtomicU8,
+}
 
 impl Entropy for Counting {
-    fn id_entropy(&mut self) -> IdEntropy {
-        self.0 = self.0.checked_add(1).expect("fewer than 256 draws");
-        [self.0; 10]
+    fn fill(&self, out: &mut [u8]) {
+        let draw = self
+            .draws
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .checked_add(1)
+            .expect("fewer than 256 draws");
+        out.fill(draw);
     }
 }
 
@@ -202,8 +212,8 @@ enum Script {
 async fn creates_catches_up_reconnects_sends_and_quits() {
     let (seen_by_daemon, seen): (SyncSender<Seen>, Receiver<Seen>) = sync_channel(64);
     let (keyboard, input) = scripted(16);
-    let mut entropy = Counting::default();
-    let session = new_session(&FixedClock, &mut entropy);
+    let entropy = Counting::default();
+    let session = new_session(&FixedClock, &entropy);
     let seams = Seams {
         input: Box::new(input),
         dialer: Arc::new(ScriptedDaemon {
@@ -658,8 +668,8 @@ impl Dialer for Unreachable {
 async fn holding_ctrl_r_while_the_daemon_is_silent_starts_nothing_new() {
     for open in [false, true] {
         let (keyboard, input) = scripted(16);
-        let mut entropy = Counting::default();
-        let session = new_session(&FixedClock, &mut entropy);
+        let entropy = Counting::default();
+        let session = new_session(&FixedClock, &entropy);
         let seams = Seams {
             input: Box::new(input),
             dialer: Arc::new(Unreachable),

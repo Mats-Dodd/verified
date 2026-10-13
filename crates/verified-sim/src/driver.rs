@@ -8,15 +8,14 @@
 //! reconnects when the TUI says it stopped following, and gives up the rest
 //! of the plan when the TUI says the session takes no more.
 
-use core::time::Duration;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::watch;
+use verified_domain::Millis;
 use verified_tui::app::{App, Start};
-use verified_tui::seam::{Clock as _, Entropy, TcpDialer};
-use verified_tui::shim::SimClock;
+use verified_tui::seam::{Clock as _, TcpDialer};
 use verified_tui::tea::Seams;
 use verified_tui::terminal::{Keyboard, KeyboardError, TestScreen, scripted};
 use verified_tui::view::Connection;
@@ -24,7 +23,8 @@ use verified_tui::{Limits, new_session};
 use verified_wire::command::Verdict;
 use verified_wire::transcript::{Part, ToolState};
 
-use crate::entropy::TuiEntropy;
+use crate::clock::SimClock;
+use crate::entropy::SeededEntropy;
 use crate::hosts::{DAEMON, PORT, epoch};
 use crate::ledger::{Entry, Ledger};
 use crate::scenario::{CancelAt, TurnPlan};
@@ -32,7 +32,7 @@ use crate::scenario::{CancelAt, TurnPlan};
 /// How many keys may wait unread.
 const KEYS: usize = 64;
 /// How often the user looks again when nothing changed.
-const GLANCE: Duration = Duration::from_millis(100);
+const GLANCE: Millis = Millis::new(100);
 /// Mixed into the seed for the TUI's entropy.
 const TUI_SALT: u64 = 0x7475_6900;
 /// What the TUI's notice says when the session takes no more commands
@@ -278,14 +278,14 @@ impl User {
 /// The observer missed a folded read (a harness defect: it sees every update).
 pub async fn tui(plan: Vec<TurnPlan>, seed: u64, ledger: Ledger) -> turmoil::Result {
     let clock = SimClock::new(epoch());
-    let mut entropy: Box<dyn Entropy> = Box::new(TuiEntropy::new(seed ^ TUI_SALT));
-    let session = new_session(&clock, &mut *entropy);
+    let entropy = SeededEntropy::new(seed ^ TUI_SALT);
+    let session = new_session(&clock, &entropy);
     let (keyboard, input) = scripted(KEYS);
     let seams = Seams {
         input: Box::new(input),
         dialer: Arc::new(TcpDialer::new(DAEMON.to_owned(), PORT)),
         clock: Arc::new(clock),
-        entropy,
+        entropy: Box::new(entropy),
     };
     let (shown, watching) = watch::channel(Seen::default());
     let mut screen = TestScreen::new(100, 30);

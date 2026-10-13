@@ -11,6 +11,7 @@
 //! twice to prove the trace is deterministic.
 
 pub mod check;
+pub mod clock;
 pub mod coverage;
 pub mod directed;
 pub mod driver;

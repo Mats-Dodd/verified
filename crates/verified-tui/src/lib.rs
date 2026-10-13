@@ -23,10 +23,10 @@ pub use tea::run;
 
 use verified_domain::id::SessionId;
 
-use crate::seam::{Clock, Entropy};
+use crate::seam::{Clock, Entropy, id_entropy};
 
 /// A fresh session id, minted from the seams.
 #[must_use]
-pub fn new_session(clock: &dyn Clock, entropy: &mut dyn Entropy) -> SessionId {
-    SessionId::from_parts(clock.now(), &entropy.id_entropy())
+pub fn new_session(clock: &dyn Clock, entropy: &dyn Entropy) -> SessionId {
+    SessionId::from_parts(clock.now(), &id_entropy(entropy))
 }

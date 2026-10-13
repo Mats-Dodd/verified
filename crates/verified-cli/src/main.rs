@@ -266,9 +266,9 @@ async fn run_tui(project: PathBuf, session: Option<SessionId>) -> Result<(), Cli
     let layout = Layout { project };
     let addr = ensure_daemon(&layout).await?;
     let clock = verified_tui::seam::SystemClock;
-    let mut entropy = verified_tui::seam::OsEntropy;
+    let entropy = verified_tui::seam::OsEntropy;
     let start = session.map_or_else(
-        || Start::New(verified_tui::new_session(&clock, &mut entropy)),
+        || Start::New(verified_tui::new_session(&clock, &entropy)),
         Start::Open,
     );
     let seams = verified_tui::tea::Seams {

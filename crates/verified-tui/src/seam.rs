@@ -5,13 +5,13 @@
 //! supplies its own.
 
 use core::fmt;
-use core::time::Duration;
 use std::io;
 
 use async_trait::async_trait;
 use crossterm::event::Event;
 use ratatui::Frame;
 use tokio::io::{AsyncRead, AsyncWrite};
+use verified_domain::Millis;
 use verified_domain::id::{IdEntropy, UnixMillis};
 
 use crate::shim;
@@ -22,15 +22,23 @@ pub trait Clock: Send + Sync + fmt::Debug {
     /// Milliseconds since the Unix epoch.
     fn now(&self) -> UnixMillis;
 
-    /// Waits `duration`. Callers that must stop early race it against a
+    /// Waits `delay`. Callers that must stop early race it against a
     /// cancellation token; sleeping holds nothing, so dropping it is safe.
-    async fn sleep(&self, duration: Duration);
+    async fn sleep(&self, delay: Millis);
 }
 
 /// Random bytes for client-minted ids.
-pub trait Entropy: Send + fmt::Debug {
-    /// Ten fresh random bytes (the random part of a `UUIDv7`).
-    fn id_entropy(&mut self) -> IdEntropy;
+pub trait Entropy: Send + Sync + fmt::Debug {
+    /// Fills `out` with random bytes.
+    fn fill(&self, out: &mut [u8]);
+}
+
+/// The 10 random bytes of a `UUIDv7`.
+#[must_use]
+pub fn id_entropy(entropy: &dyn Entropy) -> IdEntropy {
+    let mut bytes = IdEntropy::default();
+    entropy.fill(&mut bytes);
+    bytes
 }
 
 /// A byte stream to the daemon.
@@ -100,8 +108,8 @@ impl Clock for SystemClock {
         clippy::disallowed_methods,
         reason = "this is the Clock seam's real implementation"
     )]
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+    async fn sleep(&self, delay: Millis) {
+        tokio::time::sleep(core::time::Duration::from_millis(delay.get())).await;
     }
 }
 
@@ -114,10 +122,8 @@ impl Entropy for OsEntropy {
         clippy::disallowed_methods,
         reason = "the Entropy seam's real impl is where randomness enters"
     )]
-    fn id_entropy(&mut self) -> IdEntropy {
-        let mut entropy = IdEntropy::default();
-        getrandom::fill(&mut entropy).expect("the operating system provides entropy");
-        entropy
+    fn fill(&self, out: &mut [u8]) {
+        getrandom::fill(out).expect("the operating system provides entropy");
     }
 }
 

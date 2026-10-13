@@ -1,9 +1,8 @@
 //! `update` driven directly, and views rendered with a test backend.
 
-use core::time::Duration;
-
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::Value;
+use verified_domain::Millis;
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId, UnixMillis};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{CreateSessionReply, Outcome, Rejection, SendMessageReply, Verdict};
@@ -338,7 +337,7 @@ fn caught_up_is_false_after_a_reconnect_until_a_read() {
         &mut app,
         StreamUpdate::Disconnected {
             error: ClientError::ClosedEarly,
-            retry: Some(Duration::from_millis(5)),
+            retry: Some(Millis::new(5)),
         },
     );
     let _cmd = stream(&mut app, StreamUpdate::Connected);
@@ -536,7 +535,7 @@ fn a_chunk_that_does_not_fold_breaks_the_stream_until_reloaded() {
         follow: FollowId(1),
         update: StreamUpdate::Disconnected {
             error: ClientError::ClosedEarly,
-            retry: Some(Duration::from_millis(1)),
+            retry: Some(Millis::new(1)),
         },
     }));
     assert!(matches!(app.connection(), Connection::Broken(_)));
@@ -589,7 +588,7 @@ fn retrying_shows_when() {
         &mut app,
         StreamUpdate::Disconnected {
             error: ClientError::ClosedEarly,
-            retry: Some(Duration::from_millis(500)),
+            retry: Some(Millis::new(500)),
         },
     );
     assert!(matches!(app.connection(), Connection::Retrying(reason) if reason.contains("500ms")));
@@ -604,7 +603,7 @@ fn ctrl_r_retries_at_once_while_retrying() {
         &mut app,
         StreamUpdate::Disconnected {
             error: ClientError::ClosedEarly,
-            retry: Some(Duration::from_millis(500)),
+            retry: Some(Millis::new(500)),
         },
     );
     assert!(matches!(

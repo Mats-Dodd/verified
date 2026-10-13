@@ -506,10 +506,9 @@ impl App {
             }
             StreamUpdate::Disconnected { error, retry } => {
                 self.connection = match retry {
-                    Some(delay) => Connection::Retrying(format!(
-                        "{error}; retrying in {}ms",
-                        delay.as_millis()
-                    )),
+                    Some(delay) => {
+                        Connection::Retrying(format!("{error}; retrying in {}ms", delay.get()))
+                    }
                     None => Connection::Down(error.to_string()),
                 };
                 Cmd::None

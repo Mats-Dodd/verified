@@ -21,10 +21,10 @@ use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey}
 use verified_server::model::fake;
 use verified_server::seam::{Clock, NoLock, Tasks};
 use verified_server::shell::{Planted, Seams, ShellConfig};
-use verified_server::shim::time::SimClock;
 use verified_server::shim::{fs, net};
 
-use crate::entropy::DaemonEntropy;
+use crate::clock::SimClock;
+use crate::entropy::SeededEntropy;
 use crate::env::SimEnv;
 use crate::ledger::{Entry, Ledger};
 use crate::scenario::FILES;
@@ -142,7 +142,7 @@ pub fn daemon(
                 model: Arc::new(model),
                 env: Arc::new(env),
                 clock,
-                entropy: Arc::new(DaemonEntropy::new(seed ^ u64::from(boot))),
+                entropy: Arc::new(SeededEntropy::new(seed ^ u64::from(boot))),
                 tasks,
             };
             let listener = net::bind(any_addr(PORT)).await?;
