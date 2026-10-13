@@ -516,10 +516,17 @@ impl Session {
         } else {
             records
         };
+        // The planted defect: the decision's tool runs start at once,
+        // before its records are durable.
         #[cfg(feature = "sim")]
-        let effects = if self.config.planted.run_before_persist {
-            self.run_before_persist(effects).await
-        } else {
+        let effects = {
+            let mut effects = effects;
+            if self.config.planted.run_before_persist {
+                for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
+                {
+                    self.start_effect(run).await;
+                }
+            }
             effects
         };
         if !records.is_empty() {
@@ -557,24 +564,6 @@ impl Session {
             self.tail.set(self.core.seq());
         }
         Ok(Persisted::Done(outcome, effects))
-    }
-
-    /// The planted defect: starts the decision's tool runs at once, before
-    /// its records are durable, and returns the other effects.
-    #[cfg(feature = "sim")]
-    async fn run_before_persist(&mut self, effects: Vec<Effect<Parsed>>) -> Vec<Effect<Parsed>> {
-        let mut rest = Vec::new();
-        for effect in effects {
-            match effect {
-                Effect::RunTool { .. } => self.start_effect(effect).await,
-                Effect::CallModel { .. }
-                | Effect::CancelModel { .. }
-                | Effect::AskApproval { .. }
-                | Effect::CancelTool { .. }
-                | Effect::Sleep { .. } => rest.push(effect),
-            }
-        }
-        rest
     }
 
     async fn decide(&mut self, event: Event<Parsed>) -> Result<Persisted, ShellError> {
