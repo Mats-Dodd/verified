@@ -22,14 +22,14 @@ use verified_domain::id::{IdEntropy, UnixMillis};
 /// Wall time and sleeping.
 #[async_trait]
 pub trait Clock: Send + Sync + fmt::Debug {
-    /// The wall time, for ids and stream cursors.
+    /// The wall time, for ids.
     fn now(&self) -> UnixMillis;
 
     /// Waits `delay`. Cancel-safe: dropping the future just stops waiting.
     async fn sleep(&self, delay: Millis);
 }
 
-/// Randomness for ids and jitter.
+/// Randomness for ids.
 pub trait Entropy: Send + Sync + fmt::Debug {
     /// Fills `out` with random bytes.
     fn fill(&self, out: &mut [u8]);
@@ -41,14 +41,6 @@ pub fn id_entropy(entropy: &dyn Entropy) -> IdEntropy {
     let mut bytes = IdEntropy::default();
     entropy.fill(&mut bytes);
     bytes
-}
-
-/// A random `u64`.
-#[must_use]
-pub fn entropy_u64(entropy: &dyn Entropy) -> u64 {
-    let mut bytes = [0u8; 8];
-    entropy.fill(&mut bytes);
-    u64::from_le_bytes(bytes)
 }
 
 /// The OS clock and tokio's timer.

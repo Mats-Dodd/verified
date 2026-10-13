@@ -14,8 +14,8 @@ use verified_domain::id::{CallId, IdEntropy, MessageId, SessionId, TurnId, UnixM
 use verified_domain::{Cause, Exit, Limits, LimitsConfig, Millis, Record, TurnOutcome};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
-    BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Stopped,
-    Written,
+    BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Kept,
+    Stopped, Written,
 };
 use verified_server::limits::ServerLimits;
 use verified_server::log::{MemDisk, MemLogStore};
@@ -24,7 +24,6 @@ use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{CommandError, Seams, SessionHandle, ShellConfig};
-use verified_server::tool::Kept;
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{

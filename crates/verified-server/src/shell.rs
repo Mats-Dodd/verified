@@ -98,9 +98,8 @@ pub struct ShellConfig {
 
 /// A deliberate defect, for the simulation's mutation tests. Without the
 /// `sim` feature there is none: the shipped daemon cannot plant one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Planted {
-    #[default]
     None,
     /// Start tool runs before their decision is durable (breaks Law 2:
     /// persist before acting). The model's replay must catch the run it

@@ -18,7 +18,6 @@
 //! may still be running.
 
 use core::fmt::Write as _;
-use std::collections::VecDeque;
 
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
@@ -150,36 +149,6 @@ pub const fn stopped(why: Stopped) -> &'static str {
     match why {
         Stopped::Cancelled => "stopped (cancelled); processes it started may still be running",
         Stopped::TimedOut => "stopped (timed out); processes it started may still be running",
-    }
-}
-
-/// The tail of a command's output: its last `limit` bytes, and how many
-/// came before them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Kept {
-    bytes: VecDeque<u8>,
-    omitted: u64,
-    limit: usize,
-}
-
-impl Kept {
-    /// Keeps nothing yet, and at most `limit` bytes.
-    #[must_use]
-    pub fn new(limit: usize) -> Self {
-        Self {
-            bytes: VecDeque::with_capacity(limit),
-            omitted: 0,
-            limit,
-        }
-    }
-
-    /// Appends `chunk`, dropping the oldest bytes past the limit.
-    pub fn push(&mut self, chunk: &[u8]) {
-        self.bytes.extend(chunk);
-        while self.bytes.len() > self.limit {
-            self.bytes.pop_front();
-            self.omitted = self.omitted.saturating_add(1);
-        }
     }
 }
 

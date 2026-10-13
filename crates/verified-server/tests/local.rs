@@ -21,8 +21,8 @@ use verified_server::log::{FileLog, Log as _};
 use verified_server::model::fake::FakeModel;
 use verified_server::payload::{Command, Parsed, ProjectPath, ToolArgs, Truncation, measure};
 use verified_server::seam::{
-    Clock, FileLock, Lock as _, LockError, OsEntropy, ProcessGroups, SystemClock, Tasks,
-    entropy_u64,
+    Clock, Entropy as _, FileLock, Lock as _, LockError, OsEntropy, ProcessGroups, SystemClock,
+    Tasks,
 };
 use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::{fs, net};
@@ -42,10 +42,12 @@ async fn within<F: Future>(
 }
 
 async fn scratch(name: &str) -> PathBuf {
+    let mut random = [0u8; 8];
+    OsEntropy.fill(&mut random);
     let dir = std::env::temp_dir().join(format!(
         "verified-{name}-{}-{:x}",
         std::process::id(),
-        entropy_u64(&OsEntropy)
+        u64::from_le_bytes(random)
     ));
     fs::create_dir_all(&dir).await.expect("a scratch dir");
     dir

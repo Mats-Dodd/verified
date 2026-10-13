@@ -20,12 +20,11 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use verified_domain::{EffectId, Millis};
 use verified_server::env::{
-    BashGrant, DirEntry, EditGrant, Env, EnvError, ExecOptions, ExitStatus, LocalEnv, Stopped,
-    Written,
+    BashGrant, DirEntry, EditGrant, Env, EnvError, ExecOptions, ExitStatus, Kept, LocalEnv,
+    Stopped, Written,
 };
 use verified_server::payload::ProjectPath;
 use verified_server::seam::Clock;
-use verified_server::tool::Kept;
 
 use crate::ledger::{Entry, Ledger, Op};
 

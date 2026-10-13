@@ -16,6 +16,7 @@
 
 use core::fmt;
 use core::pin::Pin;
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
@@ -33,7 +34,6 @@ use verified_domain::{EffectId, Millis};
 use crate::payload::{Command, Parsed, ProjectPath, Sibling, ToolArgs};
 use crate::seam::{Clock, ProcessGroups};
 use crate::shim::fs;
-use crate::tool::Kept;
 
 /// Why an `Env` operation failed, backend-independent (pi's `FileErrorCode`
 /// and `ExecutionErrorCode`).
@@ -139,6 +139,36 @@ pub struct ExecOptions {
     pub output_bytes: usize,
     /// Extra environment variables (e.g. `VERIFIED_CALL_ID`).
     pub env: Vec<(String, String)>,
+}
+
+/// The tail of a command's output: its last `limit` bytes, and how many
+/// came before them.
+#[derive(Debug)]
+pub struct Kept {
+    pub(crate) bytes: VecDeque<u8>,
+    pub(crate) omitted: u64,
+    limit: usize,
+}
+
+impl Kept {
+    /// Keeps nothing yet, and at most `limit` bytes.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(limit),
+            omitted: 0,
+            limit,
+        }
+    }
+
+    /// Appends `chunk`, dropping the oldest bytes past the limit.
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend(chunk);
+        while self.bytes.len() > self.limit {
+            self.bytes.pop_front();
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
 }
 
 /// What an approved call may do, derived from the call alone.
@@ -287,14 +317,14 @@ pub trait Env: Send + Sync + fmt::Debug {
 
     /// Runs the approved command with `sh -c` in the project root, in its
     /// own process group, and keeps the last `ExecOptions::output_bytes` of
-    /// its combined output. The command runs until its leader exits, even after its
-    /// output closes; nothing else in its group is signalled then, so
-    /// background processes it started may keep running. `cancel` and the
-    /// timeout send the group one `SIGKILL` and make the result
-    /// [`ExitStatus::Stopped`]; after that its output is read, and then its
-    /// leader waited for, at most `ExecOptions::drain` each, so neither a
-    /// process that left the group holding the output nor a leader the kill
-    /// could not reach can hang the call.
+    /// its combined output ([`Kept`]). The command runs until its leader
+    /// exits, even after its output closes; nothing else in its group is
+    /// signalled then, so background processes it started may keep running.
+    /// `cancel` and the timeout send the group one `SIGKILL` and make the
+    /// result [`ExitStatus::Stopped`]; after that its output is read, and
+    /// then its leader waited for, at most `ExecOptions::drain` each, so
+    /// neither a process that left the group holding the output nor a leader
+    /// the kill could not reach can hang the call.
     ///
     /// # Errors
     /// The shell could not start.
