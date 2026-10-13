@@ -12,8 +12,8 @@
 //! drops it (a refused resume stays, as [`Observed::Refused`]). [`replay`]
 //! walks the model along them and checks its properties on every state.
 
-use verified_domain::alpha::record;
 use verified_domain::{Limits, Record};
+use verified_model::alpha::record;
 use verified_model::{Harness, Mismatch, Observed, Replayed, alpha};
 use verified_server::payload::Parsed;
 use verified_server::shim::{Barrier, Observation};

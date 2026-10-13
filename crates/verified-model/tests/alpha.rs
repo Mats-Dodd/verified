@@ -7,12 +7,12 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use proptest::prelude::*;
 use verified_core::{Core, Decision, Effect, Event, ModelExit, Verdict};
-use verified_domain::alpha::record;
 use verified_domain::{
     CallId, Cause, EffectId, Epoch, Exit, Fault, Limits, LimitsConfig, MessageId, Millis, Record,
     ToolName, TurnId, UnixMillis,
 };
 use verified_model::alpha;
+use verified_model::alpha::record;
 use verified_server::payload::{ModelPart, Parsed, ToolInput, ToolOutput, measure, proposal};
 
 /// Small bounds, so that sizes reach the context limit and calls reach
