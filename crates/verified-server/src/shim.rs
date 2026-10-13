@@ -41,6 +41,10 @@ pub mod net {
         }
 
         impl Listener {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the shim is where the daemon's real listener is bound"
+            )]
             pub(super) async fn bind(addr: SocketAddr) -> io::Result<Self> {
                 tokio::net::TcpListener::bind(addr)
                     .await
@@ -197,6 +201,13 @@ pub mod net {
 ///
 /// Durability follows POSIX, which turmoil's filesystem models: a new file
 /// is durable only once its data is synced *and* its directory is synced.
+#[cfg_attr(
+    not(feature = "sim"),
+    expect(
+        clippy::disallowed_methods,
+        reason = "the shim is where the real filesystem is used; under sim it is turmoil's"
+    )
+)]
 pub mod fs {
     use std::ffi::OsString;
     use std::io;

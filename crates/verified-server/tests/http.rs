@@ -48,6 +48,10 @@ async fn within<F: Future>(
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test binds real loopback listeners for the daemon and the fake host, with or without the sim shim"
+)]
 async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

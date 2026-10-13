@@ -149,6 +149,13 @@ impl Dialer for TcpDialer {
         &self.authority
     }
 
+    #[cfg_attr(
+        not(feature = "sim"),
+        expect(
+            clippy::disallowed_methods,
+            reason = "the Dialer seam's real impl dials through the shim's stream; under sim it is turmoil's"
+        )
+    )]
     async fn dial(&self) -> io::Result<Box<dyn Stream>> {
         let stream = shim::TcpStream::connect((self.host.as_str(), self.port)).await?;
         Ok(Box::new(stream))

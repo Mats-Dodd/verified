@@ -174,6 +174,10 @@ async fn run_daemon(project: PathBuf, model: String, api_key: ApiKey) -> Result<
 }
 
 /// The version a daemon at `addr` reports, if it answers.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the binary's port probe, before any seam exists; the shipped binary never runs under sim"
+)]
 async fn daemon_version(addr: SocketAddr) -> Option<String> {
     let ask = async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
