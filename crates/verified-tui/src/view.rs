@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize as _};
 use ratatui::text::{Line, Span, Text};
 use serde_json::Value;
 use verified_wire::chunk::TurnEndReason;
+use verified_wire::stream::Freshness;
 use verified_wire::transcript::{Part, ToolPart, ToolState, TranscriptTurn};
 
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
@@ -175,7 +176,8 @@ pub enum Connection {
     /// Not following yet.
     Idle,
     Connecting,
-    Live,
+    /// Following; whether the last read on this connection reached the end.
+    Live(Freshness),
     /// Dropped; reconnecting after a delay.
     Retrying(String),
     /// Stopped following; ^r reconnects.
@@ -218,7 +220,7 @@ pub fn status_line(status: &Status<'_>) -> Line<'static> {
     spans.push(match status.connection {
         Connection::Idle => Span::styled("○", QUIET),
         Connection::Connecting => "◌ connecting".yellow(),
-        Connection::Live => "● live".green(),
+        Connection::Live(_) => "● live".green(),
         Connection::Retrying(reason) => Span::styled(format!("◌ {reason}"), PROMPT),
         Connection::Down(reason) => Span::styled(format!("✗ {reason} (^r)"), ERROR),
         Connection::Broken(reason) => Span::styled(format!("✗ {reason} (^r reloads)"), ERROR),

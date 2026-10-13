@@ -345,6 +345,32 @@ fn the_stream_drives_the_conversation() {
 }
 
 #[test]
+fn caught_up_is_false_after_a_reconnect_until_a_read() {
+    let mut app = opened();
+    let _cmd = read(&mut app, fixture("simple"), 11);
+    assert!(app.caught_up());
+    let _cmd = stream(
+        &mut app,
+        StreamUpdate::Disconnected {
+            error: ClientError::ClosedEarly,
+            retry: Some(Duration::from_millis(5)),
+        },
+    );
+    let _cmd = stream(&mut app, StreamUpdate::Connected);
+    assert!(!app.caught_up(), "reconnected, but nothing read yet");
+    let from = app.position().offset;
+    let _cmd = stream(
+        &mut app,
+        StreamUpdate::Read {
+            from,
+            chunks: Vec::new(),
+            control: control(11),
+        },
+    );
+    assert!(app.caught_up(), "the first read says it is up to date");
+}
+
+#[test]
 fn updates_from_a_replaced_follower_are_dropped() {
     let mut app = opened();
     let stale = app.follow;

@@ -135,7 +135,6 @@ pub struct App {
     /// Where the next read starts: just past the last folded read.
     position: Position,
     folded: Option<Folded>,
-    freshness: Freshness,
     follow: FollowId,
     connection: Connection,
     draft: String,
@@ -190,7 +189,7 @@ impl App {
     /// transcript is the fold of everything the daemon had committed then.
     #[must_use]
     pub const fn caught_up(&self) -> bool {
-        matches!(self.connection, Connection::Live) && matches!(self.freshness, Freshness::UpToDate)
+        matches!(self.connection, Connection::Live(Freshness::UpToDate))
     }
 
     /// No message waits for the daemon's acknowledgement.
@@ -386,14 +385,14 @@ impl App {
                 self.transcript = Transcript::new(&self.limits.wire);
                 self.rendered.clear();
                 self.position = START;
-                self.freshness = Freshness::Behind;
                 self.refollow()
             }
             (Phase::Ready, Connection::Idle | Connection::Down(_)) => self.refollow(),
             (Phase::Creating(Delivery::Sending), _)
-            | (Phase::Ready, Connection::Connecting | Connection::Live | Connection::Retrying(_)) => {
-                Cmd::None
-            }
+            | (
+                Phase::Ready,
+                Connection::Connecting | Connection::Live(_) | Connection::Retrying(_),
+            ) => Cmd::None,
         }
     }
 
@@ -489,7 +488,8 @@ impl App {
         }
         match update {
             StreamUpdate::Connected => {
-                self.connection = Connection::Live;
+                // Live, but nothing read on this connection says how far.
+                self.connection = Connection::Live(Freshness::Behind);
                 Cmd::None
             }
             StreamUpdate::Read {
@@ -529,8 +529,7 @@ impl App {
                     next: control.stream_next_offset,
                     chunks,
                 });
-                self.freshness = control.up_to_date;
-                self.connection = Connection::Live;
+                self.connection = Connection::Live(control.up_to_date);
                 Cmd::None
             }
             StreamUpdate::Disconnected { error, retry } => {
@@ -633,7 +632,6 @@ impl Model for App {
             transcript: Transcript::new(&flags.limits.wire),
             position: START,
             folded: None,
-            freshness: Freshness::Behind,
             follow: FollowId(0),
             connection: Connection::Idle,
             draft: String::new(),
