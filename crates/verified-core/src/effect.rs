@@ -140,7 +140,7 @@ pub enum Rejection {
     Busy,
     /// `Limits::turns_per_session` reached.
     SessionFull,
-    /// No call with that id awaits approval in the running turn.
+    /// No call with that id awaits approval in the running step.
     UnknownCall,
     /// No turn with that id is running.
     NotRunning,
@@ -151,8 +151,8 @@ pub enum Rejection {
 #[verifier::external_derive]
 pub enum Outcome {
     Accepted,
-    /// A repeat of something already done (same message, same verdict,
-    /// interrupt of a turn already stopping).
+    /// A repeat of something already done (same message, interrupt of a
+    /// turn already stopping).
     Exists,
     Rejected(Rejection),
     /// A completion that matches nothing in flight: an earlier epoch, a

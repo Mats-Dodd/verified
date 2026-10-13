@@ -406,7 +406,11 @@ fn mutating_tool_waits_for_the_user() {
     );
     single_run(&effects, "edit");
     let (outcome, effects) = driver.approve("edit", Verdict::Approve);
-    assert_eq!(outcome, Outcome::Exists, "a repeated approval is a no-op");
+    assert_eq!(
+        outcome,
+        Outcome::Rejected(Rejection::UnknownCall),
+        "a repeated approval finds nothing awaiting it"
+    );
     assert!(effects.is_empty(), "and starts nothing");
 }
 
@@ -617,7 +621,11 @@ fn interrupt_during_tools() {
         "the unapproved call never runs"
     );
     let (outcome, _) = driver.approve("edit", Verdict::Approve);
-    assert_eq!(outcome, Outcome::Exists, "too late to approve");
+    assert_eq!(
+        outcome,
+        Outcome::Rejected(Rejection::UnknownCall),
+        "too late to approve"
+    );
     let from = driver.log.len();
     driver.tool_done(read, Exit::Ok);
     assert_eq!(

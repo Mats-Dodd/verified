@@ -625,14 +625,6 @@ impl<P: Payload> Call<P> {
         };
         Call { id: self.id.clone(), args, rerun: self.rerun, phase: self.phase }
     }
-
-    /// The rerun class of the call's tool; `None` for an invalid request.
-    const fn rerun(&self) -> (rerun: Option<Rerun>)
-        ensures
-            rerun == self.rerun,
-    {
-        self.rerun
-    }
 }
 
 /// Which dispatched calls the decision starts.
@@ -1551,22 +1543,26 @@ impl<P: Payload> Core<P> {
         false
     }
 
-    /// Starts model call `step`, unless a bound says the turn is over.
-    fn start_step(&self, plan: &mut Plan<P>, step: StepId)
+    /// Starts model call `index` of `turn`, unless a bound says the turn is
+    /// over. The index is widened, so the step after the last `u32` is past
+    /// the bound too.
+    fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64)
         requires
             old(plan).inv(),
-            may_start(old(plan).scratch@, step),
+            may_start(old(plan).scratch@, turn, index as int),
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
-        if step.index >= self.limits.steps_per_turn() {
-            plan.emit(Record::TurnEnded { turn: step.turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
+        if index >= u64::from(self.limits.steps_per_turn()) {
+            plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
         } else if matches!(plan.scratch.context, Context::Exceeded) {
-            plan.emit(Record::TurnEnded { turn: step.turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
+            plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
         } else {
+            #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "Verus proves the index is below steps_per_turn, a u32")]
+            let step = StepId { turn, index: index as u32 };
             let seq = plan.emit(Record::StepStarted { step });
             let id = plan.id(seq);
             plan.effect(Effect::CallModel { id, step });
@@ -1615,7 +1611,7 @@ impl<P: Payload> Core<P> {
                             >= self.limits.calls_per_turn() {
                             plan.resolve(index, Exit::Err(Cause::Failed(Fault::Limit(Limit::Calls))));
                         } else {
-                            match plan.scratch.calls[index].rerun() {
+                            match plan.scratch.calls[index].rerun {
                                 None => plan.resolve(index, Exit::Err(Cause::Failed(Fault::Other))),
                                 Some(Rerun::Safe) => {
                                     plan.emit(
@@ -1675,15 +1671,8 @@ impl<P: Payload> Core<P> {
                 Intent::Proceed => {
                     if count == open.first_call {
                         plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Completed });
-                    } else if open.step.index < u32::MAX {
-                        self.start_step(plan, StepId { turn: open.turn, index: open.step.index + 1 });
                     } else {
-                        plan.emit(
-                            Record::TurnEnded {
-                                turn: open.turn,
-                                outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)),
-                            },
-                        );
+                        self.start_step(plan, open.turn, u64::from(open.step.index) + 1);
                     }
                 },
             }
@@ -1727,7 +1716,7 @@ impl<P: Payload> Core<P> {
         }
         let mut plan = self.plan();
         plan.emit(Record::TurnStarted { turn, message, text });
-        self.start_step(&mut plan, StepId { turn, index: 0 });
+        self.start_step(&mut plan, turn, 0);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -1766,13 +1755,11 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Rejected(Rejection::UnknownCall));
         };
         assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-        if !(matches!(plan.scratch.calls[index].phase, Phase::Proposed)) {
-            return quiet(Outcome::Exists);
-        }
-        // A call still awaiting approval while the turn is being cancelled
-        // cannot exist (the interrupt resolves it), and an invalid one never
-        // awaits approval.
-        if plan.scratch.calls[index].args.is_none() || matches!(open.intent, Intent::Cancel) {
+        // Only a valid call still proposed awaits approval, and none does
+        // while the turn is being cancelled (the interrupt resolves it). A
+        // repeated verdict finds nothing; the log tells it apart.
+        if !(matches!(plan.scratch.calls[index].phase, Phase::Proposed)) || plan.scratch.calls[index].args.is_none()
+            || matches!(open.intent, Intent::Cancel) {
             return quiet(Outcome::Rejected(Rejection::UnknownCall));
         }
         match verdict {
@@ -1911,8 +1898,8 @@ impl<P: Payload> Core<P> {
         match result {
             ModelExit::Finished(calls) => {
                 if Self::reused(&calls) {
-                    // Never two live calls with one id: the model boundary
-                    // refuses such a response, and so does the core.
+                    // Never two live calls with one id: an approval finds
+                    // its call by id.
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: failed });
                 } else {
                     plan.emit(Record::StepFinished { step: open.step, calls });
@@ -1974,7 +1961,7 @@ impl<P: Payload> Core<P> {
                 count == plan.scratch.calls@.len(),
                 open.first_call <= index,
                 match found {
-                    Some(at) => open.first_call <= at < count,
+                    Some(at) => open.first_call <= at < count && plan.scratch.calls@[at as int].phase is Dispatched,
                     None => true,
                 },
             decreases count - index,
@@ -1992,9 +1979,6 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         };
         assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-        if !(matches!(plan.scratch.calls[index].phase, Phase::Dispatched { .. })) {
-            return quiet(Outcome::Stale);
-        }
         plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
         self.settle(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
@@ -2018,7 +2002,7 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         match open.intent {
-            Intent::Proceed => self.start_step(&mut plan, open.step),
+            Intent::Proceed => self.start_step(&mut plan, open.turn, u64::from(open.step.index)),
             Intent::Cancel => {
                 plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
             },
@@ -2051,11 +2035,11 @@ impl<P: Payload> Core<P> {
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
                 },
                 (Stage::Starting, Intent::Proceed) => {
-                    self.start_step(&mut plan, StepId { turn: open.turn, index: 0 });
+                    self.start_step(&mut plan, open.turn, 0);
                 },
                 (Stage::Model { .. }, Intent::Proceed) => {
                     plan.emit(Record::StepReset { step: open.step, reason: Reset::Restart });
-                    self.start_step(&mut plan, open.step);
+                    self.start_step(&mut plan, open.turn, u64::from(open.step.index));
                 },
                 (Stage::Backoff { since, reset }, Intent::Proceed) => {
                     let id = plan.id(since);
@@ -2112,7 +2096,7 @@ impl<P: Payload> Core<P> {
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
-                match (plan.scratch.calls[index].rerun(), open.intent) {
+                match (plan.scratch.calls[index].rerun, open.intent) {
                     (None | Some(Rerun::Unsafe), Intent::Proceed | Intent::Cancel) => {
                         plan.resolve(index, Exit::Err(Cause::Unknown));
                     },
@@ -2127,18 +2111,19 @@ impl<P: Payload> Core<P> {
     }
 }
 
-/// Whether model call `step` may start from `view`: the next `StepStarted`
-/// applies, and so does a `TurnEnded` failing the turn by a bound.
-pub open spec fn may_start(view: CoreView, step: StepId) -> bool {
+/// Whether model call `index` of `turn` may start from `view`: the next
+/// `StepStarted` applies if the index is a `u32`, and so does a `TurnEnded`
+/// failing the turn by a bound.
+pub open spec fn may_start(view: CoreView, turn: TurnId, index: int) -> bool {
     match view.turn {
         Turn::Open(open) => {
             &&& open.intent is Proceed
-            &&& step.turn@ == open.turn@
+            &&& turn@ == open.turn@
             &&& resolved(view.calls, 0, view.calls.len() as int)
             &&& match open.stage {
-                Stage::Starting => step.index == 0,
-                Stage::Backoff { .. } => step.index == open.step.index,
-                Stage::Tools => open.step.index < u32::MAX && step.index == open.step.index + 1,
+                Stage::Starting => index == 0,
+                Stage::Backoff { .. } => index == open.step.index,
+                Stage::Tools => index == open.step.index + 1,
                 Stage::Model { .. } => false,
             }
         },

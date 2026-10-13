@@ -23,7 +23,7 @@ pub enum Verdict {
 #[verifier::external_derive]
 pub enum ModelExit<P: Payload> {
     /// The response finished, proposing these calls (possibly none). The
-    /// model boundary already refused a response that reuses a call id.
+    /// core refuses a response that reuses a call id.
     Finished(Vec<Proposal<P>>),
     Failed(Cause),
 }
@@ -32,7 +32,8 @@ pub enum ModelExit<P: Payload> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 pub enum Event<P: Payload> {
-    /// The user sent a message. Both ids were made by the client.
+    /// The user sent a message: the client made `message`; the shell minted
+    /// `turn`; a repeat is recognised by `message` alone.
     Message { message: MessageId, turn: TurnId, text: Measured<P::Text> },
     /// The user answered an approval request.
     Approve { call: CallId, verdict: Verdict },
