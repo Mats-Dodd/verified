@@ -459,9 +459,9 @@ pub mod fs {
 /// What a panicking daemon task does to the daemon (crash-only, Law 8).
 pub mod crash {
     /// After a daemon task panicked and its [`crate::seam::Tasks`] crashed. The panic hook has
-    /// already printed the panic and, where the daemon installed
-    /// [`crate::seam::ProcessGroups::kill_on_panic`], killed the running
-    /// commands.
+    /// already printed the panic; where the daemon installed
+    /// [`crate::seam::ProcessGroups::kill_on_panic`], it also killed the
+    /// running commands and aborted, so only a daemon without it gets here.
     ///
     /// Real: aborts the process. Nothing unwinds and no other task takes
     /// another step; the next start recovers from the log.

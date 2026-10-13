@@ -245,16 +245,19 @@ impl ProcessGroups {
         self.lock().is_empty()
     }
 
-    /// Kills every running group on any panic, before the process aborts
-    /// (`panic = "abort"` drops nothing and runs no `catch_unwind`) or
-    /// unwinds: chains [`ProcessGroups::kill_all`] after the current panic
-    /// hook.
+    /// Makes any panic the daemon's crash: chains [`ProcessGroups::kill_all`]
+    /// and then an abort after the current panic hook. Under
+    /// `panic = "abort"` nothing is dropped and no `catch_unwind` runs, so
+    /// the hook is all that is left to kill the commands; in an unwinding
+    /// build the abort keeps a panic that tokio or hyper catches from killing
+    /// the commands of a daemon that carries on serving.
     pub fn kill_on_panic(&self) {
         let groups = self.clone();
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |panicked| {
             previous(panicked);
             groups.kill_all();
+            std::process::abort();
         }));
     }
 

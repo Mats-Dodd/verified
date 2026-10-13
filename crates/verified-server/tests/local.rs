@@ -574,8 +574,8 @@ const GROUPS_TEST: &str = "a_panic_anywhere_kills_the_running_commands";
 
 /// The child half: a running command's process group is registered with
 /// the daemon's tasks, as `LocalEnv` does, the daemon's panic hook is installed, and
-/// a plain thread (no daemon task, so no `catch_unwind`) panics. The process
-/// then aborts, as `panic = "abort"` does: nothing is dropped.
+/// a plain thread (no daemon task, so no `catch_unwind`) panics. The hook
+/// aborts the process: nothing is dropped.
 fn panicking_thread() {
     use std::os::unix::process::CommandExt as _;
 
@@ -597,11 +597,6 @@ fn panicking_thread() {
     .expect("the parent reads it");
     tasks.groups().insert(group);
     tasks.groups().kill_on_panic();
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panicked| {
-        hook(panicked);
-        std::process::abort();
-    }));
     let panicked = std::thread::spawn(|| {
         panic!("a plain thread panics on purpose");
     })
