@@ -590,8 +590,8 @@ proof fn lemma_refusal_sticks<P: Payload>(view: CoreView, log: Seq<Record<P>>, a
 // ---------------------------------------------------------------------------
 
 /// Conversation size so far, against `Limits::context_bytes`. Past the bound
-/// it stays `Exceeded`: no wrap, no saturation, and every later step fails
-/// with `Limit::Context` before it is sent.
+/// it stays `Exceeded` (no wrap, no saturation) until a reset rewinds the
+/// step, and every later step fails with `Limit::Context` before it is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 enum Context {
@@ -714,6 +714,9 @@ pub struct Core<P: Payload> {
     /// The calls of the running (or last) turn, indexed by `CallIx`.
     calls: Vec<Call<P>>,
     context: Context,
+    /// `context` when the current step started: a reset rewinds to it, so a
+    /// discarded attempt's output does not count.
+    step_base: Context,
     /// Ghost audit of the calls: approvals and dispatches applied.
     ledger: Ghost<Seq<CallView>>,
 }
@@ -1086,6 +1089,7 @@ impl<P: Payload> Core<P> {
             turn: Turn::Idle,
             calls,
             context: Context::Within(0),
+            step_base: Context::Within(0),
             ledger: Ghost(Seq::empty()),
         };
         assert(core@.calls =~= initial().calls);
@@ -1164,6 +1168,7 @@ impl<P: Payload> Core<P> {
             turn: self.turn,
             calls,
             context: self.context,
+            step_base: self.step_base,
             ledger: Ghost(self.ledger@),
         };
         proof {
@@ -1291,6 +1296,7 @@ impl<P: Payload> Core<P> {
                 self.turn = Turn::Open(
                     Open { step: *step, retries, stage: Stage::Model { since: self.seq }, ..open },
                 );
+                self.step_base = self.context;
                 self.seq = next;
                 Ok(())
             },
@@ -1335,6 +1341,7 @@ impl<P: Payload> Core<P> {
                 self.turn = Turn::Open(
                     Open { retries, stage: Stage::Backoff { since: self.seq, reset: *reason }, ..open },
                 );
+                self.context = self.step_base;
                 self.seq = next;
                 Ok(())
             },
@@ -2272,6 +2279,7 @@ impl<P: Payload> fmt::Debug for Core<P> {
             .field("turn", &self.turn)
             .field("calls", &self.calls)
             .field("context", &self.context)
+            .field("step_base", &self.step_base)
             .finish_non_exhaustive()
     }
 }
@@ -2286,6 +2294,7 @@ impl<P: Payload> PartialEq for Core<P> {
             && self.turn == other.turn
             && self.calls == other.calls
             && self.context == other.context
+            && self.step_base == other.step_base
     }
 }
 

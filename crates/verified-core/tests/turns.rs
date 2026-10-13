@@ -776,6 +776,46 @@ fn context_is_checked_before_sending() {
 }
 
 #[test]
+fn a_discarded_attempt_does_not_count_against_context() {
+    let mut driver = Driver::new(small_limits());
+    let first = driver.start();
+    driver.send(Event::ModelParts {
+        id: first,
+        parts: payload(600),
+    });
+    let (_, effects) = driver.send(Event::ModelDone {
+        id: first,
+        result: ModelExit::Failed(Cause::Failed(Fault::Network)),
+    });
+    let sleep = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Sleep { id, .. } => Some(*id),
+            Effect::CallModel { .. }
+            | Effect::CancelModel { .. }
+            | Effect::AskApproval { .. }
+            | Effect::RunTool { .. }
+            | Effect::CancelTool { .. } => None,
+        })
+        .expect("a backoff");
+    let (_, effects) = driver.send(Event::Woke { id: sleep });
+    let second = model_call(&effects);
+    driver.send(Event::ModelParts {
+        id: second,
+        parts: payload(600),
+    });
+    let (_, effects) = driver.finish(second, vec![propose("read", Tool::Read)]);
+    let read = single_run(&effects, "read");
+    let (_, effects) = driver.tool_done(read, Exit::Ok);
+    assert_ne!(
+        driver.log.last(),
+        Some(&ended(TurnOutcome::Failed(Failure::Limit(Limit::Context)))),
+        "only the attempt that was kept counts"
+    );
+    model_call(&effects);
+}
+
+#[test]
 fn calls_past_the_step_bound_are_recorded_and_fail() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
