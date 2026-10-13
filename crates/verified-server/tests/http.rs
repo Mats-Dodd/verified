@@ -25,8 +25,6 @@ use verified_domain::id::{MessageId, SessionId, UnixMillis};
 use verified_server::daemon;
 use verified_server::limits::ServerLimits;
 use verified_server::log::{MemDisk, MemLogStore};
-use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
-use verified_server::model::fake;
 use verified_server::model::{Model as _, ModelError, ModelRequest};
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{Seams, ShellConfig};
@@ -40,17 +38,9 @@ use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
 use verified_wire::transcript::Transcript;
 
-use common::within;
+use common::{client, fake_model, listener, within};
 
 type HttpClient = Client<HttpConnector, Full<Bytes>>;
-
-async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a local port");
-    let addr = listener.local_addr().expect("bound");
-    (listener, addr)
-}
 
 async fn start() -> (SocketAddr, Tasks) {
     start_with(ServerLimits::v0()).await
@@ -60,22 +50,7 @@ async fn start_with(limits: ServerLimits) -> (SocketAddr, Tasks) {
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let (fake_listener, fake_addr) = listener().await;
-    let fake_app = fake::router(Arc::clone(&clock), tasks.clone());
-    tasks.spawn(async move {
-        drop(axum::serve(fake_listener, fake_app).await);
-    });
-    let model = AnthropicModel::new(
-        HttpConnector::new(),
-        AnthropicConfig {
-            base: format!("http://{fake_addr}").parse().expect("a uri"),
-            api_key: ApiKey::new("test-key".to_owned()),
-            model: "claude-test".to_owned(),
-        },
-        &limits,
-        Arc::clone(&clock),
-    )
-    .expect("a client");
+    let model = fake_model(&limits, &clock, &tasks).await;
 
     let (daemon_listener, daemon_addr) = listener().await;
     let seams = Seams {
@@ -505,17 +480,7 @@ async fn stalled_call(reply: &'static [u8]) -> Result<(), ModelError> {
     let mut limits = ServerLimits::v0();
     limits.model_response_timeout = Millis::new(100);
     limits.model_idle_timeout = Millis::new(100);
-    let model = AnthropicModel::new(
-        HttpConnector::new(),
-        AnthropicConfig {
-            base: format!("http://{addr}").parse().expect("a uri"),
-            api_key: ApiKey::new("test-key".to_owned()),
-            model: "claude-test".to_owned(),
-        },
-        &limits,
-        Arc::new(SystemClock),
-    )
-    .expect("a client");
+    let model = client(addr, &limits, Arc::new(SystemClock));
     let (parts, _receiver) = tokio::sync::mpsc::channel(16);
     within(
         Duration::from_secs(10),

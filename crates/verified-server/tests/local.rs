@@ -4,6 +4,7 @@
 #![cfg(not(feature = "sim"))]
 #![expect(
     clippy::disallowed_methods,
+    clippy::disallowed_types,
     clippy::panic,
     clippy::zombie_processes,
     reason = "test harness code, not the code under test"
@@ -26,7 +27,6 @@ use verified_server::daemon::{self, DaemonError, Layout};
 use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
 use verified_server::log::{FileLog, Log as _};
-use verified_server::model::fake::FakeModel;
 use verified_server::payload::{Command, Parsed, ProjectPath, ToolArgs, Truncation, measure};
 use verified_server::seam::{
     Clock, Entropy as _, FileLock, Lock as _, LockError, OsEntropy, ProcessGroups, SystemClock,
@@ -36,7 +36,7 @@ use verified_server::shell::{Seams, ShellConfig};
 use verified_server::shim::{fs, net};
 use verified_server::tool;
 
-use common::within;
+use common::{fake_model, within};
 
 async fn scratch(name: &str) -> PathBuf {
     let mut random = [0u8; 8];
@@ -410,7 +410,7 @@ async fn daemon_takes_the_lock_and_writes_the_port_file() {
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
-        model: Arc::new(FakeModel::new(Arc::clone(&clock), 1000)),
+        model: Arc::new(fake_model(&ServerLimits::v0(), &clock, &tasks).await),
         env: Arc::new(local(project.clone())),
         clock,
         entropy: Arc::new(OsEntropy),

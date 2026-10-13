@@ -16,10 +16,9 @@
 //!
 //! A last user message of only tool results is answered `Result: <first result>`.
 //!
-//! Two transports serve the script: [`router`] is a real HTTP host (for
+//! [`router`] serves the script as an HTTP host, for
 //! [`super::anthropic::AnthropicModel`] over a socket, or over turmoil in
-//! simulation), and [`FakeModel`] runs it in-process through the same
-//! [`StreamParser`].
+//! simulation.
 
 use core::fmt;
 use std::convert::Infallible;
@@ -27,22 +26,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::post;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use verified_domain::Millis;
 use verified_wire::sse::SseEvent;
 
-use super::anthropic::{Progress, StreamParser, classify_status, request_json};
-use super::{Model, ModelError, ModelRequest};
-use crate::payload::ModelPart;
 use crate::seam::{Clock, Tasks};
 
 /// The fake's reply to one request.
@@ -297,63 +291,6 @@ fn sse_of(event: &Value) -> SseEvent {
     SseEvent::new(name, event.to_string()).expect("scripted events are valid SSE")
 }
 
-/// The script, in-process: no HTTP, the same parser as the real client.
-#[derive(Debug, Clone)]
-pub struct FakeModel {
-    clock: Arc<dyn Clock>,
-    max_parts: usize,
-}
-
-impl FakeModel {
-    #[must_use]
-    pub fn new(clock: Arc<dyn Clock>, max_parts: usize) -> Self {
-        Self { clock, max_parts }
-    }
-}
-
-#[async_trait]
-impl Model for FakeModel {
-    async fn stream(
-        &self,
-        request: &ModelRequest,
-        parts: mpsc::Sender<ModelPart>,
-        cancel: &CancellationToken,
-    ) -> Result<(), ModelError> {
-        match reply(&request_json("fake", request)) {
-            Reply::Status { status, body } => Err(classify_status(status, &body.to_string())),
-            Reply::Events { events, pace } => {
-                let mut parser = StreamParser::new(self.max_parts, 1 << 20);
-                for event in &events {
-                    if pace.get() > 0 {
-                        tokio::select! {
-                            biased;
-                            () = self.clock.sleep(pace) => {}
-                            () = cancel.cancelled() => return Err(ModelError::Interrupted),
-                        }
-                    }
-                    if cancel.is_cancelled() {
-                        return Err(ModelError::Interrupted);
-                    }
-                    let mut out = Vec::new();
-                    let progress = parser.event(&sse_of(event), &mut out)?;
-                    for part in out {
-                        parts
-                            .send(part)
-                            .await
-                            .map_err(|_closed| ModelError::Interrupted)?;
-                    }
-                    if matches!(progress, Progress::Done) {
-                        return Ok(());
-                    }
-                }
-                Err(ModelError::Network(
-                    "the stream ended before message_stop".to_owned(),
-                ))
-            }
-        }
-    }
-}
-
 #[derive(Clone)]
 struct FakeHost {
     clock: Arc<dyn Clock>,
@@ -366,10 +303,15 @@ impl fmt::Debug for FakeHost {
     }
 }
 
+/// The largest request the host takes: Anthropic's own bound on a Messages
+/// request.
+const MAX_REQUEST_BYTES: usize = 32 << 20;
+
 /// The script as an HTTP host: `POST /v1/messages`, streaming SSE.
 pub fn router(clock: Arc<dyn Clock>, tasks: Tasks) -> Router {
     Router::new()
         .route("/v1/messages", post(messages))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(FakeHost { clock, tasks })
 }
 

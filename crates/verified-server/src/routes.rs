@@ -383,6 +383,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use hyper_util::client::legacy::connect::HttpConnector;
     use tokio::sync::{Semaphore, mpsc};
     use verified_domain::Millis;
     use verified_domain::id::{SessionId, UnixMillis};
@@ -393,7 +394,7 @@ mod tests {
     use crate::env::LocalEnv;
     use crate::limits::ServerLimits;
     use crate::log::{MemDisk, MemLogStore};
-    use crate::model::fake::FakeModel;
+    use crate::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
     use crate::seam::{Clock, OsEntropy, SystemClock, Tasks};
     use crate::shell::{Planted, Seams, ShellConfig};
 
@@ -407,10 +408,20 @@ mod tests {
         let tasks = Tasks::new();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let seams = Seams {
-            model: Arc::new(FakeModel::new(
-                Arc::clone(&clock),
-                limits.model_parts_per_call,
-            )),
+            // Never called: the test sends no message.
+            model: Arc::new(
+                AnthropicModel::new(
+                    HttpConnector::new(),
+                    AnthropicConfig {
+                        base: "http://127.0.0.1:9".parse().expect("a uri"),
+                        api_key: ApiKey::new("unused".to_owned()),
+                        model: "fake".to_owned(),
+                    },
+                    &limits,
+                    Arc::clone(&clock),
+                )
+                .expect("a client"),
+            ),
             env: Arc::new(LocalEnv::new(
                 PathBuf::from("."),
                 Arc::clone(&clock),

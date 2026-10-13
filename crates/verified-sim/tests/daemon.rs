@@ -1,4 +1,4 @@
-//! The daemon alone on turmoil, driven by the TUI's client: a panic in a
+//! The daemon on turmoil, driven by the TUI's client: a panic in a
 //! daemon task fails its host (crash-only under the simulation), and a
 //! session holding over 4 MiB of tool output is followed from the start.
 #![expect(clippy::panic, reason = "test harness code, not the code under test")]
@@ -15,7 +15,6 @@ use verified_domain::{Limits as CoreLimits, LimitsConfig};
 use verified_server::daemon::{self, Layout};
 use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
-use verified_server::model::fake::FakeModel;
 use verified_server::model::{Model, ModelError, ModelRequest};
 use verified_server::payload::ModelPart;
 use verified_server::seam::{Clock, NoLock, Tasks};
@@ -23,7 +22,7 @@ use verified_server::shell::{Planted, Seams, ShellConfig};
 use verified_server::shim::{fs, net};
 use verified_sim::clock::SimClock;
 use verified_sim::entropy::SeededEntropy;
-use verified_sim::hosts::{DAEMON, PORT, Software, epoch};
+use verified_sim::hosts::{ANTHROPIC, DAEMON, PORT, Software, anthropic, epoch, model};
 use verified_tui::Limits;
 use verified_tui::client::{Answer, Client, ClientError, Command, StreamUpdate};
 use verified_tui::seam::TcpDialer;
@@ -35,7 +34,7 @@ use verified_wire::stream::Offset;
 /// The daemon under `limits` with `model`, its project holding `files` (a
 /// name and a size each, filled with `x`).
 fn daemon_host(
-    model: fn(Arc<dyn Clock>) -> Arc<dyn Model>,
+    model: fn(&ServerLimits, Arc<dyn Clock>) -> Arc<dyn Model>,
     limits: ServerLimits,
     files: &'static [(&'static str, usize)],
 ) -> impl Fn() -> Software {
@@ -51,7 +50,7 @@ fn daemon_host(
             let tasks = Tasks::new();
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let seams = Seams {
-                model: model(Arc::clone(&clock)),
+                model: model(&limits, Arc::clone(&clock)),
                 env: Arc::new(LocalEnv::new(
                     PathBuf::from(project),
                     Arc::clone(&clock),
@@ -146,7 +145,7 @@ fn a_panicking_task_fails_the_daemon_host() {
     let mut sim = turmoil::Builder::new().build();
     sim.host(
         DAEMON,
-        daemon_host(|_| Arc::new(PanickingModel), ServerLimits::v0(), &[]),
+        daemon_host(|_, _| Arc::new(PanickingModel), ServerLimits::v0(), &[]),
     );
     sim.client("tui", async {
         let client = client();
@@ -179,10 +178,11 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(600))
         .build();
+    sim.host(ANTHROPIC, anthropic());
     sim.host(
         DAEMON,
         daemon_host(
-            |clock| Arc::new(FakeModel::new(clock, 1000)),
+            |limits, clock| Arc::new(model(limits, clock).expect("a client")),
             limits,
             &[("big.txt", 64usize << 10u32)],
         ),

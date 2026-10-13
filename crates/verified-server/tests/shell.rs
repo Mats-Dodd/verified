@@ -1,7 +1,9 @@
 //! In-process tests of the shell: the real core, shell, projection, history,
-//! tools and log framing, with the scripted model, an in-memory environment
-//! and an in-memory disk. No sockets and no filesystem, so they run the same
-//! with and without the `sim` feature.
+//! tools and log framing, with an in-memory environment and an in-memory
+//! disk, and the scripted model served on loopback to the real Anthropic
+//! client. No filesystem, and the one socket is bound directly rather than
+//! through the shim, so they run the same with and without the `sim`
+//! feature.
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -26,7 +28,6 @@ use verified_server::env::{
 };
 use verified_server::limits::ServerLimits;
 use verified_server::log::{MemDisk, MemLogStore};
-use verified_server::model::fake::FakeModel;
 use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
@@ -39,7 +40,7 @@ use verified_wire::command::{
 use verified_wire::stream::Offset;
 use verified_wire::transcript::Transcript;
 
-use common::within;
+use common::{fake_model, within};
 
 /// Files and a shell in memory. `block` commands wait for their cancel.
 #[derive(Debug, Default)]
@@ -185,10 +186,7 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
-        model: Arc::new(FakeModel::new(
-            Arc::clone(&clock),
-            limits.model_parts_per_call,
-        )),
+        model: Arc::new(fake_model(&limits, &clock, &tasks).await),
         env,
         clock,
         entropy: Arc::new(OsEntropy),
@@ -792,12 +790,13 @@ async fn torn_tail_is_cut_and_corruption_refused() {
     disk.set_bytes(session_id(), damaged);
     let (fatal, _failed) = mpsc::channel(1);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let tasks = Tasks::new();
     let seams = Seams {
-        model: Arc::new(FakeModel::new(Arc::clone(&clock), 100)),
+        model: Arc::new(fake_model(&limits(), &clock, &tasks).await),
         env: Arc::new(MemEnv::default()),
         clock,
         entropy: Arc::new(OsEntropy),
-        tasks: Tasks::new(),
+        tasks,
     };
     let config = Arc::new(ShellConfig {
         limits: limits(),

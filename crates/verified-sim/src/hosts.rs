@@ -79,6 +79,27 @@ pub fn anthropic() -> impl Fn() -> Software {
     }
 }
 
+/// The real Anthropic client, talking to the fake Anthropic over the
+/// simulated network.
+///
+/// # Errors
+/// Never: the fake's address makes an endpoint.
+pub fn model(
+    limits: &ServerLimits,
+    clock: Arc<dyn Clock>,
+) -> turmoil::Result<AnthropicModel<net::Connector>> {
+    Ok(AnthropicModel::new(
+        net::Connector,
+        AnthropicConfig {
+            base: format!("http://{ANTHROPIC}:{MODEL_PORT}").parse()?,
+            api_key: ApiKey::new("simulated".to_owned()),
+            model: MODEL.to_owned(),
+        },
+        limits,
+        clock,
+    )?)
+}
+
 /// Creates the project's files on first boot (durably), then reads them.
 async fn project_files() -> turmoil::Result<BTreeMap<String, String>> {
     let project = Path::new(PROJECT);
@@ -118,16 +139,7 @@ pub fn daemon(
             let files = project_files().await?;
             ledger.record(Entry::Boot { boot, files });
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
-            let model = AnthropicModel::new(
-                net::Connector,
-                AnthropicConfig {
-                    base: format!("http://{ANTHROPIC}:{MODEL_PORT}").parse()?,
-                    api_key: ApiKey::new("simulated".to_owned()),
-                    model: MODEL.to_owned(),
-                },
-                &limits,
-                Arc::clone(&clock),
-            )?;
+            let model = model(&limits, Arc::clone(&clock))?;
             let tasks = Tasks::new();
             let env = SimEnv::new(
                 LocalEnv::new(
