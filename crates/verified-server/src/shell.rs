@@ -22,9 +22,12 @@
 //!
 //! Should the log refuse an append anyway (its file is full), nothing was
 //! written and nothing is applied: the session stops taking records. It
-//! keeps serving its stream and refuses every command as full; a restart
-//! replays the same log and carries on until an append is refused again.
-//! Nothing acknowledged is ever lost, and the daemon never crash-loops on it.
+//! interrupts the running turn, whose closing records alone may take the
+//! log's reserve ([`ServerLimits::reserve`]), so the turn still ends. It
+//! keeps serving its stream and refuses every record from then on; a
+//! restart replays the same log and carries on until an append is refused
+//! again, ending a turn the crash left running the same way. Nothing
+//! acknowledged is ever lost, and the daemon never crash-loops on it.
 //!
 //! Law 7, as clarified: no side effect is ever cancelled by dropping its
 //! future. Tool runs and log appends run to completion (a tool checks its
@@ -64,7 +67,7 @@ use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
 use crate::model::Model;
-use crate::payload::{ModelPart, Parsed, measure, proposal};
+use crate::payload::{ModelPart, Parsed, ToolOutput, Truncation, measure, proposal};
 use crate::projection::Projector;
 use crate::seam::{Clock, Entropy, World, id_entropy};
 use crate::shim::{Barrier, barrier};
@@ -384,7 +387,8 @@ pub struct Session {
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
-    /// Why the log stopped taking records, once it has.
+    /// Why the log stopped taking records, once it has: from then on only
+    /// the running turn's closing records are persisted, into the reserve.
     full: Option<String>,
 }
 
@@ -463,12 +467,14 @@ impl Session {
     }
 
     async fn run(mut self, mut receiver: mpsc::Receiver<Input>) -> Result<(), ShellError> {
-        let resumed = self.core.resume();
-        #[cfg(feature = "sim")]
-        crate::shim::observe(crate::shim::Observation::Resumed {
-            records: resumed.records.clone(),
-        });
-        if let Persisted::Done(_, effects) = self.persist(resumed).await? {
+        let mut resumed = self.resume().await?;
+        if matches!(resumed, Persisted::Refused) && self.core.running().is_some() {
+            // The log has no room to carry the turn on: interrupt it, and
+            // resume again, which now ends it.
+            self.close().await?;
+            resumed = self.resume().await?;
+        }
+        if let Persisted::Done(_, effects) = resumed {
             self.start_effects(effects).await;
         }
         let shutdown = self.seams.world.shutdown().clone();
@@ -485,8 +491,19 @@ impl Session {
         }
     }
 
-    /// Steps 2 and 3: durable, then applied and projected. Once the log
-    /// has refused an append, nothing more is persisted.
+    async fn resume(&mut self) -> Result<Persisted, ShellError> {
+        let resumed = self.core.resume();
+        #[cfg(feature = "sim")]
+        crate::shim::observe(crate::shim::Observation::Resumed {
+            records: resumed.records.clone(),
+        });
+        self.persist(resumed).await
+    }
+
+    /// Steps 2 and 3: durable, then applied and projected. An ordinary
+    /// append leaves the log's reserve free. Once the log has refused one,
+    /// only the running turn's closing records are persisted, into the
+    /// reserve.
     async fn persist(&mut self, decision: Decision<Parsed>) -> Result<Persisted, ShellError> {
         let Decision {
             records,
@@ -506,17 +523,21 @@ impl Session {
             effects
         };
         if !records.is_empty() {
-            if self.full.is_some() {
+            let spare = if self.full.is_none() {
+                self.config.limits.reserve()
+            } else if self.core.running().is_some() && records.iter().all(closes) {
+                0
+            } else {
                 return Ok(Persisted::Refused);
-            }
+            };
             assert!(
                 self.log.next_seq() == self.core.seq(),
                 "the log and the core agree on the next seq"
             );
-            match self.log.append(&records).await {
+            match self.log.append(&records, spare).await {
                 Ok(()) => {}
                 Err(error) if error.refused() => {
-                    self.full = Some(error.to_string());
+                    self.full.get_or_insert_with(|| error.to_string());
                     return Ok(Persisted::Refused);
                 }
                 Err(error) => return Err(error.into()),
@@ -565,7 +586,29 @@ impl Session {
             event: observed,
             records: decision.records.clone(),
         });
-        self.persist(decision).await
+        let persisted = self.persist(decision).await?;
+        if matches!(persisted, Persisted::Refused) {
+            self.close().await?;
+        }
+        Ok(persisted)
+    }
+
+    /// Once the log is full, interrupts the running turn (if it is not
+    /// stopping already), so that its closing records end it.
+    async fn close(&mut self) -> Result<(), ShellError> {
+        let Some(turn) = self.core.running() else {
+            return Ok(());
+        };
+        let decision = self.core.decide(Event::Interrupt { turn });
+        #[cfg(feature = "sim")]
+        crate::shim::observe(crate::shim::Observation::Decided {
+            event: Event::Interrupt { turn },
+            records: decision.records.clone(),
+        });
+        if let Persisted::Done(_, effects) = self.persist(decision).await? {
+            self.start_effects(effects).await;
+        }
+        Ok(())
     }
 
     /// The answer to every command once the log is full.
@@ -592,18 +635,20 @@ impl Session {
                     | Event::ModelParts { .. }
                     | Event::Woke { .. } => {}
                 }
-                if let Persisted::Done(_, effects) = self.decide(event).await? {
+                let closed = closing(&event);
+                let persisted = if self.full.is_none() {
+                    self.decide(event).await?
+                } else {
+                    Persisted::Refused
+                };
+                let persisted = match (persisted, closed) {
+                    // The log is full: the completion as it takes one.
+                    (Persisted::Refused, Some(closed)) => self.decide(closed).await?,
+                    (persisted, _) => persisted,
+                };
+                if let Persisted::Done(_, effects) = persisted {
                     self.start_effects(effects).await;
                 }
-            }
-            Input::Message { reply, .. } if self.full.is_some() => {
-                drop(reply.send(Err(self.full())));
-            }
-            Input::Approve { reply, .. } if self.full.is_some() => {
-                drop(reply.send(Err(self.full())));
-            }
-            Input::Cancel { reply, .. } if self.full.is_some() => {
-                drop(reply.send(Err(self.full())));
             }
             Input::Message { command, reply } => {
                 if self.held_bytes >= self.config.limits.session_bytes
@@ -896,6 +941,62 @@ impl Session {
                 });
             }
         }
+    }
+}
+
+/// Whether `record` is one that ends a turn, and so may take the log's
+/// reserve: a short line with no payload.
+const fn closes(record: &Record<Parsed>) -> bool {
+    match record {
+        Record::CancelRequested { .. }
+        | Record::ToolResult { .. }
+        | Record::TurnEnded { .. }
+        | Record::EpochBumped { .. } => true,
+        Record::TurnStarted { .. }
+        | Record::StepStarted { .. }
+        | Record::ModelOutput { .. }
+        | Record::StepReset { .. }
+        | Record::StepFinished { .. }
+        | Record::Approved { .. }
+        | Record::Dispatched { .. } => false,
+    }
+}
+
+/// A completion as a full log takes it, so the core answers with closing
+/// records that fit the reserve: a tool's output is dropped, and a model's
+/// finished response (its calls would be a `StepFinished`) counts as
+/// interrupted, as the turn being stopped is. `None` for an event a full
+/// log drops: streamed parts, and a timer, which the turn's interrupt made
+/// stale.
+fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
+    match event {
+        Event::ToolDone { id, exit, output } => {
+            let shown = u64::try_from(output.body.text.len()).unwrap_or(u64::MAX);
+            let omitted_bytes = match output.body.truncation {
+                Truncation::Complete => shown,
+                Truncation::Truncated { omitted_bytes } => omitted_bytes.saturating_add(shown),
+            };
+            Some(Event::ToolDone {
+                id: *id,
+                exit: *exit,
+                output: measure(ToolOutput {
+                    text: String::new(),
+                    truncation: Truncation::Truncated { omitted_bytes },
+                }),
+            })
+        }
+        Event::ModelDone { id, result } => Some(Event::ModelDone {
+            id: *id,
+            result: match result {
+                ModelExit::Finished(_) => ModelExit::Failed(Cause::Interrupted),
+                ModelExit::Failed(cause) => ModelExit::Failed(*cause),
+            },
+        }),
+        Event::Message { .. }
+        | Event::Approve { .. }
+        | Event::Interrupt { .. }
+        | Event::ModelParts { .. }
+        | Event::Woke { .. } => None,
     }
 }
 

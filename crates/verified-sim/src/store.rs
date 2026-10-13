@@ -104,10 +104,10 @@ impl Log for WatchedLog {
         self.inner.next_seq()
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
+    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError> {
         let first = self.inner.next_seq();
         self.clock.sleep(SYNC_LATENCY).await;
-        self.inner.append(records).await?;
+        self.inner.append(records, spare).await?;
         self.ledger.record(Entry::Acked {
             first,
             records: records.to_vec(),

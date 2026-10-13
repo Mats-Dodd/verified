@@ -314,12 +314,14 @@ pub trait Log: Send + fmt::Debug {
     /// The seq the next appended record gets.
     fn next_seq(&self) -> u64;
 
-    /// Appends `records` as one group commit: one write, one fsync. Returns
-    /// once they are durable. After an error the log is unusable.
+    /// Appends `records` as one group commit: one write, one fsync, leaving
+    /// at least `spare` bytes of the file's bound free. Returns once they
+    /// are durable. After an error the log is unusable, except after a
+    /// [`LogError::refused`] one.
     ///
     /// # Errors
     /// Any IO error; the caller crashes.
-    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError>;
+    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError>;
 
     /// Rereads the durable records from `seq` on.
     ///
@@ -330,14 +332,14 @@ pub trait Log: Send + fmt::Debug {
 
 /// The framed lines of a group commit from `first`, refused when a line
 /// would be longer than `max_line` (as replay measures it: without its
-/// newline) or the file, now `length` bytes, would grow past `max_file`.
+/// newline) or the file, now `length` bytes, would grow past `limit`.
 fn frames(
     path: &str,
     first: u64,
     records: &[Record<Parsed>],
     length: u64,
     max_line: usize,
-    max_file: u64,
+    limit: u64,
 ) -> Result<Vec<u8>, LogError> {
     let mut bytes = Vec::new();
     let mut seq = first;
@@ -356,11 +358,11 @@ fn frames(
         seq = seq.checked_add(1).expect("fewer than 2^64 records");
     }
     let grown = length.saturating_add(to_u64(bytes.len()));
-    if grown > max_file {
+    if grown > limit {
         return Err(LogError::Full {
             path: path.to_owned(),
             length: grown,
-            limit: max_file,
+            limit,
         });
     }
     Ok(bytes)
@@ -466,14 +468,14 @@ impl Log for FileLog {
         self.next
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
+    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError> {
         let bytes = frames(
             &self.path.display().to_string(),
             self.next,
             records,
             self.length,
             self.max_line,
-            self.max_file,
+            self.max_file.saturating_sub(spare),
         )?;
         fs::append_synced(&mut self.file, &bytes)
             .await
@@ -568,7 +570,7 @@ impl Log for MemLog {
         self.next
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
+    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError> {
         let length = self
             .disk
             .bytes(self.session)
@@ -579,7 +581,7 @@ impl Log for MemLog {
             records,
             length,
             self.max_line,
-            self.max_file,
+            self.max_file.saturating_sub(spare),
         )?;
         self.disk.append(self.session, &bytes);
         self.next = advance(self.next, records);
@@ -827,7 +829,7 @@ mod tests {
         let mut acked = Vec::new();
         let mut refused = Vec::new();
         for group in groups {
-            match log.append(group).await {
+            match log.append(group, 0).await {
                 Ok(()) => acked.extend(group.iter().cloned()),
                 Err(error) => {
                     assert!(error.refused(), "only a bound refuses: {error}");

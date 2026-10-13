@@ -339,8 +339,8 @@ async fn file_log_survives_reopen_and_cuts_a_torn_tail() {
     let group = |epoch: u64| Record::<Parsed>::EpochBumped {
         epoch: Epoch(epoch),
     };
-    log.append(&[group(1), group(2)]).await.expect("durable");
-    log.append(&[group(3)]).await.expect("durable");
+    log.append(&[group(1), group(2)], 0).await.expect("durable");
+    log.append(&[group(3)], 0).await.expect("durable");
     drop(log);
 
     // A torn write after the last acknowledged group.
@@ -360,7 +360,7 @@ async fn file_log_survives_reopen_and_cuts_a_torn_tail() {
         "acknowledged records survive"
     );
     assert_eq!(log.next_seq(), 3, "the torn tail is cut");
-    log.append(&[group(4)])
+    log.append(&[group(4)], 0)
         .await
         .expect("appends after the cut");
     assert_eq!(
@@ -752,10 +752,10 @@ async fn file_log_refuses_what_replay_would_cut() {
         message: MessageId::from_parts(at(), &[2; 10]),
         text: measure("x".repeat(600)),
     };
-    log.append(std::slice::from_ref(&small))
+    log.append(std::slice::from_ref(&small), 0)
         .await
         .expect("fits");
-    let refused = log.append(&[large]).await;
+    let refused = log.append(&[large], 0).await;
     assert!(
         matches!(
             refused,
@@ -763,7 +763,7 @@ async fn file_log_refuses_what_replay_would_cut() {
         ),
         "{refused:?}"
     );
-    log.append(&[Record::EpochBumped { epoch: Epoch(2) }])
+    log.append(&[Record::EpochBumped { epoch: Epoch(2) }], 0)
         .await
         .expect("the log is still usable");
     drop(log);

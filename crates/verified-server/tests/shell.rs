@@ -1021,17 +1021,53 @@ async fn cancelling_bash_reports_the_honest_message() {
     daemon.world.shutdown().cancel();
 }
 
-/// A log that reaches its file bound refuses the append that would pass it:
-/// nothing of it is written, the session refuses commands from then on,
-/// and the log still replays to exactly what was acknowledged, including
-/// after a restart, which serves it read-only instead of crashing.
-#[tokio::test]
-async fn a_full_log_stops_taking_records_and_loses_nothing() {
+/// Bounds small enough to fill a log in a test.
+fn small_limits() -> ServerLimits {
     let mut small = limits();
     small.wire.max_message_text_bytes = 1_000;
     small.tool_output_bytes = 1_000;
     small.log_line_bytes = 16usize << 10u32;
-    small.log_file_bytes = 16u64 << 10u32;
+    small.log_file_bytes = 48u64 << 10u32;
+    small
+}
+
+/// The turns `log` started and has not ended.
+fn still_running(log: &[Record<Parsed>]) -> Vec<TurnId> {
+    let mut running = Vec::new();
+    for record in log {
+        match record {
+            Record::TurnStarted { turn, .. } => running.push(*turn),
+            Record::TurnEnded { turn, .. } => running.retain(|open| open != turn),
+            Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::CancelRequested { .. }
+            | Record::EpochBumped { .. } => {}
+        }
+    }
+    running
+}
+
+fn assert_every_turn_ended(log: &[Record<Parsed>]) {
+    let running = still_running(log);
+    assert!(
+        running.is_empty(),
+        "a turn always ends; still running: {running:?}"
+    );
+}
+
+/// A log that reaches its file bound refuses the append that would pass it:
+/// nothing of it is written, the running turn ends within the log's
+/// reserve, the session refuses commands from then on, and the log still
+/// replays to exactly what was acknowledged, including after a restart,
+/// which serves it read-only instead of crashing.
+#[tokio::test]
+async fn a_full_log_stops_taking_records_and_loses_nothing() {
+    let small = small_limits();
     let disk = MemDisk::new();
     let first = boot_with(&disk, Arc::new(MemEnv::default()), small.clone()).await;
     let (_, handle) = first.registry.create(session_id()).await.expect("created");
@@ -1065,6 +1101,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
         "the session fills: {full:?}"
     );
     let acked = records(&handle).await;
+    assert_every_turn_ended(&acked);
     let bytes = disk.bytes(session_id()).expect("the log");
     assert!(
         u64::try_from(bytes.len()).expect("small") <= small.log_file_bytes,
@@ -1091,12 +1128,11 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             refused,
-            Some(CommandError::Rejected(
-                Rejection::SessionFull { .. } | Rejection::SessionBusy { .. }
-            ))
+            Some(CommandError::Rejected(Rejection::SessionFull { .. }))
         ),
         "{refused:?}"
     );
+    assert_every_turn_ended(&records(&handle).await);
     assert!(
         u64::try_from(disk.bytes(session_id()).expect("the log").len()).expect("small")
             <= small.log_file_bytes,
@@ -1123,6 +1159,80 @@ async fn shutdown_wins_over_a_queued_command() {
         Some(before),
         "a stopping daemon appends nothing"
     );
+}
+
+/// A crash mid-turn on a log too full to carry the turn on: the restart
+/// ends the turn, cancelled, within the log's bound.
+#[tokio::test]
+async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
+    let roomy = ServerLimits {
+        log_file_bytes: 1 << 20,
+        ..small_limits()
+    };
+    let disk = MemDisk::new();
+    let first = boot_with(&disk, Arc::new(MemEnv::default()), roomy).await;
+    let (_, handle) = first.registry.create(session_id()).await.expect("created");
+    let length = || disk.bytes(session_id()).map_or(0, |bytes| bytes.len());
+    let mut seed = 1u8;
+    while length() < 40usize << 10u32 {
+        let reply = handle
+            .send_message(send(seed, &"x".repeat(990)))
+            .await
+            .expect("accepted");
+        until(&handle, ended(reply.turn_id)).await;
+        seed = seed.saturating_add(1);
+    }
+    let outputs = || {
+        disk.bytes(session_id()).map_or(0, |bytes| {
+            String::from_utf8_lossy(&bytes)
+                .matches("\"ModelOutput\"")
+                .count()
+        })
+    };
+    let before = outputs();
+    let slow = handle
+        .send_message(send(seed, "slow and steady"))
+        .await
+        .expect("accepted");
+    assert!(
+        eventually(|| outputs() > before).await,
+        "the slow reply streams"
+    );
+    first.world.shutdown().cancel();
+    drop(handle);
+
+    // Room for a few short records, not for the rest of the turn.
+    let tight = ServerLimits {
+        log_file_bytes: u64::try_from(length()).expect("small") + 1024,
+        ..small_limits()
+    };
+    let second = boot_with(&disk, Arc::new(MemEnv::default()), tight.clone()).await;
+    let handle = second
+        .registry
+        .lookup(session_id())
+        .await
+        .expect("it boots");
+    let ending = within(Duration::from_secs(5), until(&handle, ended(slow.turn_id))).await;
+    let log = records(&handle).await;
+    assert!(
+        ending.is_ok(),
+        "the restart ends the turn: {:?}",
+        still_running(&log)
+    );
+    assert_every_turn_ended(&log);
+    assert_eq!(
+        log.last(),
+        Some(&Record::TurnEnded {
+            turn: slow.turn_id,
+            outcome: TurnOutcome::Cancelled
+        }),
+        "the turn is cancelled"
+    );
+    assert!(
+        u64::try_from(length()).expect("small") <= tight.log_file_bytes,
+        "within its bound"
+    );
+    second.world.shutdown().cancel();
 }
 
 /// The first refusal of a new message within two seconds.
