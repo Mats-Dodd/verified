@@ -25,12 +25,6 @@ use vstd::prelude::*;
 
 verus! {
 
-/// One session (one conversation, one log), minted by the client that
-/// creates it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[verifier::external_derive]
-pub struct SessionId(u128);
-
 /// A user message, minted by the client and reused on every retry of the
 /// send, so a repeat is answered with "exists".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,47 +37,7 @@ pub struct MessageId(u128);
 #[verifier::external_derive]
 pub struct TurnId(u128);
 
-impl SessionId {
-    /// The id minted at `at` with `entropy` from the Entropy seam.
-    #[verifier::external]
-    #[must_use]
-    pub const fn from_parts(at: UnixMillis, entropy: &IdEntropy) -> Self {
-        Self(mint(at, entropy))
-    }
-
-    /// # Errors
-    /// Anything but canonical lowercase hyphenated `UUIDv7` text.
-    #[verifier::external]
-    pub fn parse(text: &str) -> Result<Self, IdError> {
-        parse_v7(text).map(Self)
-    }
-
-    #[must_use]
-    pub const fn as_u128(self) -> u128 {
-        self.0
-    }
-}
-
 impl MessageId {
-    /// The id minted at `at` with `entropy` from the Entropy seam.
-    #[verifier::external]
-    #[must_use]
-    pub const fn from_parts(at: UnixMillis, entropy: &IdEntropy) -> Self {
-        Self(mint(at, entropy))
-    }
-
-    /// # Errors
-    /// Anything but canonical lowercase hyphenated `UUIDv7` text.
-    #[verifier::external]
-    pub fn parse(text: &str) -> Result<Self, IdError> {
-        parse_v7(text).map(Self)
-    }
-
-    #[must_use]
-    pub const fn as_u128(self) -> u128 {
-        self.0
-    }
-
     /// Whether two ids name the same message.
     #[must_use]
     pub const fn same(self, other: Self) -> (same: bool)
@@ -95,25 +49,6 @@ impl MessageId {
 }
 
 impl TurnId {
-    /// The id minted at `at` with `entropy` from the Entropy seam.
-    #[verifier::external]
-    #[must_use]
-    pub const fn from_parts(at: UnixMillis, entropy: &IdEntropy) -> Self {
-        Self(mint(at, entropy))
-    }
-
-    /// # Errors
-    /// Anything but canonical lowercase hyphenated `UUIDv7` text.
-    #[verifier::external]
-    pub fn parse(text: &str) -> Result<Self, IdError> {
-        parse_v7(text).map(Self)
-    }
-
-    #[must_use]
-    pub const fn as_u128(self) -> u128 {
-        self.0
-    }
-
     /// Whether two ids name the same turn.
     #[must_use]
     pub const fn same(self, other: Self) -> (same: bool)
@@ -149,20 +84,6 @@ impl StepId {
 pub struct CallId(String);
 
 impl CallId {
-    /// # Errors
-    /// Empty, longer than [`MAX_PROTOCOL_ID_BYTES`], or a character outside
-    /// `[A-Za-z0-9_-]`.
-    #[verifier::external]
-    pub fn parse(text: &str) -> Result<Self, IdError> {
-        protocol_id("tool call id", text).map(|()| Self(text.to_owned()))
-    }
-
-    #[verifier::external]
-    #[must_use]
-    pub const fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
     /// Whether two ids name the same call.
     #[verifier::external_body]
     #[must_use]
@@ -202,6 +123,29 @@ impl EffectId {
 }
 
 } // verus!
+
+/// One session (one conversation, one log), minted by the client that
+/// creates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(u128);
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
+)]
+impl CallId {
+    /// # Errors
+    /// Empty, longer than [`MAX_PROTOCOL_ID_BYTES`], or a character outside
+    /// `[A-Za-z0-9_-]`.
+    pub fn parse(text: &str) -> Result<Self, IdError> {
+        protocol_id("tool call id", text).map(|()| Self(text.to_owned()))
+    }
+
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 /// Why text is not an id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -290,8 +234,28 @@ fn write_uuid(value: u128, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     )
 }
 
-macro_rules! uuid7_text {
+/// Minting, text and serde: everything a `UUIDv7` id is outside the proofs.
+macro_rules! uuid7_id {
     ($name:ident) => {
+        impl $name {
+            /// The id minted at `at` with `entropy` from the Entropy seam.
+            #[must_use]
+            pub const fn from_parts(at: UnixMillis, entropy: &IdEntropy) -> Self {
+                Self(mint(at, entropy))
+            }
+
+            /// # Errors
+            /// Anything but canonical lowercase hyphenated `UUIDv7` text.
+            pub fn parse(text: &str) -> Result<Self, IdError> {
+                parse_v7(text).map(Self)
+            }
+
+            #[must_use]
+            pub const fn as_u128(self) -> u128 {
+                self.0
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write_uuid(self.as_u128(), formatter)
@@ -334,9 +298,9 @@ macro_rules! uuid7_text {
     };
 }
 
-uuid7_text!(SessionId);
-uuid7_text!(MessageId);
-uuid7_text!(TurnId);
+uuid7_id!(SessionId);
+uuid7_id!(MessageId);
+uuid7_id!(TurnId);
 
 impl fmt::Display for EffectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

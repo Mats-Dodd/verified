@@ -99,57 +99,6 @@ impl Limits {
         self.batch_window
     }
 
-    /// Checks `config` and makes the bounds the agent runs under.
-    ///
-    /// # Errors
-    /// A retry schedule longer than [`MAX_RETRIES`].
-    #[verifier::external]
-    pub fn parse(config: LimitsConfig) -> Result<Self, LimitsError> {
-        if config.retry_schedule.len() > MAX_RETRIES {
-            return Err(LimitsError::RetrySchedule {
-                length: config.retry_schedule.len(),
-                limit: MAX_RETRIES,
-            });
-        }
-        Ok(Self {
-            turns_per_session: config.turns_per_session.get(),
-            steps_per_turn: config.steps_per_turn.get(),
-            calls_per_step: config.calls_per_step.get(),
-            calls_per_turn: config.calls_per_turn.get(),
-            context_bytes: config.context_bytes.get(),
-            retry_schedule: config.retry_schedule,
-            parts_per_batch: config.parts_per_batch.get(),
-            batch_window: config.batch_window,
-        })
-    }
-
-    /// The bounds v0 ships with.
-    ///
-    /// # Panics
-    /// Never: [`LimitsConfig::v0`] parses.
-    #[verifier::external]
-    #[must_use]
-    pub fn v0() -> Self {
-        Self::parse(LimitsConfig::v0()).expect("the v0 limits are consistent")
-    }
-
-    /// Group commit: model parts batched into one record before an fsync.
-    ///
-    /// # Panics
-    /// Never: [`Limits::parse`] made it from a non-zero count.
-    #[verifier::external]
-    #[must_use]
-    pub const fn parts_per_batch(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.parts_per_batch).expect("parsed from a NonZeroUsize")
-    }
-
-    /// The retry schedule's length: the retry budget of one step.
-    #[verifier::external]
-    #[must_use]
-    pub const fn retries(&self) -> usize {
-        self.retry_schedule.len()
-    }
-
     /// The config these limits were parsed from.
     ///
     /// # Panics
@@ -175,6 +124,59 @@ impl Limits {
 pub const MAX_RETRIES: usize = 64;
 
 } // verus!
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
+)]
+impl Limits {
+    /// Checks `config` and makes the bounds the agent runs under.
+    ///
+    /// # Errors
+    /// A retry schedule longer than [`MAX_RETRIES`].
+    pub fn parse(config: LimitsConfig) -> Result<Self, LimitsError> {
+        if config.retry_schedule.len() > MAX_RETRIES {
+            return Err(LimitsError::RetrySchedule {
+                length: config.retry_schedule.len(),
+                limit: MAX_RETRIES,
+            });
+        }
+        Ok(Self {
+            turns_per_session: config.turns_per_session.get(),
+            steps_per_turn: config.steps_per_turn.get(),
+            calls_per_step: config.calls_per_step.get(),
+            calls_per_turn: config.calls_per_turn.get(),
+            context_bytes: config.context_bytes.get(),
+            retry_schedule: config.retry_schedule,
+            parts_per_batch: config.parts_per_batch.get(),
+            batch_window: config.batch_window,
+        })
+    }
+
+    /// The bounds v0 ships with.
+    ///
+    /// # Panics
+    /// Never: [`LimitsConfig::v0`] parses.
+    #[must_use]
+    pub fn v0() -> Self {
+        Self::parse(LimitsConfig::v0()).expect("the v0 limits are consistent")
+    }
+
+    /// Group commit: model parts batched into one record before an fsync.
+    ///
+    /// # Panics
+    /// Never: [`Limits::parse`] made it from a non-zero count.
+    #[must_use]
+    pub const fn parts_per_batch(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.parts_per_batch).expect("parsed from a NonZeroUsize")
+    }
+
+    /// The retry schedule's length: the retry budget of one step.
+    #[must_use]
+    pub const fn retries(&self) -> usize {
+        self.retry_schedule.len()
+    }
+}
 
 /// The raw bounds [`Limits::parse`] checks. Every count is non-zero by type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
