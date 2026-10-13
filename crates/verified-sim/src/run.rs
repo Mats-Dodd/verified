@@ -173,7 +173,7 @@ fn poll_once<F: Future>(future: F) -> Option<F::Output> {
 const fn aimed_at(aim: Aim, point: &Barrier) -> bool {
     matches!(
         (aim, point),
-        (Aim::Dispatched, Barrier::Dispatched { .. })
+        (Aim::Dispatched, Barrier::Dispatched(_))
             | (Aim::ToolRan, Barrier::ToolRan { .. })
             | (Aim::GroupWritten, Barrier::GroupWritten { .. })
     )

@@ -12,9 +12,8 @@
 //! The model's `Execute` is the run acting on the world, so it is taken
 //! where the run first did: its first [`Observed::Mutated`]. A run that
 //! never mutates (a `read`, an `edit` whose file changed under it) acted
-//! when it returned ([`Observed::Ran`]), unless it reports `Interrupted`:
-//! then it was stopped before it acted. A run that returned and was never
-//! reported (the daemon crashed first) is taken to have acted.
+//! when it returned ([`Observed::Ran`]), unless it was stopped: then it
+//! was stopped before it acted, whether or not its report ever arrived.
 //!
 //! The model is followed one state at a time. Each observation names the
 //! actions it means there, with their values (ids, sizes, what the model
@@ -29,7 +28,7 @@ use std::collections::BTreeSet;
 
 use stateright::{Expectation, Model as _};
 use verified_core::Event;
-use verified_domain::{Abstract, Cause, EffectId, Exit, Rerun, Tool};
+use verified_domain::{Abstract, EffectId, Rerun, Tool};
 
 use crate::coverage::{self, Key};
 use crate::harness::{Action, Harness};
@@ -59,8 +58,9 @@ pub enum Observed {
     /// it returns.
     Mutated(EffectId),
     /// A tool run returned: its side effect, if any, has happened. It acted
-    /// here only if it never mutated and does not report `Interrupted`.
-    Ran(EffectId),
+    /// here only if it never mutated and was not `stopped` (it reports
+    /// `Interrupted`).
+    Ran { id: EffectId, stopped: bool },
     /// The client folded the record at this offset. Only the offset: what
     /// it folded there is the simulation's I6 to check, not the replay's.
     Read(u64),
@@ -78,7 +78,7 @@ impl Observed {
             | Self::Acked { .. }
             | Self::Dispatched(_)
             | Self::Mutated(_)
-            | Self::Ran(_)
+            | Self::Ran { .. }
             | Self::Read(_) => None,
         }
     }
@@ -228,42 +228,10 @@ fn running(world: &World, id: EffectId) -> Result<Tool, String> {
     }
 }
 
-/// The runs the trace reports `Interrupted`. Effect ids are never reused
-/// (each boot is a new epoch), so each is the run's own.
-fn interrupted(trace: &[Observed]) -> BTreeSet<EffectId> {
-    trace
-        .iter()
-        .filter_map(|observed| match observed {
-            Observed::Decided(
-                Event::ToolDone {
-                    id,
-                    exit: Exit::Err(Cause::Interrupted),
-                    ..
-                },
-                _,
-            ) => Some(*id),
-            Observed::Booted(_)
-            | Observed::Resumed(_)
-            | Observed::Refused
-            | Observed::Decided(..)
-            | Observed::Acked { .. }
-            | Observed::Dispatched(_)
-            | Observed::Mutated(_)
-            | Observed::Ran(_)
-            | Observed::Read(_) => None,
-        })
-        .collect()
-}
-
 /// The actions `observed` means at `world`, in order: none for a check on
 /// the state, or for a change the shell makes outside the model's actions
 /// (a refusal, and the resume after one).
-fn means(
-    harness: &Harness,
-    world: &World,
-    observed: &Observed,
-    interrupted: &BTreeSet<EffectId>,
-) -> Result<Vec<Action>, String> {
+fn means(harness: &Harness, world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
     match observed {
         Observed::Booted(records) => {
             // The crash is named by what it kept, so a boot means one; a
@@ -322,9 +290,9 @@ fn means(
             }
             Ok(vec![Action::Execute(*id)])
         }
-        Observed::Ran(id) => match world.flights.get(id) {
+        Observed::Ran { id, stopped } => match world.flights.get(id) {
             Some(flight) if matches!(flight.job, Job::Tool { .. }) => {
-                if flight.executed || interrupted.contains(id) {
+                if flight.executed || *stopped {
                     Ok(Vec::new())
                 } else {
                     Ok(vec![Action::Execute(*id)])
@@ -427,7 +395,7 @@ fn agrees(
                 ))
             }
         }
-        Observed::Dispatched(_) | Observed::Mutated(_) | Observed::Ran(_) => Ok(after),
+        Observed::Dispatched(_) | Observed::Mutated(_) | Observed::Ran { .. } => Ok(after),
     }
 }
 
@@ -484,11 +452,10 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
             state: summary(&world),
         });
     }
-    let interrupted = interrupted(trace);
     let mut keys = BTreeSet::new();
     for (index, observed) in (1..).zip(rest) {
         let mut after = world.clone();
-        let stepped = means(harness, &world, observed, &interrupted).and_then(|taken| {
+        let stepped = means(harness, &world, observed).and_then(|taken| {
             for action in taken {
                 let next = take(harness, &after, &action)?;
                 keys.extend(coverage::keys(harness, &after, &action, &next));

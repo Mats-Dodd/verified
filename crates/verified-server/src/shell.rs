@@ -911,11 +911,7 @@ impl Session {
             }
             Effect::RunTool { call } => {
                 let id = call.effect();
-                barrier(Barrier::Dispatched {
-                    epoch: id.epoch.0,
-                    seq: id.seq,
-                })
-                .await;
+                barrier(Barrier::Dispatched(id)).await;
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 self.seams.world.spawn(run_tool(
@@ -1045,8 +1041,8 @@ async fn run_tool(
     }
     let (exit, output) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
     barrier(Barrier::ToolRan {
-        epoch: id.epoch.0,
-        seq: id.seq,
+        id,
+        stopped: exit == Exit::Err(Cause::Interrupted),
     })
     .await;
     let output = measure(output);

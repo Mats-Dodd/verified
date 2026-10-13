@@ -582,7 +582,10 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
                 trace.push(Observed::Booted(next.log.clone()));
                 trace.push(Observed::Resumed(next.pending.clone()));
             }
-            Action::Execute(id) => trace.push(Observed::Ran(*id)),
+            Action::Execute(id) => trace.push(Observed::Ran {
+                id: *id,
+                stopped: false,
+            }),
             Action::Read => trace.push(Observed::Read(
                 u64::try_from(world.client.next).expect("a short log"),
             )),
@@ -648,7 +651,7 @@ fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
         .iter()
         .enumerate()
         .find_map(|(at, observed)| {
-            if let Observed::Ran(id) = observed {
+            if let Observed::Ran { id, .. } = observed {
                 Some((at, *id))
             } else {
                 None
@@ -810,7 +813,7 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
         .iter()
         .enumerate()
         .filter_map(|(at, observed)| {
-            let Observed::Ran(id) = observed else {
+            let Observed::Ran { id, .. } = observed else {
                 return None;
             };
             let executed = path

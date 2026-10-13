@@ -533,11 +533,16 @@ pub mod crash {
 /// (`turmoil::barriers`). Without the `sim` feature they compile to nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barrier {
-    /// A tool call's `Dispatched` record is durable and applied; the tool has
-    /// not started. `seq` is the effect id's sequence number.
-    Dispatched { epoch: u64, seq: u64 },
-    /// A tool's side effect happened; its `ToolDone` has not been sent.
-    ToolRan { epoch: u64, seq: u64 },
+    /// A tool call's `Dispatched` record is durable and applied; the run
+    /// with this id has not started.
+    Dispatched(verified_domain::EffectId),
+    /// A tool's run returned, its side effect (if any) done; its `ToolDone`
+    /// has not been sent. `stopped`: the run reports it was stopped
+    /// (`Interrupted`), so it acted only if it mutated before that.
+    ToolRan {
+        id: verified_domain::EffectId,
+        stopped: bool,
+    },
     /// A group commit's bytes are written but not yet synced.
     GroupWritten { bytes: usize },
 }

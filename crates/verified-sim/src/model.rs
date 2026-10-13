@@ -13,7 +13,7 @@
 //! walks the model along them and checks its properties on every state.
 
 use verified_domain::alpha::record;
-use verified_domain::{EffectId, Epoch, Limits, Record};
+use verified_domain::{Limits, Record};
 use verified_model::{Harness, Mismatch, Observed, Replayed, alpha};
 use verified_server::payload::Parsed;
 use verified_server::shim::{Barrier, Observation};
@@ -22,13 +22,6 @@ use crate::ledger::{Entry, Stamped};
 
 fn records(records: &[Record<Parsed>]) -> Vec<Record<verified_domain::Abstract>> {
     records.iter().map(record).collect()
-}
-
-const fn effect(epoch: u64, seq: u64) -> EffectId {
-    EffectId {
-        epoch: Epoch(epoch),
-        seq,
-    }
 }
 
 /// The facts of a run's ledger the model replays, in order.
@@ -67,11 +60,14 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
                     Some(_) | None => trace.push(Observed::Refused),
                 }
             }
-            Entry::Shell(Observation::Passed(Barrier::Dispatched { epoch, seq })) => {
-                trace.push(Observed::Dispatched(effect(*epoch, *seq)));
+            Entry::Shell(Observation::Passed(Barrier::Dispatched(id))) => {
+                trace.push(Observed::Dispatched(*id));
             }
-            Entry::Shell(Observation::Passed(Barrier::ToolRan { epoch, seq })) => {
-                trace.push(Observed::Ran(effect(*epoch, *seq)));
+            Entry::Shell(Observation::Passed(Barrier::ToolRan { id, stopped })) => {
+                trace.push(Observed::Ran {
+                    id: *id,
+                    stopped: *stopped,
+                });
             }
             Entry::Shell(Observation::Passed(Barrier::GroupWritten { .. }))
             | Entry::Boot { .. }
