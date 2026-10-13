@@ -146,8 +146,9 @@ async fn run_daemon(project: PathBuf, model: String, api_key: ApiKey) -> Result<
         Arc::clone(&clock),
     )?;
     // The world's process-group registry goes to the Env, so a daemon that
-    // crashes kills the commands it started.
+    // panics kills the commands it started.
     let world = World::new();
+    world.groups().kill_on_panic();
     let seams = Seams {
         model: Arc::new(anthropic),
         env: Arc::new(LocalEnv::new(

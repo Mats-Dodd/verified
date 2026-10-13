@@ -189,12 +189,12 @@ impl Lock for NoLock {
 ///
 /// Crash-only (Law 8): a task that panics takes the daemon down, and
 /// recovery on restart is the way back. Every task is supervised: a panic
-/// is caught where the task is polled and handed to
-/// the crash shim ([`crate::shim::crash`]). In the shipped daemon that aborts
-/// the process on the spot, so no other task runs another step (no log
-/// append, no tool) after a broken invariant. Under the `sim` feature a
-/// process abort would kill the whole test run, so the panic instead fires
-/// [`World::crashed`] and stops every task at its next safe point;
+/// is caught where the task is polled, fires [`World::crashed`], and is
+/// handed to the crash shim ([`crate::shim::crash`]). In the shipped daemon
+/// that aborts the process on the spot, so no other task runs another step
+/// (no log append, no tool) after a broken invariant. Under the `sim`
+/// feature a process abort would kill the whole test run, so the shim
+/// returns instead and every task stops at its next safe point;
 /// [`crate::daemon::serve`] then returns [`crate::daemon::DaemonError::Panicked`],
 /// the turmoil host's software fails, and the simulation reports the run as
 /// failed.
@@ -207,15 +207,16 @@ pub struct World {
 
 /// The process groups of the commands running now.
 ///
-/// However the daemon stops (a fatal error, or an abort on a panic, where
-/// nothing is dropped), it kills them first: `kill_on_drop` alone reaches only a
-/// group's leader, never the grandchildren a command left running.
+/// On a panic ([`ProcessGroups::kill_on_panic`]) or a fatal error (as each
+/// command's future is dropped) the daemon kills them: `kill_on_drop` alone
+/// reaches only a group's leader, never the grandchildren a command left
+/// running. A signal that kills the daemon bypasses both.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessGroups {
     #[expect(
         clippy::disallowed_types,
         reason = "writers: the Env seam's exec, as a group starts and once it is reaped or dropped; \
-                  reader: the crash shim, just before the process aborts; invariant: holds only \
+                  reader: the panic hook, before the process aborts; invariant: holds only \
                   groups whose leader is not yet reaped (so no id is reused); dropped with the world"
     )]
     live: Arc<std::sync::Mutex<BTreeSet<i32>>>,
@@ -223,8 +224,8 @@ pub struct ProcessGroups {
 
 impl ProcessGroups {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<i32>> {
-        // A panic while holding it left a set that is still accurate enough
-        // to kill from; the crash path must not panic again.
+        // A panic while holding it left a set that is still accurate: the
+        // commands carry on being registered and unregistered.
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -252,11 +253,29 @@ impl ProcessGroups {
         self.lock().is_empty()
     }
 
+    /// Kills every running group on any panic, before the process aborts
+    /// (`panic = "abort"` drops nothing and runs no `catch_unwind`) or
+    /// unwinds: chains [`ProcessGroups::kill_all`] after the current panic
+    /// hook.
+    pub fn kill_on_panic(&self) {
+        let groups = self.clone();
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |panicked| {
+            previous(panicked);
+            groups.kill_all();
+        }));
+    }
+
     /// Sends `SIGKILL` to every running group. Best effort: the daemon is
-    /// going down, and a group that is gone already is what it wants.
+    /// going down, and a group that is gone already is what it wants. It
+    /// never blocks on the set's lock: a panic inside `insert` or `remove`
+    /// holds it (or poisoned it), and waiting there from the panic hook
+    /// would never reach the abort, so then it kills nothing.
     pub fn kill_all(&self) {
-        let groups: Vec<i32> = self.lock().iter().copied().collect();
-        for group in groups {
+        let Ok(live) = self.live.try_lock() else {
+            return;
+        };
+        for group in live.iter().copied() {
             if let Some(pid) = rustix::process::Pid::from_raw(group) {
                 let _best_effort: Result<(), rustix::io::Errno> =
                     rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -301,19 +320,15 @@ impl World {
         &self.shutdown
     }
 
-    /// Fires when a task panicked (only ever under the `sim` feature: the
-    /// shipped daemon has aborted by then).
+    /// Fires when a task panicked (seen only under the `sim` feature: the
+    /// shipped daemon aborts at once).
     #[must_use]
     pub const fn crashed(&self) -> &CancellationToken {
         &self.crashed
     }
 
     /// Records that a task panicked and stops every task at its next safe
-    /// point. Called from the `sim` crash shim.
-    #[cfg_attr(
-        not(feature = "sim"),
-        expect(dead_code, reason = "the real crash shim aborts the process instead")
-    )]
+    /// point.
     pub(crate) fn crash(&self) {
         self.crashed.cancel();
         self.shutdown.cancel();
@@ -337,8 +352,9 @@ impl Future for Supervised {
         // its state is dropped with this future.
         match panic::catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(cx))) {
             Ok(poll) => poll,
-            Err(payload) => {
-                crate::shim::crash::task_panicked(&this.world, payload.as_ref());
+            Err(_payload) => {
+                this.world.crash();
+                crate::shim::crash::task_panicked();
                 Poll::Ready(())
             }
         }

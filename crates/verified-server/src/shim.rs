@@ -471,34 +471,26 @@ pub mod time {
 
 /// What a panicking world task does to the daemon (crash-only, Law 8).
 pub mod crash {
-    use core::any::Any;
-
-    use crate::seam::World;
-
-    /// The panic hook has already printed the panic's message and location.
+    /// After a world task panicked and the world crashed. The panic hook has
+    /// already printed the panic and, where the daemon installed
+    /// [`crate::seam::ProcessGroups::kill_on_panic`], killed the running
+    /// commands.
     ///
-    /// Real: kills the running commands' process groups, then aborts the
-    /// process. Nothing unwinds and no other task takes another step; the
-    /// next start recovers from the log.
+    /// Real: aborts the process. Nothing unwinds and no other task takes
+    /// another step; the next start recovers from the log.
     #[cfg(not(feature = "sim"))]
-    pub(crate) fn task_panicked(world: &World, payload: &(dyn Any + Send)) {
-        let _: &(dyn Any + Send) = payload;
-        // Nothing is dropped by an abort: kill every running command's
-        // process group first, grandchildren included.
-        world.groups().kill_all();
+    pub(crate) fn task_panicked() {
         std::process::abort();
     }
 
     /// Sim: a process abort would end the whole test binary (every seed),
-    /// so the daemon's host fails instead: [`World::crashed`] fires, every
-    /// task stops at its next safe point and `daemon::serve` returns
-    /// `DaemonError::Panicked`, which turmoil reports as the host's error
-    /// and the simulation treats as a failed run.
+    /// so the daemon's host fails instead: [`crate::seam::World::crashed`]
+    /// has fired, every task stops at its next safe point and
+    /// `daemon::serve` returns `DaemonError::Panicked`, which turmoil
+    /// reports as the host's error and the simulation treats as a failed
+    /// run.
     #[cfg(feature = "sim")]
-    pub(crate) fn task_panicked(world: &World, payload: &(dyn Any + Send)) {
-        let _: &(dyn Any + Send) = payload;
-        world.crash();
-    }
+    pub(crate) const fn task_panicked() {}
 }
 
 /// Points where a simulation may observe or suspend the daemon

@@ -505,27 +505,41 @@ fn panicking_daemon() {
     });
 }
 
-/// Crash-only in the shipped build: a panic in a world task (here the model
-/// task) aborts the daemon process instead of leaving a half-dead daemon
-/// serving. Runs the daemon in a child process (this test binary again).
-#[test]
+/// This test binary again, running only `test` as the child half of a
+/// crash test.
 #[expect(
     clippy::disallowed_methods,
     reason = "the test re-runs its own binary as the daemon under test; the env var marks the child"
 )]
+fn run_child(test: &str) -> std::process::Output {
+    let exe = std::env::current_exe().expect("the test binary");
+    std::process::Command::new(exe)
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(PANIC_CHILD, "1")
+        .output()
+        .expect("the child ran")
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the env var marks the child half of a crash test"
+)]
+fn is_child() -> bool {
+    std::env::var_os(PANIC_CHILD).is_some()
+}
+
+/// Crash-only in the shipped build: a panic in a world task (here the model
+/// task) aborts the daemon process instead of leaving a half-dead daemon
+/// serving. Runs the daemon in a child process (this test binary again).
+#[test]
 fn a_panicking_task_aborts_the_daemon() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    if std::env::var_os(PANIC_CHILD).is_some() {
+    if is_child() {
         panicking_daemon();
         return;
     }
-    let exe = std::env::current_exe().expect("the test binary");
-    let output = std::process::Command::new(exe)
-        .args(["--exact", PANIC_TEST, "--nocapture", "--test-threads=1"])
-        .env(PANIC_CHILD, "1")
-        .output()
-        .expect("the child ran");
+    let output = run_child(PANIC_TEST);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("the model task panics on purpose"),
@@ -536,6 +550,100 @@ fn a_panicking_task_aborts_the_daemon() {
         Some(rustix::process::Signal::ABORT.as_raw()),
         "the daemon aborted rather than living on: {:?}\n{stderr}",
         output.status
+    );
+}
+
+const GROUPS_TEST: &str = "a_panic_anywhere_kills_the_running_commands";
+
+/// The child half: a running command's process group is registered with
+/// the world, as `LocalEnv` does, the daemon's panic hook is installed, and
+/// a plain thread (no world task, so no `catch_unwind`) panics. The process
+/// then aborts, as `panic = "abort"` does: nothing is dropped.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test starts its own command and its own unsupervised thread"
+)]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the child aborts with its command running; the parent checks the group is gone"
+)]
+fn panicking_thread() {
+    use std::os::unix::process::CommandExt as _;
+
+    let world = World::new();
+    let command = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 300 & wait"])
+        .process_group(0)
+        // Not the test's pipes: the parent reads them to their end.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a command");
+    let group = i32::try_from(command.id()).expect("a pid");
+    std::io::Write::write_all(
+        &mut std::io::stdout(),
+        format!("group {group}\n").as_bytes(),
+    )
+    .expect("the parent reads it");
+    world.groups().insert(group);
+    world.groups().kill_on_panic();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panicked| {
+        hook(panicked);
+        std::process::abort();
+    }));
+    let panicked = std::thread::spawn(|| {
+        #[expect(
+            clippy::panic,
+            reason = "the test's point: a panic outside every world task"
+        )]
+        {
+            panic!("a plain thread panics on purpose");
+        }
+    })
+    .join();
+    drop(panicked);
+}
+
+/// A panic anywhere in the daemon, not only in a world task, kills every
+/// running command's process group before the process dies: under
+/// `panic = "abort"` nothing is dropped and no `catch_unwind` runs, so the
+/// panic hook is all that is left.
+#[tokio::test]
+async fn a_panic_anywhere_kills_the_running_commands() {
+    if is_child() {
+        panicking_thread();
+        return;
+    }
+    let output = run_child(GROUPS_TEST);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a plain thread panics on purpose"),
+        "the child reached the panic: {stderr}"
+    );
+    // The harness prints the test's name on the same line.
+    let group = stdout
+        .split_once("group ")
+        .and_then(|(_, rest)| rest.lines().next()?.parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("the child's command group");
+    let mut alive = true;
+    for _ in 0..500u32 {
+        alive = rustix::process::test_kill_process_group(group).is_ok();
+        if !alive {
+            break;
+        }
+        SystemClock.sleep(Millis::new(10)).await;
+    }
+    if alive {
+        let _cleanup: Result<(), rustix::io::Errno> =
+            rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    assert!(
+        !alive,
+        "the command's group outlived the panic: {stdout}\n{stderr}"
     );
 }
 
@@ -664,7 +772,7 @@ async fn a_stopping_daemon_kills_whole_process_groups() {
     );
     assert!(groups.is_empty(), "nothing is left registered");
 
-    // Killed through the registry, as the crash shim does before aborting.
+    // Killed through the registry, as the panic hook does before an abort.
     let call = bash("sleep 30 & echo $! > crashed.pid; wait");
     let crash = async {
         let background = pid_in(&root.join("crashed.pid")).await;
