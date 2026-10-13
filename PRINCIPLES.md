@@ -82,20 +82,22 @@ Every entry passes all four parts of the admission rule.
 | U4 | **After a crash, a dispatched `Unsafe` call resolves `Unknown`.** It is never reported as interrupted or as succeeded. | Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_interrupted_fails_the_replay` |
 | U5 | **State is the replay of the log.** `recover(log)` equals the fold of the log, and every durable prefix recovers. | Proved (`recover` ensures `replay(log) == Some(core)`). `spec_apply` is the one home of every clause on the log's shape (approval before dispatch, at most one result for a call, a turn ends once and only with every call resolved, an interrupted turn ends cancelled): a log that breaks one does not recover. Model-checked (every state's log recovers). | Mutation recorded in the commit that added this file |
 | U6 | **The view is an exact prefix of the durable log.** The client only folds committed records, with no gaps or duplicates across reconnects, and once it has caught up it equals the projection of the log. | Serving only durable records is structural: a read is an input to the shell, queued behind `persist`. Model-checked. Simulated (I6), the check of the real daemon and TUI. The replay checks which offsets the client read and when; what it folded there is I6's. | Stateright `serving_records_before_they_are_durable_is_caught` and `skipping_a_record_on_reconnect_is_caught` |
+| U7 | **A message starts at most one turn,** so a retried command means the same thing: `decide` answers `Exists` and records nothing. | Proved: `spec_apply` refuses a `TurnStarted` for a message already seen, `decided` makes every record `decide` emits apply, and `recover` rebuilds only a log that applies. | Mutation recorded in the commit that admitted it (`on_message` without its seen guard) |
+| U8 | **Each call has at most one result.** No log v writes or recovers holds a second `ToolResult` for a call. | Proved: `spec_apply` refuses a `ToolResult` for a resolved call; `decided` and `recover` as for U7. | Mutation recorded in the commit that admitted it (`apply` without its `Resolved` guard) |
 
 ## Held, not yet admitted
 
 A deterministic layer checks each of these today, but none has a committed
 planted bug. Until one exists, they are not promises. Every DST run now
-also checks the model's properties among them (a log with a second result
-for a call does not recover; "quiescent implies the turn ended"), but no
-planted shell bug has been seen to fail those checks, so none has moved up.
+also checks the model's property among them ("quiescent implies the turn
+ended"), but no planted shell bug has been seen to fail it, so it has not
+moved up.
 
 | Property | Current check | Missing |
 |---|---|---|
-| Each call has exactly one result: at most one always, and exactly one at quiescence. | Model-checked: a second result is a log `spec_apply` refuses, and "quiescent implies the turn ended", which `spec_apply` allows only once every call resolved. The missing-result half has a Stateright planted bug (`leaving_an_unsafe_call_dispatched_after_a_crash_is_caught`). Simulated (I5). | A planted shell bug: a duplicate or missing `ToolResult`. |
+| Each call has a result at quiescence (with U8, exactly one). | Model-checked: "quiescent implies the turn ended", which `spec_apply` allows only once every call resolved. It has a Stateright planted bug (`leaving_an_unsafe_call_dispatched_after_a_crash_is_caught`). Simulated (I5). | A planted shell bug: a missing `ToolResult`. |
 | Anything acknowledged survives a crash and replays. | Property-tested (`everything_acknowledged_replays`, `damage_before_a_later_group_is_corrupt`). Trace-checked: each group the log acknowledges must be the model's next sync, and each boot must find every synced record, then a prefix of the pending group. | A committed DST planted bug, such as an append that skips fsync. |
-| A message starts at most one turn, so a retried command means the same thing. | `apply` refuses a duplicate message. Simulated (I8). | A planted bug. Is the core's refusal proved, or only checked at run time? |
+| Every message the user sends starts a turn (with U7, exactly one). | Simulated (I8): the log starts one turn for each message sent. | A planted bug: a retry that loses a message. |
 | An `edit` reported `Ok` wrote `new` in place of `old`. | Simulated (I7). | A committed planted bug (the mutation was only run once). |
 
 ## Candidates
@@ -210,7 +212,7 @@ described in `AGENTS.md` and the code.
   only way back (U5).
 - Epochs on effect ids, so stale completions change nothing (U1, U3).
 - TigerBeetle-style ids at every hop: the sender mints the id, persists it,
-  and reuses it on retry (the message candidate above).
+  and reuses it on retry (U7).
 - Group commit with bounds identical at append and replay (the "survives
   and replays" property above).
 - Trace checking: the shell reports, under `sim` only, each input entering
