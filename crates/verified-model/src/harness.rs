@@ -272,6 +272,16 @@ impl Harness {
         }
     }
 
+    /// `world` with the shell's resume staged without a crash: the boot's
+    /// resume was refused by a full log, and is decided again once the
+    /// running turn is interrupted. `None` if the log does not recover.
+    pub(crate) fn resumed(&self, world: &World) -> Option<World> {
+        let mut next = world.clone();
+        next.refused = false;
+        self.stage(&mut next, &self.core(world)?.resume());
+        Some(next)
+    }
+
     /// The decision being persisted is durable: its records join the log
     /// and its effects start.
     fn sync(world: &mut World) {
@@ -579,6 +589,7 @@ impl Model for Harness {
                 world.pending.clear();
                 world.staged.clear();
                 world.asks.clear();
+                world.refused = false;
                 // Only tools outlive the process (a child may still run);
                 // model streams and timers die with it.
                 let flights = std::mem::take(&mut world.flights);

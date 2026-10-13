@@ -575,6 +575,10 @@ pub enum Observation {
         event: verified_core::Event<crate::payload::Parsed>,
         records: Vec<verified_domain::Record<crate::payload::Parsed>>,
     },
+    /// The log refused the decision being persisted (the last one
+    /// `Resumed` or `Decided` reported): none of its records were written
+    /// or applied, and none of its effects start.
+    Refused,
     /// A barrier was reached.
     Passed(Barrier),
 }

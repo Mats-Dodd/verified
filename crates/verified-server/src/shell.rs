@@ -528,7 +528,7 @@ impl Session {
             } else if self.core.running().is_some() && records.iter().all(closes) {
                 0
             } else {
-                return Ok(Persisted::Refused);
+                return Ok(refused());
             };
             assert!(
                 self.log.next_seq() == self.core.seq(),
@@ -538,7 +538,7 @@ impl Session {
                 Ok(()) => {}
                 Err(error) if error.refused() => {
                     self.full.get_or_insert_with(|| error.to_string());
-                    return Ok(Persisted::Refused);
+                    return Ok(refused());
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -952,6 +952,20 @@ impl Session {
             }
         }
     }
+}
+
+/// A decision the log refused, as the simulation sees it too.
+#[cfg_attr(
+    not(feature = "sim"),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "under sim it reports the refusal, which no const fn can"
+    )
+)]
+fn refused() -> Persisted {
+    #[cfg(feature = "sim")]
+    crate::shim::observe(crate::shim::Observation::Refused);
+    Persisted::Refused
 }
 
 /// Whether `record` is one that ends a turn, and so may take the log's

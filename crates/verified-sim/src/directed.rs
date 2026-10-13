@@ -279,6 +279,7 @@ pub fn compile(harness: &Harness, witness: &[Action], seed: u64) -> Result<Scena
         holds,
         block_size: None,
         max_latency: Duration::from_millis(5),
+        limits: hosts::limits(),
     })
 }
 

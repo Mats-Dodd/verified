@@ -31,7 +31,8 @@
 //!   edits are durable: after the final crash each file holds what the last
 //!   write to it that finished wrote, or what a write that overlapped that
 //!   one wrote (two racing renames land in either order).
-//! - I8 each message the user sent started exactly one turn.
+//! - I8 each message the user sent started exactly one turn, but the one it
+//!   gave up on when the session took no more, which started at most one.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -244,6 +245,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     // has, it knows nothing durable, and no tool of it may run.
     let mut known = false;
     let mut caught = 0usize;
+    let mut gave_up = None;
     for (at, stamped) in entries.iter().enumerate() {
         match &stamped.entry {
             Entry::Created => {
@@ -321,6 +323,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 next: *next,
                 chunks,
             }),
+            Entry::GaveUp { turn } => gave_up = Some(*turn),
             Entry::Fault(_) | Entry::User(_) | Entry::Shell(_) => {}
         }
     }
@@ -348,7 +351,12 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
             "the final recovery came before the TUI was quiescent".to_owned(),
         ));
     }
-    final_log(&last, &mutations, scenario, &mut found);
+    final_log(
+        &last,
+        &mutations,
+        (scenario.turns.len(), gave_up),
+        &mut found,
+    );
     edits_applied(&last, &disk, &mut found);
     edits_durable(&disk, &mut found);
     reads_exact(&last, &reads, &mut found);
@@ -694,11 +702,12 @@ fn reads_exact(log: &[Record<Parsed>], reads: &[Read<'_>], found: &mut Vec<Viola
     }
 }
 
-/// I1, I2, I3 and I8 over the log the final recovery found.
+/// I1, I2, I3 and I8 over the log the final recovery found, of a plan of
+/// `planned` messages the user may have given up at one.
 fn final_log(
     log: &[Record<Parsed>],
     mutations: &[(Option<String>, Op)],
-    scenario: &Scenario,
+    (planned, gave_up): (usize, Option<usize>),
     found: &mut Vec<Violation>,
 ) {
     let calls = calls(log, found);
@@ -767,12 +776,16 @@ fn final_log(
     let sent = messages.len();
     messages.sort_unstable();
     messages.dedup();
-    if messages.len() != sent || sent != scenario.turns.len() {
+    let started = match gave_up {
+        None => sent == planned,
+        Some(turn) => sent == turn || sent == turn.saturating_add(1),
+    };
+    if messages.len() != sent || !started {
         found.push(violation(
             "I8",
             format!(
-                "{} messages were planned; the log started {sent} turns from {} distinct messages",
-                scenario.turns.len(),
+                "{planned} messages were planned (given up at {gave_up:?}); the log started \
+                 {sent} turns from {} distinct messages",
                 messages.len()
             ),
         ));

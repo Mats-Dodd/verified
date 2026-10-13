@@ -7,16 +7,17 @@
 //! what each boot recovered, each input entering the core and what it
 //! decided, each group commit made durable, each tool run dispatched,
 //! acting and returning, and the offset of each record the TUI folded (the
-//! offset only: what it folded there is I6's to check). [`replay`] walks
-//! the model along them and checks its properties on every state.
+//! offset only: what it folded there is I6's to check). A decision a full
+//! log refused is no fact: the core never took its event, so the fold
+//! drops it (a refused resume stays, as [`Observed::Refused`]). [`replay`]
+//! walks the model along them and checks its properties on every state.
 
 use verified_domain::alpha::record;
-use verified_domain::{EffectId, Epoch, Record};
+use verified_domain::{EffectId, Epoch, Limits, Record};
 use verified_model::{Mismatch, Observed, Replayed, alpha};
 use verified_server::payload::Parsed;
 use verified_server::shim::{Barrier, Observation};
 
-use crate::hosts;
 use crate::ledger::{Entry, Stamped};
 
 fn records(records: &[Record<Parsed>]) -> Vec<Record<verified_domain::Abstract>> {
@@ -54,6 +55,18 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
                 event,
                 records: decided,
             }) => trace.push(Observed::Decided(alpha::event(event), records(decided))),
+            Entry::Shell(Observation::Refused) => {
+                // What was refused is the last decision reported.
+                let last = trace.iter().rposition(|observed| {
+                    matches!(observed, Observed::Decided(..) | Observed::Resumed(_))
+                });
+                match last {
+                    Some(at) if matches!(trace.get(at), Some(Observed::Decided(..))) => {
+                        trace.remove(at);
+                    }
+                    Some(_) | None => trace.push(Observed::Refused),
+                }
+            }
             Entry::Shell(Observation::Passed(Barrier::Dispatched { epoch, seq })) => {
                 trace.push(Observed::Dispatched(effect(*epoch, *seq)));
             }
@@ -65,19 +78,17 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
             | Entry::Wrote { .. }
             | Entry::Fault(_)
             | Entry::User(_)
+            | Entry::GaveUp { .. }
             | Entry::Caught { .. } => {}
         }
     }
     trace
 }
 
-/// Replays `trace` through the model, under the daemon's limits.
+/// Replays `trace` through the model, under the daemon's core `limits`.
 ///
 /// # Errors
 /// The run is not a path of the model, or breaks one of its properties.
-pub fn replay(trace: &[Observed]) -> Result<Replayed, Mismatch> {
-    verified_model::replay(
-        &verified_model::replay::harness(hosts::limits().core, trace),
-        trace,
-    )
+pub fn replay(limits: Limits, trace: &[Observed]) -> Result<Replayed, Mismatch> {
+    verified_model::replay(&verified_model::replay::harness(limits, trace), trace)
 }

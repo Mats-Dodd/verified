@@ -56,6 +56,9 @@ pub enum Entry {
     Fault(String),
     /// The scripted user did something.
     User(String),
+    /// The scripted user gave up its plan at turn `turn` (it may or may not
+    /// have started): the TUI said the session takes no more.
+    GaveUp { turn: usize },
     /// The TUI folded one stream read: the records `from..next` arrived as
     /// exactly these chunks.
     Read {
@@ -195,6 +198,7 @@ impl Ledger {
                 | Entry::Wrote { .. }
                 | Entry::Fault(_)
                 | Entry::User(_)
+                | Entry::GaveUp { .. }
                 | Entry::Read { .. }
                 | Entry::Shell(_)
                 | Entry::Caught { .. } => {}

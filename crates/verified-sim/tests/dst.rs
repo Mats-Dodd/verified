@@ -9,11 +9,15 @@
 //! `just sim` also runs `verified-sim processes`, which traces each fixed
 //! seed in two fresh processes.
 
+use core::time::Duration;
+
 use verified_model::coverage::{Class, Key};
 use verified_model::replay::harness;
-use verified_model::{Bug, Harness, Mismatch};
+use verified_model::{Bug, Harness, Mismatch, Observed};
+use verified_server::limits::ServerLimits;
 use verified_server::shell::Planted;
 use verified_sim::directed::{self, Directed};
+use verified_sim::scenario::{Fault, Scenario};
 use verified_sim::{hosts, run};
 
 /// Runs `seed` twice, compares the traces, then judges the world.
@@ -335,6 +339,73 @@ fn the_fixed_seeds_replay_every_kind_of_step() {
         assert!(
             taken.contains(kind),
             "no fixed seed replays a {kind}: {taken:?}"
+        );
+    }
+}
+
+/// v0's limits, shrunk so a seed's few turns fill the log: one line and
+/// the reserve that ends a turn, no more.
+fn a_small_log() -> ServerLimits {
+    let mut limits = hosts::limits();
+    limits.wire.max_message_text_bytes = 1_000;
+    limits.tool_output_bytes = 1_000;
+    limits.log_line_bytes = 16usize << 10u32;
+    limits.log_file_bytes = u64::try_from(limits.log_line_bytes)
+        .expect("small")
+        .saturating_add(limits.reserve());
+    limits
+}
+
+/// Seeds whose turns fill [`a_small_log`] while a turn runs, and the
+/// simulated millisecond of a crash added as it fills (seed 28's leaves
+/// a resume the full log refuses).
+const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_424))];
+
+/// A full log ends the running turn within its reserve, refuses what
+/// follows, and the run is still a path of the model: the refused
+/// decisions never reached the core, a refused resume is decided again
+/// once the turn is interrupted, and the turn ends cancelled.
+#[test]
+fn a_full_log_ends_the_running_turn_and_replays() {
+    for (seed, crash) in FILLING {
+        let mut scenario = Scenario {
+            limits: a_small_log(),
+            ..Scenario::from_seed(seed)
+        };
+        if let Some(at) = crash {
+            scenario.faults.push((
+                Duration::from_millis(at),
+                Fault::Crash {
+                    down: Duration::from_millis(300),
+                },
+            ));
+            scenario.faults.sort_by_key(|(at, _)| *at);
+        }
+        let outcome = run::twice_scenario(&scenario)
+            .map_err(|error| error.to_string())
+            .expect("the run finishes, deterministically");
+        assert!(
+            outcome.violations.is_empty(),
+            "seed {seed} (crash {crash:?}) on a small log broke invariants:\n{:#?}",
+            outcome.violations
+        );
+        let filled = outcome
+            .trace
+            .iter()
+            .position(|line| line.contains("Shell(Refused)"))
+            .expect("the log fills");
+        assert!(
+            outcome
+                .trace
+                .iter()
+                .skip(filled)
+                .any(|line| line.contains("outcome: Cancelled")),
+            "seed {seed}: the turn running as the log fills ends cancelled"
+        );
+        assert_eq!(
+            outcome.observed.contains(&Observed::Refused),
+            crash.is_some(),
+            "seed {seed}: only the crash leaves a resume refused"
         );
     }
 }

@@ -50,6 +50,12 @@ pub enum Observed {
     Resumed(Vec<Rec>),
     /// An event entered `decide`, which decided these records.
     Decided(Event<Abstract>, Vec<Rec>),
+    /// A full log refused the boot's resume: nothing of it was written, and
+    /// none of its effects start. The shell interrupts the running turn
+    /// and resumes again ([`Observed::Resumed`], on a log not being
+    /// persisted). A refused `Decided` never reaches the model: the
+    /// simulation's fold drops it, since the core never took its event.
+    Refused,
     /// A group commit from `first` became durable: these records.
     Acked { first: u64, records: Vec<Rec> },
     /// A tool run is about to start: its `Dispatched` is durable.
@@ -104,6 +110,7 @@ pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
             Observed::Decided(event, _) => Some(action(event)),
             Observed::Booted(_)
             | Observed::Resumed(_)
+            | Observed::Refused
             | Observed::Acked { .. }
             | Observed::Dispatched(_)
             | Observed::Mutated(_)
@@ -310,6 +317,7 @@ impl Runs {
                 ) => Some(*id),
                 Observed::Booted(_)
                 | Observed::Resumed(_)
+                | Observed::Refused
                 | Observed::Decided(..)
                 | Observed::Acked { .. }
                 | Observed::Dispatched(_)
@@ -358,13 +366,30 @@ fn step(
             Ok(found)
         }
         Observed::Resumed(records) => {
-            if world.pending != *records {
+            let resumed = if world.refused {
+                harness
+                    .resumed(world)
+                    .ok_or_else(|| "the log the shell resumes on does not recover".to_owned())?
+            } else {
+                world.clone()
+            };
+            if resumed.pending != *records {
                 return Err(format!(
                     "the model resumed to {:?}, the shell to {records:?}",
-                    world.pending
+                    resumed.pending
                 ));
             }
-            Ok(vec![(world.clone(), Vec::new())])
+            Ok(vec![(resumed, Vec::new())])
+        }
+        Observed::Refused => {
+            if !world.persisting() {
+                return Err("the log refused a resume, but none is being persisted".to_owned());
+            }
+            let mut refused = world.clone();
+            refused.pending.clear();
+            refused.staged.clear();
+            refused.refused = true;
+            Ok(vec![(refused, Vec::new())])
         }
         Observed::Decided(event, records) => {
             let found = one(action(event))?;

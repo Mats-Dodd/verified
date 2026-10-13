@@ -8,7 +8,10 @@ use core::time::Duration;
 
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
+use verified_server::limits::ServerLimits;
 use verified_wire::command::Verdict;
+
+use crate::hosts;
 
 /// The files the project starts with, and their text.
 pub const FILES: [(&str, &str); 2] = [
@@ -96,6 +99,9 @@ pub struct Scenario {
     /// Torn-write granularity of the daemon's disk (`None`: atomic writes).
     pub block_size: Option<u64>,
     pub max_latency: Duration,
+    /// The daemon's limits ([`hosts::limits`] but where a test shrinks
+    /// them; the model replays the run under the same).
+    pub limits: ServerLimits,
 }
 
 fn verdicts(rng: &mut ChaCha8Rng) -> Vec<Verdict> {
@@ -234,6 +240,7 @@ impl Scenario {
             holds: Vec::new(),
             block_size,
             max_latency: Duration::from_millis(rng.random_range(1..=40)),
+            limits: hosts::limits(),
         }
     }
 }

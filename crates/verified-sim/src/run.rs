@@ -400,7 +400,10 @@ pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome
     let mut sim = builder.build();
     let _observer = observer(&ledger);
     sim.host(ANTHROPIC, hosts::anthropic());
-    sim.host(DAEMON, hosts::daemon(ledger.clone(), seed, planted));
+    sim.host(
+        DAEMON,
+        hosts::daemon(ledger.clone(), seed, scenario.limits.clone(), planted),
+    );
     sim.client(
         TUI,
         driver::tui(scenario.turns.clone(), seed, ledger.clone()),
@@ -443,7 +446,7 @@ pub fn simulate_scenario(scenario: Scenario, planted: Planted) -> Result<Outcome
     let entries = ledger.entries();
     let mut violations = check::world(&entries, &scenario);
     let observed = model::observed(&entries);
-    let replayed = match model::replay(&observed) {
+    let replayed = match model::replay(scenario.limits.core.clone(), &observed) {
         Ok(replayed) => Some(replayed),
         Err(mismatch) => {
             violations.push(Violation {

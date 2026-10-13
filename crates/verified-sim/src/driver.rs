@@ -4,8 +4,9 @@
 //! The user reads the app after every redraw (a watch channel fed by the
 //! TUI's `observe` hook) and reacts like a person would: sends the next
 //! message once the last turn is over, answers approval prompts, presses Esc
-//! when the plan says to, resends a message that did not get through, and
-//! reconnects when the TUI says it stopped following.
+//! when the plan says to, resends a message that did not get through,
+//! reconnects when the TUI says it stopped following, and gives up the rest
+//! of the plan when the TUI says the session takes no more.
 
 use core::time::Duration;
 use std::collections::BTreeMap;
@@ -34,6 +35,9 @@ const KEYS: usize = 64;
 const GLANCE: Duration = Duration::from_millis(100);
 /// Mixed into the seed for the TUI's entropy.
 const TUI_SALT: u64 = 0x7475_6900;
+/// What the TUI's notice says when the session takes no more commands
+/// (it is full, or gone): a person would stop there.
+const OVER: &str = "restart verified for a new session";
 
 /// What the user sees after a redraw.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -53,6 +57,8 @@ struct Seen {
     noticed: bool,
     delivery_failed: bool,
     stopped: bool,
+    /// The TUI says the session takes no more ([`OVER`]).
+    over: bool,
     draft: bool,
     offset: u64,
     /// The folded transcript, when nothing is in flight.
@@ -88,6 +94,7 @@ impl Seen {
                 app.connection(),
                 Connection::Down(_) | Connection::Broken(_)
             ),
+            over: app.notice().is_some_and(|notice| notice.contains(OVER)),
             draft: !app.draft().is_empty(),
             offset: app.position().offset.seq(),
             transcript: quiet
@@ -156,7 +163,9 @@ impl User {
         Ok(())
     }
 
-    async fn play_turn(&mut self, index: usize, turn: &TurnPlan) -> Result<(), ScriptError> {
+    /// Plays turn `index` of the plan; `false` when the TUI says the
+    /// session takes no more.
+    async fn play_turn(&mut self, index: usize, turn: &TurnPlan) -> Result<bool, ScriptError> {
         loop {
             let seen = self.glance().await?;
             if seen.quiet() && seen.turns == index && !seen.draft {
@@ -172,8 +181,11 @@ impl User {
         let mut prompts = 0usize;
         loop {
             let seen = self.glance().await?;
+            if seen.over {
+                return Ok(false);
+            }
             if seen.turns > index && !seen.running && seen.settled {
-                return Ok(());
+                return Ok(true);
             }
             self.unstick(&seen).await?;
             if seen.draft && seen.settled && !seen.running && seen.caught_up {
@@ -226,8 +238,13 @@ impl User {
     }
 
     async fn play(mut self, plan: &[TurnPlan]) -> Result<(), ScriptError> {
+        let mut over = false;
         for (index, turn) in plan.iter().enumerate() {
-            self.play_turn(index, turn).await?;
+            if !self.play_turn(index, turn).await? {
+                self.ledger.record(Entry::GaveUp { turn: index });
+                over = true;
+                break;
+            }
         }
         loop {
             let seen = self.glance().await?;
@@ -236,7 +253,7 @@ impl User {
             // crashed daemon learns otherwise only at its idle timeout).
             let current = seen.offset == self.ledger.logged();
             if let (true, true, Some(transcript)) =
-                (seen.turns == plan.len(), current, seen.transcript)
+                (over || seen.turns == plan.len(), current, seen.transcript)
             {
                 self.ledger.record(Entry::Caught {
                     offset: seen.offset,

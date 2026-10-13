@@ -81,6 +81,10 @@ pub struct World {
     pub client: Client,
     pub broken: Broken,
     pub stale_refused: bool,
+    /// A full log refused the boot's resume: the shell owes it, and decides
+    /// it again once the running turn is interrupted. Only a replay sets
+    /// it ([`crate::Observed::Refused`]); BFS never fills the log.
+    pub refused: bool,
 }
 
 impl World {
@@ -91,10 +95,10 @@ impl World {
         !self.pending.is_empty() || !self.staged.is_empty()
     }
 
-    /// Nothing pending, in flight or awaiting the user.
+    /// Nothing pending, owed, in flight or awaiting the user.
     #[must_use]
     pub fn quiescent(&self) -> bool {
-        !self.persisting() && self.flights.is_empty() && self.asks.is_empty()
+        !self.persisting() && !self.refused && self.flights.is_empty() && self.asks.is_empty()
     }
 }
 
@@ -121,6 +125,7 @@ impl Default for World {
             },
             broken: Broken::default(),
             stale_refused: bool::default(),
+            refused: false,
         }
     }
 }

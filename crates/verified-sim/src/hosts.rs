@@ -101,16 +101,22 @@ async fn project_files() -> turmoil::Result<BTreeMap<String, String>> {
     Ok(files)
 }
 
-/// The daemon, booting (and rebooting after each crash) from its disk, with
-/// the defects `planted` (none, but in the simulation's mutation tests).
-pub fn daemon(ledger: Ledger, seed: u64, planted: Planted) -> impl Fn() -> Software {
+/// The daemon under `limits`, booting (and rebooting after each crash) from
+/// its disk, with the defects `planted` (none, but in the simulation's
+/// mutation tests).
+pub fn daemon(
+    ledger: Ledger,
+    seed: u64,
+    limits: ServerLimits,
+    planted: Planted,
+) -> impl Fn() -> Software {
     move || {
         let ledger = ledger.clone();
+        let limits = limits.clone();
         Box::pin(async move {
             let boot = ledger.boots();
             let files = project_files().await?;
             ledger.record(Entry::Boot { boot, files });
-            let limits = limits();
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let model = AnthropicModel::new(
                 net::Connector,
