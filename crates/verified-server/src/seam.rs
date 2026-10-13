@@ -274,7 +274,7 @@ impl ProcessGroups {
     /// going down, and a group that is gone already is what it wants. It
     /// never blocks on the set's lock, since the panic hook may run on the
     /// thread holding it (a panic inside `insert` or `remove`) and would
-    /// then never reach the abort: it tries [`KILL_ATTEMPTS`] times, which
+    /// then never reach the abort: it tries a bounded number of times, which
     /// outlasts another thread's insert or remove, and only then kills
     /// nothing. A poisoned set is still accurate (see `lock`).
     pub fn kill_all(&self) {
