@@ -20,7 +20,7 @@ pub use id::{
     ApprovalId, CallId, CallIx, EffectId, Epoch, IdEntropy, IdError, MessageId, PartId, SessionId,
     StepId, ToolName, TurnId, UnixMillis,
 };
-pub use limits::{Limits, LimitsConfig, LimitsError, Millis};
+pub use limits::{Limits, LimitsConfig, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit, alpha};
 pub use record::{
     Approver, Cause, Exit, Failure, Fault, Limit, Proposal, Record, Request, Rerun, Reset, Tool,

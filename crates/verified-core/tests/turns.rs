@@ -38,12 +38,8 @@ const fn count(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("non-zero")
 }
 
-fn limits(config: LimitsConfig) -> Limits {
-    Limits::parse(config).expect("consistent limits")
-}
-
 fn small_limits() -> Limits {
-    limits(small_config())
+    Limits::new(small_config())
 }
 
 const fn payload(bytes: u64) -> Measured<Unit> {
@@ -752,7 +748,7 @@ fn other_model_failures_do_not_retry() {
 
 #[test]
 fn steps_per_turn_is_a_bound() {
-    let mut driver = Driver::new(limits(LimitsConfig {
+    let mut driver = Driver::new(Limits::new(LimitsConfig {
         steps_per_turn: NonZeroU32::new(1).expect("non-zero"),
         ..small_config()
     }));
@@ -825,7 +821,7 @@ fn a_discarded_attempt_does_not_count_against_context() {
 
 #[test]
 fn the_turn_budget_counts_proposals() {
-    let mut driver = Driver::new(limits(LimitsConfig {
+    let mut driver = Driver::new(Limits::new(LimitsConfig {
         calls_per_step: count(1),
         calls_per_turn: count(2),
         ..small_config()
@@ -889,7 +885,7 @@ fn calls_past_the_step_bound_are_recorded_and_fail() {
 
 #[test]
 fn calls_past_the_turn_bound_fail() {
-    let mut driver = Driver::new(limits(LimitsConfig {
+    let mut driver = Driver::new(Limits::new(LimitsConfig {
         calls_per_turn: count(1),
         ..small_config()
     }));

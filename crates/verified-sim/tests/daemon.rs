@@ -175,10 +175,10 @@ fn a_panicking_task_fails_the_daemon_host() {
 #[test]
 fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
     let mut limits = ServerLimits::v0();
-    limits.core = CoreLimits::parse(LimitsConfig {
+    limits.core = CoreLimits::new(LimitsConfig {
         context_bytes: core::num::NonZeroU64::new(64u64 << 20u32).expect("non-zero"),
         ..LimitsConfig::v0()
-    })?;
+    });
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(600))
         .build();

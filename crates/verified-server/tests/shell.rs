@@ -186,11 +186,10 @@ struct Daemon {
 
 fn limits() -> ServerLimits {
     let mut limits = ServerLimits::v0();
-    limits.core = Limits::parse(LimitsConfig {
+    limits.core = Limits::new(LimitsConfig {
         retry_schedule: vec![Millis::new(1), Millis::new(1)],
         ..LimitsConfig::v0()
-    })
-    .expect("consistent limits");
+    });
     limits
 }
 

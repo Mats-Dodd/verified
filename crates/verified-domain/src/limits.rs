@@ -2,9 +2,9 @@
 //! loop and retry. It is data: the core reads it, never grows past it, and
 //! turns an exceeded bound into a typed outcome.
 //!
-//! A `Limits` is only made by [`Limits::parse`] from a [`LimitsConfig`]: every
-//! count is non-zero by type and the cross-field rules are checked there, so
-//! nothing downstream patches a value at run time.
+//! A `Limits` is only made by [`Limits::new`] from a [`LimitsConfig`]: every
+//! count is non-zero by type, so nothing downstream patches a value at run
+//! time.
 
 use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
@@ -30,7 +30,7 @@ impl Millis {
 }
 
 /// Every bound the agent runs under. Its fields are private: a value comes
-/// only from [`Limits::parse`], which has checked them.
+/// only from [`Limits::new`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 pub struct Limits {
@@ -98,30 +98,7 @@ impl Limits {
     pub const fn batch_window(&self) -> Millis {
         self.batch_window
     }
-
-    /// The config these limits were parsed from.
-    ///
-    /// # Panics
-    /// Never: every count was non-zero when parsed.
-    #[verifier::external]
-    #[must_use]
-    pub fn config(&self) -> LimitsConfig {
-        let nonzero = "parsed from a non-zero count";
-        LimitsConfig {
-            turns_per_session: NonZeroUsize::new(self.turns_per_session).expect(nonzero),
-            steps_per_turn: NonZeroU32::new(self.steps_per_turn).expect(nonzero),
-            calls_per_step: NonZeroUsize::new(self.calls_per_step).expect(nonzero),
-            calls_per_turn: NonZeroUsize::new(self.calls_per_turn).expect(nonzero),
-            context_bytes: NonZeroU64::new(self.context_bytes).expect(nonzero),
-            retry_schedule: self.retry_schedule.clone(),
-            parts_per_batch: self.parts_per_batch(),
-            batch_window: self.batch_window,
-        }
-    }
 }
-
-/// The longest retry schedule accepted.
-pub const MAX_RETRIES: usize = 64;
 
 } // verus!
 
@@ -130,18 +107,10 @@ pub const MAX_RETRIES: usize = 64;
     reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
 )]
 impl Limits {
-    /// Checks `config` and makes the bounds the agent runs under.
-    ///
-    /// # Errors
-    /// A retry schedule longer than [`MAX_RETRIES`].
-    pub fn parse(config: LimitsConfig) -> Result<Self, LimitsError> {
-        if config.retry_schedule.len() > MAX_RETRIES {
-            return Err(LimitsError::RetrySchedule {
-                length: config.retry_schedule.len(),
-                limit: MAX_RETRIES,
-            });
-        }
-        Ok(Self {
+    /// The bounds the agent runs under.
+    #[must_use]
+    pub fn new(config: LimitsConfig) -> Self {
+        Self {
             turns_per_session: config.turns_per_session.get(),
             steps_per_turn: config.steps_per_turn.get(),
             calls_per_step: config.calls_per_step.get(),
@@ -150,35 +119,26 @@ impl Limits {
             retry_schedule: config.retry_schedule,
             parts_per_batch: config.parts_per_batch.get(),
             batch_window: config.batch_window,
-        })
+        }
     }
 
     /// The bounds v0 ships with.
-    ///
-    /// # Panics
-    /// Never: [`LimitsConfig::v0`] parses.
     #[must_use]
     pub fn v0() -> Self {
-        Self::parse(LimitsConfig::v0()).expect("the v0 limits are consistent")
+        Self::new(LimitsConfig::v0())
     }
 
     /// Group commit: model parts batched into one record before an fsync.
     ///
     /// # Panics
-    /// Never: [`Limits::parse`] made it from a non-zero count.
+    /// Never: [`Limits::new`] made it from a non-zero count.
     #[must_use]
     pub const fn parts_per_batch(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.parts_per_batch).expect("parsed from a NonZeroUsize")
-    }
-
-    /// The retry schedule's length: the retry budget of one step.
-    #[must_use]
-    pub const fn retries(&self) -> usize {
-        self.retry_schedule.len()
+        NonZeroUsize::new(self.parts_per_batch).expect("made from a NonZeroUsize")
     }
 }
 
-/// The raw bounds [`Limits::parse`] checks. Every count is non-zero by type.
+/// The bounds a [`Limits`] is made from. Every count is non-zero by type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LimitsConfig {
     pub turns_per_session: NonZeroUsize,
@@ -191,13 +151,6 @@ pub struct LimitsConfig {
     /// Group commit: model parts batched into one record before an fsync.
     pub parts_per_batch: NonZeroUsize,
     pub batch_window: Millis,
-}
-
-/// Why a [`LimitsConfig`] is not a [`Limits`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum LimitsError {
-    #[error("the retry schedule has {length} entries, more than {limit}")]
-    RetrySchedule { length: usize, limit: usize },
 }
 
 impl LimitsConfig {
@@ -223,24 +176,10 @@ impl LimitsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Limits, LimitsConfig, LimitsError, MAX_RETRIES, Millis};
+    use super::{Limits, Millis};
 
     #[test]
-    fn parse_checks_what_types_cannot() {
-        let v0 = Limits::v0();
-        assert_eq!(Limits::parse(v0.config()), Ok(v0), "round trip");
-        let long = LimitsConfig {
-            retry_schedule: vec![Millis::new(1); MAX_RETRIES + 1],
-            ..LimitsConfig::v0()
-        };
-        assert_eq!(
-            Limits::parse(long),
-            Err(LimitsError::RetrySchedule {
-                length: MAX_RETRIES + 1,
-                limit: MAX_RETRIES
-            }),
-            "too many retries"
-        );
+    fn the_retry_schedule_runs_out() {
         assert_eq!(Limits::v0().retry_delay(3), None, "schedule spent");
         assert_eq!(Limits::v0().retry_delay(0), Some(Millis::new(500)));
     }

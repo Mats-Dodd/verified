@@ -19,7 +19,7 @@ use verified_server::payload::{ModelPart, Parsed, ToolInput, ToolOutput, measure
 /// theirs.
 fn limits() -> Limits {
     let count = |value: usize| NonZeroUsize::new(value).expect("non-zero");
-    Limits::parse(LimitsConfig {
+    Limits::new(LimitsConfig {
         turns_per_session: count(3),
         steps_per_turn: NonZeroU32::new(3).expect("non-zero"),
         calls_per_step: count(2),
@@ -29,7 +29,6 @@ fn limits() -> Limits {
         parts_per_batch: count(64),
         batch_window: Millis::new(30),
     })
-    .expect("consistent limits")
 }
 
 /// A tool call as the model might send it, valid or not.

@@ -28,13 +28,13 @@ pub fn config(steps: u32) -> LimitsConfig {
     }
 }
 
-/// [`config`], parsed.
+/// [`config`]'s limits.
 ///
 /// # Panics
 /// `steps` is zero.
 #[must_use]
 pub fn limits(steps: u32) -> Limits {
-    Limits::parse(config(steps)).expect("consistent limits")
+    Limits::new(config(steps))
 }
 
 /// One message, these model responses, up to `batches` batches of parts
@@ -127,16 +127,15 @@ pub fn crashes_while_cancelling() -> Harness {
 /// One call a step and two a turn, so a model may propose past them.
 ///
 /// # Panics
-/// Never: the limits are consistent.
+/// Never: every count is non-zero.
 #[must_use]
 pub fn calls_past_the_bounds() -> Harness {
     Harness::bounded(
-        Limits::parse(LimitsConfig {
+        Limits::new(LimitsConfig {
             calls_per_step: NonZeroUsize::new(1).expect("non-zero"),
             calls_per_turn: NonZeroUsize::new(2).expect("non-zero"),
             ..config(3)
-        })
-        .expect("consistent limits"),
+        }),
         crashing(vec![Vec::new(), vec![Tool::Read, Tool::Edit]]),
     )
 }
