@@ -269,7 +269,11 @@ async fn timeout_kills_and_output_is_bounded() {
         output.text
     );
 
-    limits.tool_output_bytes = 1000;
+    // The default timeout: under load, 300 ms can cut even a short command.
+    let limits = ServerLimits {
+        tool_output_bytes: 1000,
+        ..ServerLimits::v0()
+    };
     let (exit, output) = tool::run(
         &env,
         session(),

@@ -8,8 +8,9 @@ fmt-check:
     cargo fmt --all --check
 
 # Two configurations, each checked: everything with the `sim` shims on
-# (`--all-features`), and the shipped crates with the real IO (tests/local.rs: process groups, timeouts, FileLog's
-# torn tail on a real disk, flock), which `--all-features` compiles out.
+# (`--all-features`), and the shipped crates with the real IO
+# (tests/local.rs: process groups, timeouts, FileLog's torn tail on a real
+# disk, flock), which `--all-features` compiles out.
 real := "-p verified-server -p verified-tui -p verified-cli"
 
 check: fmt-check clippy
