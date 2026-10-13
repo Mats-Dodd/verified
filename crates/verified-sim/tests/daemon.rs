@@ -166,8 +166,8 @@ fn a_panicking_task_fails_the_daemon_host() {
     );
 }
 
-/// Over 4 MiB of tool output (70 reads of 64 KiB) is followed live from
-/// the start: no read is a data event too large for the client to decode.
+/// Over 4 MiB of tool output (84 reads of 64 KiB) is followed from the
+/// start: no read is a data event too large for the client to decode.
 #[test]
 fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
     let mut limits = ServerLimits::v0();
@@ -191,7 +191,9 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
         let client = client();
         send(&client, create()).await?;
         let reads = vec!["read big.txt"; 14].join(" ; ");
-        for turn in 1..=5u8 {
+        // The sixth message is accepted only once the fifth turn has ended,
+        // so the first read from the start has over 4 MiB to serve.
+        for turn in 1..=6u8 {
             // Refused while the last turn runs.
             while let Err(ClientError::Rejected(Rejection::SessionBusy { .. })) =
                 send(&client, message(turn, &reads)).await
@@ -213,7 +215,7 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
                 match update {
                     StreamUpdate::Read { chunks, .. } => {
                         seen.extend(chunks);
-                        if count(&seen, |chunk| matches!(chunk, UiChunk::TurnEnded { .. })) == 5 {
+                        if count(&seen, |chunk| matches!(chunk, UiChunk::TurnEnded { .. })) == 6 {
                             stop.cancel();
                         }
                     }
@@ -229,7 +231,7 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
         let outputs = count(&seen?, |chunk| {
             matches!(chunk, UiChunk::ToolOutputAvailable { .. })
         });
-        assert_eq!(outputs, 70, "every read's output is followed");
+        assert_eq!(outputs, 84, "every read's output is followed");
         Ok(())
     });
     sim.run()
