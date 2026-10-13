@@ -708,6 +708,11 @@ impl Session {
                         drop(reply.send(answer));
                         self.start_effects(effects).await;
                     }
+                    // The refusal closed the running turn: if that was this
+                    // one, this cancel is what cancelled it.
+                    Persisted::Refused if was_cancelled(&self.records, turn) => {
+                        drop(reply.send(self.cancel_answer(Outcome::Accepted, turn)));
+                    }
                     Persisted::Refused => drop(reply.send(Err(self.full()))),
                 }
             }

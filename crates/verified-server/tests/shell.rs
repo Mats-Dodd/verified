@@ -1250,6 +1250,80 @@ async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
     second.world.shutdown().cancel();
 }
 
+/// A cancel whose `CancelRequested` is the first record a full log refuses
+/// still cancels the turn (into the reserve), and says so.
+#[tokio::test]
+async fn a_cancel_that_fills_the_log_is_answered_as_a_cancel() {
+    let disk = MemDisk::new();
+    let length = || disk.bytes(session_id()).map_or(0, |bytes| bytes.len());
+    let env = MemEnv::with_file("lib.rs", "fn mian() {}");
+    let roomy = ServerLimits {
+        log_file_bytes: 1 << 20,
+        ..small_limits()
+    };
+    let first = boot_with(&disk, Arc::<MemEnv>::clone(&env), roomy.clone()).await;
+    let (_, handle) = first.registry.create(session_id()).await.expect("created");
+    // A log long enough to need one line and the reserve past it.
+    let mut seed = 1u8;
+    while length() < 40usize << 10u32 {
+        let reply = handle
+            .send_message(send(seed, &"x".repeat(990)))
+            .await
+            .expect("accepted");
+        until(&handle, ended(reply.turn_id)).await;
+        seed = seed.saturating_add(1);
+    }
+    // A turn waiting for approval appends nothing more.
+    let reply = handle
+        .send_message(send(seed, "edit lib.rs mian main"))
+        .await
+        .expect("accepted");
+    until(&handle, |chunks| approval_requested(chunks).is_some()).await;
+    first.world.shutdown().cancel();
+    drop(handle);
+    // A restart appends one EpochBumped; the next is as long.
+    let before = length();
+    let second = boot_with(&disk, Arc::<MemEnv>::clone(&env), roomy).await;
+    let handle = second
+        .registry
+        .lookup(session_id())
+        .await
+        .expect("it boots");
+    drop(records(&handle).await);
+    let bumped = length().saturating_sub(before);
+    second.world.shutdown().cancel();
+    drop(handle);
+    // Room past the reserve for the next restart's EpochBumped, no more.
+    let mut tight = small_limits();
+    tight.log_file_bytes = u64::try_from(length().saturating_add(bumped))
+        .expect("small")
+        .saturating_add(tight.reserve());
+    let third = boot_with(&disk, Arc::<MemEnv>::clone(&env), tight.clone()).await;
+    let handle = third.registry.lookup(session_id()).await.expect("it boots");
+    drop(records(&handle).await);
+    let cancelled = handle
+        .cancel(Cancel {
+            turn_id: reply.turn_id,
+        })
+        .await
+        .expect("the cancel is answered");
+    assert_eq!(cancelled.outcome, Outcome::Created, "this cancel did it");
+    until(&handle, ended(reply.turn_id)).await;
+    assert_eq!(
+        records(&handle).await.last(),
+        Some(&Record::TurnEnded {
+            turn: reply.turn_id,
+            outcome: TurnOutcome::Cancelled
+        }),
+        "the turn is cancelled"
+    );
+    assert!(
+        u64::try_from(length()).expect("small") <= tight.log_file_bytes,
+        "within its bound"
+    );
+    third.world.shutdown().cancel();
+}
+
 /// The first refusal of a new message within two seconds.
 async fn eventually_refused(handle: &SessionHandle) -> Option<CommandError> {
     for seed in 100..=120u8 {
