@@ -22,4 +22,3 @@ pub mod model;
 pub mod run;
 pub mod scenario;
 pub mod store;
-pub mod trace;
