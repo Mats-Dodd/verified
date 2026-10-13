@@ -135,8 +135,9 @@ impl ServerLimits {
 
     /// Bytes at the end of the log file only the records ending the running
     /// turn may take: a short line (no payload, so within
-    /// [`RECORD_OVERHEAD`]) for each of its step's results and the
-    /// [`CLOSING_RECORDS`]. [`ServerLimits::check`] makes sure it fits.
+    /// [`RECORD_OVERHEAD`]) for each of its step's results and its
+    /// `CancelRequested`, a restart's `EpochBumped` and its `TurnEnded`.
+    /// [`ServerLimits::check`] makes sure it fits.
     #[must_use]
     pub fn reserve(&self) -> u64 {
         u64::try_from(self.reserve_bytes().unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
