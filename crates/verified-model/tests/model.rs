@@ -143,6 +143,32 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
 }
 
 #[test]
+fn leaving_an_unsafe_call_dispatched_after_a_crash_is_caught() {
+    for tool in [Tool::Edit, Tool::Bash] {
+        let checker = Harness {
+            bug: Some(Bug::LeaveDispatched),
+            ..suite::with_crashes(vec![vec![tool]], 1)
+        }
+        .checker()
+        .spawn_bfs()
+        .join();
+        assert!(
+            checker
+                .discovery("quiescent implies every call resolved and the turn ended")
+                .is_some(),
+            "the checker sees the {tool:?} call never resolved"
+        );
+        assert_eq!(
+            checker
+                .discovery("every durable prefix recovers")
+                .map(stateright::Path::into_actions),
+            None,
+            "the log the {tool:?} call is left in still recovers"
+        );
+    }
+}
+
+#[test]
 fn approval_by_policy_of_an_edit_is_caught() {
     let checker = Harness {
         bug: Some(Bug::PolicyApprovesAll),

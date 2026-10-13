@@ -155,6 +155,10 @@ pub enum Bug {
     SkipOnReconnect,
     /// Policy approves a call of any tool, not only `Safe` ones.
     PolicyApprovesAll,
+    /// After a crash, drop the `Unknown` result of a dispatched `Unsafe`
+    /// call, and all the resume decided after it, so the call stays
+    /// dispatched.
+    LeaveDispatched,
 }
 
 /// The core under `limits` in an abstract world.
@@ -587,7 +591,22 @@ impl Model for Harness {
                     world.broken.unrecoverable = true;
                     return Some(world);
                 };
-                self.stage(&mut world, &core.resume());
+                let mut resumed = core.resume();
+                if self.bug == Some(Bug::LeaveDispatched)
+                    && let Some(at) = resumed.records.iter().position(|record| {
+                        matches!(
+                            record,
+                            Record::ToolResult {
+                                exit: Exit::Err(Cause::Unknown),
+                                ..
+                            }
+                        )
+                    })
+                {
+                    resumed.records.truncate(at);
+                    resumed.effects.clear();
+                }
+                self.stage(&mut world, &resumed);
                 if self.bug == Some(Bug::UnsafeResolvedInterrupted) {
                     for record in &mut world.pending {
                         if let Record::ToolResult { exit, .. } = record
