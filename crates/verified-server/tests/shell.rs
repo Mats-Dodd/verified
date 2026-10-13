@@ -24,6 +24,7 @@ use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
 use verified_server::shell::{CommandError, Seams, SessionHandle, ShellConfig};
+use verified_server::tool::Kept;
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
@@ -150,9 +151,8 @@ impl Env for MemEnv {
         &self,
         bash: &BashGrant<'_>,
         options: &ExecOptions,
-        output: mpsc::Sender<Vec<u8>>,
         cancel: &CancellationToken,
-    ) -> Result<ExitStatus, EnvError> {
+    ) -> Result<(ExitStatus, Kept), EnvError> {
         let command = bash.command();
         let call = options
             .env
@@ -169,15 +169,13 @@ impl Env for MemEnv {
             .lock()
             .expect("unpoisoned")
             .push((command.as_str().to_owned(), call));
+        let mut kept = Kept::new(options.output_bytes);
         if command.as_str() == "block" {
             cancel.cancelled().await;
-            return Ok(ExitStatus::Stopped(Stopped::Cancelled));
+            return Ok((ExitStatus::Stopped(Stopped::Cancelled), kept));
         }
-        output
-            .send(format!("ran {}\n", command.as_str()).into_bytes())
-            .await
-            .expect("the collector is listening");
-        Ok(ExitStatus::Code(0))
+        kept.push(format!("ran {}\n", command.as_str()).as_bytes());
+        Ok((ExitStatus::Code(0), kept))
     }
 }
 

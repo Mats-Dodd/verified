@@ -53,8 +53,6 @@ pub struct ServerLimits {
     pub dir_entries: usize,
     /// Most bytes of tool output kept (the tail survives for `bash`).
     pub tool_output_bytes: usize,
-    /// Capacity of the queue carrying a command's output to its collector.
-    pub exec_output_queue: usize,
     /// How long `bash` may run before its process group is killed.
     pub exec_timeout: Millis,
     /// How long a stopped command's output is still read: past it, a
@@ -219,7 +217,6 @@ impl ServerLimits {
             file_bytes: 4 << 20,
             dir_entries: 1_000,
             tool_output_bytes: 64 << 10,
-            exec_output_queue: 64,
             exec_timeout: Millis::new(120_000),
             exec_drain: Millis::new(1_000),
             sse_lifetime: Millis::new(60_000),

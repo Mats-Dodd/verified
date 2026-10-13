@@ -17,7 +17,6 @@ use core::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::{EffectId, Millis};
 use verified_server::env::{
@@ -26,6 +25,7 @@ use verified_server::env::{
 };
 use verified_server::payload::ProjectPath;
 use verified_server::seam::Clock;
+use verified_server::tool::Kept;
 
 use crate::ledger::{Entry, Ledger, Op};
 
@@ -94,9 +94,8 @@ impl Env for SimEnv {
         &self,
         bash: &BashGrant<'_>,
         options: &ExecOptions,
-        output: mpsc::Sender<Vec<u8>>,
         cancel: &CancellationToken,
-    ) -> Result<ExitStatus, EnvError> {
+    ) -> Result<(ExitStatus, Kept), EnvError> {
         let script = bash.command().as_str().trim();
         self.mutated(
             Some(bash.id().as_str().to_owned()),
@@ -126,11 +125,8 @@ impl Env for SimEnv {
         } else {
             (ExitStatus::Code(0), format!("{script}\n"))
         };
-        if !said.is_empty() {
-            // The collector stops reading only when the tool gives up; output
-            // nobody reads is output nobody needs.
-            drop(output.send(said.into_bytes()).await);
-        }
-        Ok(status)
+        let mut kept = Kept::new(options.output_bytes);
+        kept.push(said.as_bytes());
+        Ok((status, kept))
     }
 }

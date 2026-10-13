@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
 use verified_domain::id::{CallId, SessionId};
@@ -34,6 +33,7 @@ use verified_domain::{EffectId, Millis};
 use crate::payload::{Command, Parsed, ProjectPath, Sibling, ToolArgs};
 use crate::seam::{Clock, ProcessGroups};
 use crate::shim::fs;
+use crate::tool::Kept;
 
 /// Why an `Env` operation failed, backend-independent (pi's `FileErrorCode`
 /// and `ExecutionErrorCode`).
@@ -135,6 +135,8 @@ pub struct ExecOptions {
     pub timeout: Millis,
     /// How long output is still read once the group is stopped.
     pub drain: Millis,
+    /// How many of the last bytes of output are kept.
+    pub output_bytes: usize,
     /// Extra environment variables (e.g. `VERIFIED_CALL_ID`).
     pub env: Vec<(String, String)>,
 }
@@ -284,8 +286,8 @@ pub trait Env: Send + Sync + fmt::Debug {
     async fn write(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<Written, EnvError>;
 
     /// Runs the approved command with `sh -c` in the project root, in its
-    /// own process group, streaming combined output into `output` (dropped
-    /// on return). The command runs until its leader exits, even after its
+    /// own process group, and keeps the last `ExecOptions::output_bytes` of
+    /// its combined output. The command runs until its leader exits, even after its
     /// output closes; nothing else in its group is signalled then, so
     /// background processes it started may keep running. `cancel` and the
     /// timeout send the group one `SIGKILL` and make the result
@@ -300,9 +302,8 @@ pub trait Env: Send + Sync + fmt::Debug {
         &self,
         bash: &BashGrant<'_>,
         options: &ExecOptions,
-        output: mpsc::Sender<Vec<u8>>,
         cancel: &CancellationToken,
-    ) -> Result<ExitStatus, EnvError>;
+    ) -> Result<(ExitStatus, Kept), EnvError>;
 }
 
 /// The real environment, a best-effort development env: the project
@@ -548,9 +549,8 @@ impl Env for LocalEnv {
         &self,
         bash: &BashGrant<'_>,
         options: &ExecOptions,
-        output: mpsc::Sender<Vec<u8>>,
         cancel: &CancellationToken,
-    ) -> Result<ExitStatus, EnvError> {
+    ) -> Result<(ExitStatus, Kept), EnvError> {
         let command = bash.command();
         let mut process = tokio::process::Command::new("/bin/sh");
         process
@@ -577,6 +577,7 @@ impl Env for LocalEnv {
                 reason: "no pipes".to_owned(),
             });
         };
+        let mut kept = Kept::new(options.output_bytes);
         let mut out_buffer = vec![0u8; 8192];
         let mut err_buffer = vec![0u8; 8192];
         let (mut out_open, mut err_open) = (true, true);
@@ -615,11 +616,7 @@ impl Env for LocalEnv {
             };
             match result {
                 Ok(0) | Err(_) => *open = false,
-                Ok(count) => {
-                    let chunk = buffer.get(..count).unwrap_or_default().to_vec();
-                    // A gone collector only loses output, never the result.
-                    drop(output.send(chunk).await);
-                }
+                Ok(count) => kept.push(buffer.get(..count).unwrap_or_default()),
             }
         }
         // The output is closed, but the command runs until its leader
@@ -634,7 +631,7 @@ impl Env for LocalEnv {
                 status = group.wait() => Ok(status?),
             };
             match ended {
-                Ok(status) => return Ok(exit_status(status)),
+                Ok(status) => return Ok((exit_status(status), kept)),
                 Err(why) => {
                     group.kill();
                     why
@@ -649,7 +646,7 @@ impl Env for LocalEnv {
             _reaped = group.wait() => {}
             () = self.clock.sleep(options.drain) => {}
         }
-        Ok(ExitStatus::Stopped(why))
+        Ok((ExitStatus::Stopped(why), kept))
     }
 }
 

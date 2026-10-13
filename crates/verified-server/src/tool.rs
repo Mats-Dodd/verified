@@ -20,7 +20,6 @@
 use core::fmt::Write as _;
 use std::collections::VecDeque;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
 use verified_domain::id::SessionId;
@@ -154,33 +153,34 @@ pub const fn stopped(why: Stopped) -> &'static str {
     }
 }
 
-/// The tail of a command's output, at most `limit` bytes.
-struct Kept {
+/// The tail of a command's output: its last `limit` bytes, and how many
+/// came before them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
     bytes: VecDeque<u8>,
     omitted: u64,
     limit: usize,
 }
 
 impl Kept {
-    fn push(&mut self, chunk: &[u8]) {
+    /// Keeps nothing yet, and at most `limit` bytes.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(limit),
+            omitted: 0,
+            limit,
+        }
+    }
+
+    /// Appends `chunk`, dropping the oldest bytes past the limit.
+    pub fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend(chunk);
         while self.bytes.len() > self.limit {
             self.bytes.pop_front();
             self.omitted = self.omitted.saturating_add(1);
         }
     }
-}
-
-async fn collect(mut output: mpsc::Receiver<Vec<u8>>, limit: usize) -> Kept {
-    let mut tail = Kept {
-        bytes: VecDeque::with_capacity(limit),
-        omitted: 0,
-        limit,
-    };
-    while let Some(chunk) = output.recv().await {
-        tail.push(&chunk);
-    }
-    tail
 }
 
 async fn bash(
@@ -192,23 +192,19 @@ async fn bash(
     let options = ExecOptions {
         timeout: limits.exec_timeout,
         drain: limits.exec_drain,
+        output_bytes: limits.tool_output_bytes,
         env: vec![(CALL_ID_VAR.to_owned(), grant.id().as_str().to_owned())],
     };
-    let (sender, receiver) = mpsc::channel(limits.exec_output_queue);
-    let (status, tail) = tokio::join!(
-        env.exec(grant, &options, sender, cancel),
-        collect(receiver, limits.tool_output_bytes),
-    );
-    let status = match status {
-        Ok(status) => status,
+    let (status, kept) = match env.exec(grant, &options, cancel).await {
+        Ok(ran) => ran,
         Err(error) => return failure(error.to_string()),
     };
     let mut text = String::new();
-    if tail.omitted > 0 {
-        writeln!(text, "[… {} earlier bytes not shown]", tail.omitted)
+    if kept.omitted > 0 {
+        writeln!(text, "[… {} earlier bytes not shown]", kept.omitted)
             .expect("writing to a String never fails");
     }
-    let contiguous: Vec<u8> = tail.bytes.iter().copied().collect();
+    let contiguous: Vec<u8> = kept.bytes.iter().copied().collect();
     text.push_str(&String::from_utf8_lossy(&contiguous));
     let (exit, trailer) = match status {
         ExitStatus::Code(0i32) => (Exit::Ok, "[exit status 0]".to_owned()),
@@ -226,9 +222,9 @@ async fn bash(
         text.push('\n');
     }
     text.push_str(&trailer);
-    let truncation = if tail.omitted > 0 {
+    let truncation = if kept.omitted > 0 {
         Truncation::Truncated {
-            omitted_bytes: tail.omitted,
+            omitted_bytes: kept.omitted,
         }
     } else {
         Truncation::Complete
