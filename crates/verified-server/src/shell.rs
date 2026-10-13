@@ -784,6 +784,8 @@ impl Session {
         })
     }
 
+    /// The answer to `command`. A verdict for no call awaiting one is a
+    /// repeat only if the log holds the same verdict for that call.
     fn approve_answer(
         &self,
         outcome: Outcome,
@@ -793,7 +795,7 @@ impl Session {
             Outcome::Accepted => Ok(ApproveReply {
                 outcome: WireOutcome::Created,
             }),
-            Outcome::Exists | Outcome::Rejected(CoreRejection::UnknownCall) => {
+            Outcome::Rejected(CoreRejection::UnknownCall) => {
                 match verdict_of(&self.records, &command.call_id) {
                     Some(verdict) if verdict == command.verdict => Ok(ApproveReply {
                         outcome: WireOutcome::Exists,
@@ -807,10 +809,11 @@ impl Session {
                     }),
                 }
             }
-            Outcome::Rejected(
+            Outcome::Exists
+            | Outcome::Rejected(
                 CoreRejection::Busy | CoreRejection::SessionFull | CoreRejection::NotRunning,
             )
-            | Outcome::Stale => defect("a verdict is accepted, a repeat or for an unknown call"),
+            | Outcome::Stale => defect("a verdict is accepted or for no call awaiting one"),
         }
     }
 
