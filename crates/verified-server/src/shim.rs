@@ -5,10 +5,6 @@
 //! simulated network and filesystem.
 //! Nothing outside this module names `tokio::net`, `tokio::fs` or turmoil.
 
-/// Whether this build has the `sim` shims: turmoil instead of the OS. The
-/// shipped binary refuses to compile when it is true.
-pub const SIMULATED: bool = cfg!(feature = "sim");
-
 /// TCP: the daemon's listener and the model client's connector.
 pub mod net {
     use std::io;

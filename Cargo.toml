@@ -5,9 +5,8 @@ members = ["crates/*"]
 # everything but the simulation. Cargo unifies features across the packages
 # of one build, so building verified-sim alongside verified-cli would turn on
 # the `sim` shims of verified-server and verified-tui inside the shipped
-# binary. verified-cli also refuses to compile with them on (see its main.rs),
-# which is what stops `cargo build --workspace`; `just release-without-sim`
-# builds this set in release and checks its resolved features.
+# binary. `just release-without-sim`, the one guard against that, builds this
+# set in release and checks its resolved features.
 default-members = [
     "crates/verified-cli",
     "crates/verified-core",

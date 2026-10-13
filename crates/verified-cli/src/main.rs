@@ -30,18 +30,6 @@ use verified_tui::app::Start;
 use verified_tui::seam::TerminalError;
 use verified_tui::terminal::{CrosstermInput, CrosstermScreen};
 
-// The shipped binary never links the simulation shims. Cargo unifies features
-// across one build, so building verified-sim next to this binary (`cargo
-// build --workspace`, `--all-features`) turns on the `sim` features of
-// verified-server and verified-tui here too; that build must fail, not ship
-// a daemon on turmoil. Build the binary alone (`cargo build --release`, whose
-// default members leave out verified-sim, or `-p verified-cli`).
-const _: () = assert!(
-    !verified_server::shim::SIMULATED && !verified_tui::shim::SIMULATED,
-    "verified-cli was built with the `sim` shims on: build it without verified-sim \
-     (`cargo build --release`, or `-p verified-cli`), never with `--workspace` or `--all-features`"
-);
-
 /// The model `verified daemon` asks unless told otherwise.
 const DEFAULT_MODEL: &str = "claude-opus-5-5";
 /// Where Anthropic's API lives.

@@ -34,9 +34,9 @@ in
     };
 
     # Clippy runs through `just clippy`: the workspace cannot be linted with
-    # one `--all-features` pass, because verified-cli refuses to build with
-    # the `sim` shims on. The recipe lints the sim and real-IO configurations
-    # separately, and CI uses the same recipe.
+    # one `--all-features` pass, because the `sim` shims compile out the real
+    # IO. The recipe lints the sim and real-IO configurations separately, and
+    # CI uses the same recipe.
     clippy = {
       enable = true;
       name = "clippy";

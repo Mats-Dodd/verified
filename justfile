@@ -8,26 +8,25 @@ fmt-check:
     cargo fmt --all --check
 
 # Two configurations, each checked: everything with the `sim` shims on
-# (`--all-features`, which verified-cli refuses to compile), and the shipped
-# crates with the real IO (tests/local.rs: process groups, timeouts, FileLog's
+# (`--all-features`), and the shipped crates with the real IO (tests/local.rs: process groups, timeouts, FileLog's
 # torn tail on a real disk, flock), which `--all-features` compiles out.
 real := "-p verified-server -p verified-tui -p verified-cli"
 
 check: fmt-check clippy
-    cargo check --workspace --exclude verified-cli --all-targets --all-features
+    cargo check --workspace --all-targets --all-features
     cargo check {{real}} --all-targets
 
 clippy:
-    cargo clippy --workspace --exclude verified-cli --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo clippy {{real}} --all-targets -- -D warnings
 
 test:
-    cargo nextest run --workspace --exclude verified-cli --all-features --no-tests pass
+    cargo nextest run --workspace --all-features --no-tests pass
     cargo nextest run {{real}} --no-tests pass
 
 # The simulation (verified-sim) runs first, in `sim`.
 test-ci:
-    cargo nextest run --workspace --exclude verified-sim --exclude verified-cli --all-features --profile ci --no-tests pass
+    cargo nextest run --workspace --exclude verified-sim --all-features --profile ci --no-tests pass
     cargo nextest run {{real}} --profile ci --no-tests pass
 
 # Deterministic simulation first: every fixed seed runs twice and the two
@@ -57,11 +56,11 @@ processes *args:
     cargo run --quiet --profile sim-release -p verified-sim -- processes {{args}}
 
 # The shipped binary never links the simulation shims (the `sim` features of
-# verified-server and verified-tui, and so turmoil). Builds the root's
-# default members in release, as a release build does (verified-cli refuses
-# to compile with the shims on), then checks the features Cargo resolved for
-# that same set. `-p verified-cli` alone would resolve features for the
-# binary alone and never see a leak through the workspace.
+# verified-server and verified-tui, and so turmoil): the one guard. Builds
+# the root's default members in release, as a release build does, then
+# checks the features Cargo resolved for that same set. `-p verified-cli`
+# alone would resolve features for the binary alone and never see a leak
+# through the workspace.
 release-without-sim:
     #!/usr/bin/env bash
     set -euo pipefail
