@@ -40,7 +40,8 @@ use crate::shim::fs;
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     /// A record's line would be longer than replay accepts: nothing was
-    /// written.
+    /// written, but no input makes one. `ServerLimits::check` fits every
+    /// record the daemon makes in a line, so only a shell defect does.
     #[error("log {path}: record {seq} would be a {length}-byte line, more than {limit}")]
     LineTooLong {
         path: String,
@@ -83,13 +84,15 @@ pub enum LogError {
 }
 
 impl LogError {
-    /// Whether the append was refused before writing anything: the log is
-    /// intact and still holds exactly what was acknowledged.
+    /// Whether the append was refused because the log is full: nothing was
+    /// written, the log still holds exactly what was acknowledged, and the
+    /// session goes on.
     #[must_use]
     pub const fn refused(&self) -> bool {
         match self {
-            Self::LineTooLong { .. } | Self::Full { .. } => true,
-            Self::Io { .. }
+            Self::Full { .. } => true,
+            Self::LineTooLong { .. }
+            | Self::Io { .. }
             | Self::TooLarge { .. }
             | Self::Corrupt { .. }
             | Self::Unparseable { .. }
@@ -819,8 +822,8 @@ mod tests {
     }
 
     /// Appends groups, keeping what each acknowledged: the acknowledged
-    /// records, exactly, are what replay finds; a refused group wrote
-    /// nothing.
+    /// records, exactly, are what replay finds; a group a bound refused
+    /// wrote nothing.
     async fn append_all(
         groups: &[Vec<Record<Parsed>>],
         max_line: usize,
@@ -832,10 +835,15 @@ mod tests {
         let mut acked = Vec::new();
         let mut refused = Vec::new();
         for group in groups {
+            let before = disk.bytes(session());
             match log.append(group, 0).await {
                 Ok(()) => acked.extend(group.iter().cloned()),
                 Err(error) => {
-                    assert!(error.refused(), "only a bound refuses: {error}");
+                    assert!(
+                        matches!(error, LogError::LineTooLong { .. } | LogError::Full { .. }),
+                        "only a bound refuses: {error}"
+                    );
+                    assert_eq!(disk.bytes(session()), before, "{error} wrote nothing");
                     refused.push(error);
                 }
             }
@@ -871,7 +879,7 @@ mod tests {
         assert_eq!(
             acked,
             vec![sized(10), sized(20)],
-            "the oversized group is refused whole"
+            "the oversized group wrote nothing"
         );
         assert!(
             matches!(refused.as_slice(), [LogError::LineTooLong { seq: 2, .. }]),
