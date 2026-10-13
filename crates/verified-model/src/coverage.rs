@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use stateright::Model as _;
+use verified_core::Event;
 use verified_domain::{
     Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome,
 };
@@ -341,33 +342,32 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                 situation(&mut keys, Situation::ReconnectMidTurn);
             }
         }
-        Action::Interrupt(_) => {
-            if !before.asks.is_empty() {
-                situation(&mut keys, Situation::InterruptAtPrompt);
+        Action::Deliver(event) => {
+            match event {
+                Event::Interrupt { .. } => {
+                    if !before.asks.is_empty() {
+                        situation(&mut keys, Situation::InterruptAtPrompt);
+                    }
+                }
+                Event::Approve { call, .. } => {
+                    if !before.asks.contains(call) {
+                        situation(&mut keys, Situation::StaleAnswer);
+                    }
+                }
+                Event::ModelParts { id, .. } => {
+                    if before.flights.get(id).is_some_and(
+                        |flight| matches!(flight.job, Job::Model { batches } if batches >= 1),
+                    ) {
+                        situation(&mut keys, Situation::SecondBatch);
+                    }
+                }
+                Event::Message { .. }
+                | Event::ModelDone { .. }
+                | Event::ToolDone { .. }
+                | Event::Woke { .. } => {}
             }
             decided(after, &mut keys);
         }
-        Action::Answer(call, _) => {
-            if !before.asks.contains(call) {
-                situation(&mut keys, Situation::StaleAnswer);
-            }
-            decided(after, &mut keys);
-        }
-        Action::Parts(id, _) => {
-            if before
-                .flights
-                .get(id)
-                .is_some_and(|flight| matches!(flight.job, Job::Model { batches } if batches >= 1))
-            {
-                situation(&mut keys, Situation::SecondBatch);
-            }
-            decided(after, &mut keys);
-        }
-        Action::Send(_)
-        | Action::Finish(..)
-        | Action::Fail(..)
-        | Action::ToolDone(..)
-        | Action::Woke(_) => decided(after, &mut keys),
         Action::OrphanExecute(_) | Action::OrphanComplete(_) | Action::Duplicate | Action::Sync => {
         }
     }

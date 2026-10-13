@@ -9,10 +9,9 @@ use verified_domain::{
     Record, Request, Rerun, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
-use verified_model::replay::{Divergence, harness};
+use verified_model::replay::Divergence;
 use verified_model::{
-    Action, Bounded, Bug, Harness, Job, Kind, Message, Mismatch, Observed, Offers, World, replay,
-    suite,
+    Action, Bounded, Bug, Harness, Job, Kind, Mismatch, Observed, World, replay, suite,
 };
 
 /// Checks every `always` property, and that each `reachable` example
@@ -371,18 +370,24 @@ fn the_world_runs_while_a_decision_is_persisted() {
         *world = follow(&harness, &path);
     };
     take(&mut world, &|action| *action == Action::Sync);
-    take(&mut world, &|action| matches!(action, Action::Send(_)));
+    take(&mut world, &|action| action.kind() == Kind::Send);
     take(&mut world, &|action| *action == Action::Sync);
     for _ in 0..2u8 {
-        take(&mut world, &|action| matches!(action, Action::Parts(..)));
+        take(&mut world, &|action| action.kind() == Kind::Parts);
         take(&mut world, &|action| *action == Action::Sync);
     }
-    take(&mut world, &|action| matches!(action, Action::Finish(..)));
+    take(&mut world, &|action| action.kind() == Kind::Finish);
     take(&mut world, &|action| *action == Action::Sync);
     // The read runs on policy's approval; the bash awaits the user, whose
     // approval is then being persisted.
     take(&mut world, &|action| {
-        matches!(action, Action::Answer(_, Verdict::Approve))
+        matches!(
+            action,
+            Action::Deliver(Event::Approve {
+                verdict: Verdict::Approve,
+                ..
+            })
+        )
     });
     assert!(world.persisting(), "the approval is being persisted");
     take(&mut world, &|action| matches!(action, Action::Execute(_)));
@@ -423,7 +428,7 @@ fn a_path_found_by_bfs_replays_in_trace_mode() {
                 .expect("BFS reaches it")
                 .into_actions(),
         );
-        let trace = Harness::trace(bounded.limits.clone(), Offers::of(&path));
+        let trace = Harness::trace(bounded.limits.clone(), events(&path));
         assert_eq!(
             follow(&trace, &path),
             follow(&bounded, &path),
@@ -437,10 +442,11 @@ fn a_path_found_by_bfs_replays_in_trace_mode() {
 #[test]
 fn a_trace_carries_real_ids_and_sizes() {
     let at = UnixMillis::new(1_760_000_000_000).expect("a 48-bit time");
-    let message = Message {
+    let turn = TurnId::from_parts(at, &[9; 10]);
+    let message = Event::Message {
         message: MessageId::from_parts(at, &[7; 10]),
-        turn: TurnId::from_parts(at, &[9; 10]),
-        bytes: 2_000,
+        turn,
+        text: size(2_000),
     };
     // Boot is record 0 in epoch 1; the turn's first model call is licensed
     // by its `StepStarted` (record 2), two batches are records 3 and 4, and
@@ -459,21 +465,34 @@ fn a_trace_carries_real_ids_and_sizes() {
         request: Request::Run { args: Tool::Read },
     };
     let run = |first: u64, second: u64| {
+        let parts = |bytes: u64| {
+            Action::Deliver(Event::ModelParts {
+                id: model,
+                parts: size(bytes),
+            })
+        };
         let path = [
             Action::Sync,
-            Action::Send(message),
+            Action::Deliver(message.clone()),
             Action::Sync,
-            Action::Parts(model, first),
+            parts(first),
             Action::Sync,
-            Action::Parts(model, second),
+            parts(second),
             Action::Sync,
-            Action::Finish(model, vec![call.clone()]),
+            Action::Deliver(Event::ModelDone {
+                id: model,
+                result: ModelExit::Finished(vec![call.clone()]),
+            }),
             Action::Sync,
             Action::Execute(read),
-            Action::ToolDone(read, Exit::Ok, 4_096),
+            Action::Deliver(Event::ToolDone {
+                id: read,
+                exit: Exit::Ok,
+                output: size(4_096),
+            }),
             Action::Sync,
         ];
-        follow(&Harness::trace(Limits::v0(), Offers::of(&path)), &path).log
+        follow(&Harness::trace(Limits::v0(), events(&path)), &path).log
     };
     let ended = |log: &[Record<Abstract>]| {
         log.iter().find_map(|record| {
@@ -493,10 +512,7 @@ fn a_trace_carries_real_ids_and_sizes() {
     assert_eq!(ended(&small), None, "the turn goes on");
     assert!(
         small.contains(&Record::StepStarted {
-            step: StepId {
-                turn: message.turn,
-                index: 1
-            }
+            step: StepId { turn, index: 1 }
         }),
         "a second step starts: {small:?}"
     );
@@ -508,13 +524,13 @@ fn a_trace_carries_real_ids_and_sizes() {
 #[test]
 fn trace_mode_offers_only_the_traces_values() {
     let at = UnixMillis::new(1_760_000_000_000).expect("a 48-bit time");
-    let message = Message {
+    let message = Event::Message {
         message: MessageId::from_parts(at, &[7; 10]),
         turn: TurnId::from_parts(at, &[9; 10]),
-        bytes: 10,
+        text: size(10),
     };
-    let path = [Action::Sync, Action::Send(message), Action::Sync];
-    let trace = Harness::trace(Limits::v0(), Offers::of(&path));
+    let path = [Action::Sync, Action::Deliver(message), Action::Sync];
+    let trace = Harness::trace(Limits::v0(), events(&path));
     let world = follow(&trace, &path);
     assert!(
         world
@@ -528,50 +544,20 @@ fn trace_mode_offers_only_the_traces_values() {
     assert!(
         !actions.iter().any(|action| matches!(
             action,
-            Action::Parts(..) | Action::Finish(..) | Action::Fail(..)
+            Action::Deliver(Event::ModelParts { .. } | Event::ModelDone { .. })
         )),
         "no completion the trace lacks: {actions:?}"
     );
 }
 
-/// The event a step delivers to the core, if it delivers one.
-fn event(action: &Action) -> Option<Event<Abstract>> {
-    let size = |bytes: u64| Measured { body: Unit, bytes };
-    Some(match action.clone() {
-        Action::Send(message) => Event::Message {
-            message: message.message,
-            turn: message.turn,
-            text: size(message.bytes),
-        },
-        Action::Answer(call, verdict) => Event::Approve { call, verdict },
-        Action::Interrupt(turn) => Event::Interrupt { turn },
-        Action::Parts(id, bytes) => Event::ModelParts {
-            id,
-            parts: size(bytes),
-        },
-        Action::Finish(id, calls) => Event::ModelDone {
-            id,
-            result: ModelExit::Finished(calls),
-        },
-        Action::Fail(id, cause) => Event::ModelDone {
-            id,
-            result: ModelExit::Failed(cause),
-        },
-        Action::ToolDone(id, exit, bytes) => Event::ToolDone {
-            id,
-            exit,
-            output: size(bytes),
-        },
-        Action::Woke(id) => Event::Woke { id },
-        Action::Execute(_)
-        | Action::OrphanExecute(_)
-        | Action::OrphanComplete(_)
-        | Action::Duplicate
-        | Action::Sync
-        | Action::Crash(_)
-        | Action::Read
-        | Action::Reconnect => return None,
-    })
+/// A size of `bytes`.
+const fn size(bytes: u64) -> Measured<Unit> {
+    Measured { body: Unit, bytes }
+}
+
+/// The events `path` delivers.
+fn events(path: &[Action]) -> Vec<Event<Abstract>> {
+    path.iter().filter_map(Action::event).cloned().collect()
 }
 
 /// What a run along `path` would observe: each step as the shell's hook,
@@ -584,8 +570,8 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
     ];
     for (taken, action) in path.iter().enumerate() {
         let next = follow(harness, path.get(..=taken).expect("a prefix"));
-        if let Some(event) = event(action) {
-            trace.push(Observed::Decided(event, next.pending.clone()));
+        if let Some(event) = action.event() {
+            trace.push(Observed::Decided(event.clone(), next.pending.clone()));
         }
         match action {
             Action::Sync => trace.push(Observed::Acked {
@@ -601,14 +587,7 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
                 u64::try_from(world.client.next).expect("a short log"),
             )),
             // Seen as the event entering the core above, or not at all.
-            Action::Send(_)
-            | Action::Answer(..)
-            | Action::Interrupt(_)
-            | Action::Parts(..)
-            | Action::Finish(..)
-            | Action::Fail(..)
-            | Action::ToolDone(..)
-            | Action::Woke(_)
+            Action::Deliver(_)
             | Action::OrphanExecute(_)
             | Action::OrphanComplete(_)
             | Action::Duplicate
@@ -617,6 +596,15 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
         world = next;
     }
     trace
+}
+
+/// `bounded` in trace mode, its deliveries carrying the values `trace`'s
+/// do.
+fn trace_mode(bounded: &Harness, trace: &[Observed]) -> Harness {
+    Harness::trace(
+        bounded.limits.clone(),
+        trace.iter().filter_map(Observed::event).cloned(),
+    )
 }
 
 /// A path BFS found to an `Unknown` outcome (a crash after a dispatch), up
@@ -643,8 +631,7 @@ fn path_to_an_unknown_outcome() -> (Harness, Vec<Action>) {
 fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
     let (bounded, path) = path_to_an_unknown_outcome();
     let trace = observations(&bounded, &path);
-    let replayed =
-        replay(&harness(bounded.limits.clone(), &trace), &trace).expect("an observed path replays");
+    let replayed = replay(&trace_mode(&bounded, &trace), &trace).expect("an observed path replays");
     assert_eq!(
         replayed.keys,
         path_keys(&bounded, &path),
@@ -684,7 +671,7 @@ fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
     let mut early = trace.clone();
     let moved = early.remove(ran);
     early.insert(acked, moved.clone());
-    let divergence = match replay(&harness(bounded.limits.clone(), &early), &early) {
+    let divergence = match replay(&trace_mode(&bounded, &early), &early) {
         Err(Mismatch::Diverged(divergence)) => Some(divergence),
         Ok(_) | Err(Mismatch::Violated { .. }) => None,
     }
@@ -814,7 +801,7 @@ fn divergence(harness: &Harness, trace: &[Observed]) -> Box<Divergence> {
 fn a_tampered_observed_path_diverges_where_it_was_tampered() {
     let (bounded, path) = path_to_an_unknown_outcome();
     let trace = observations(&bounded, &path);
-    let replays = |tampered: &[Observed]| harness(bounded.limits.clone(), tampered);
+    let replays = |tampered: &[Observed]| trace_mode(&bounded, tampered);
     let first = |pick: &dyn Fn(&Observed) -> bool| {
         trace.iter().position(pick).expect("the path observes it")
     };

@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 
 use verified_domain::{Cause, Exit, Record, Reset, TurnOutcome};
 use verified_model::coverage::{Class, Key, Phase, Resolved};
-use verified_model::replay::harness;
 use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
 use verified_server::shell::Planted;
@@ -24,7 +23,7 @@ use verified_sim::directed::{self, Directed, DirectedError};
 use verified_sim::ledger::{Entry, Op};
 use verified_sim::run::Outcome;
 use verified_sim::scenario::{Fault, Scenario};
-use verified_sim::{hosts, run};
+use verified_sim::{hosts, model, run};
 
 /// Runs `seed` twice, compares the traces, then judges the run.
 fn seed(seed: u64) {
@@ -363,7 +362,7 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
     );
     let harness = Harness {
         bug: Some(Bug::RerunUnsafe),
-        ..harness(hosts::limits().core, &outcome.observed)
+        ..model::harness(hosts::limits().core, &outcome.observed)
     };
     let broken = match verified_model::replay(&harness, &outcome.observed) {
         Err(Mismatch::Violated { property, .. }) => Some(property),

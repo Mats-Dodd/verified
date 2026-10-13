@@ -28,11 +28,11 @@ use core::fmt;
 use std::collections::BTreeSet;
 
 use stateright::{Expectation, Model as _};
-use verified_core::{Event, ModelExit};
-use verified_domain::{Abstract, Cause, EffectId, Exit, Limits, Rerun, Tool};
+use verified_core::Event;
+use verified_domain::{Abstract, Cause, EffectId, Exit, Rerun, Tool};
 
 use crate::coverage::{self, Key};
-use crate::harness::{Action, Harness, Message, Offers};
+use crate::harness::{Action, Harness};
 use crate::world::{Flight, Job, Rec, World};
 
 /// One fact a run observed, in α of its values.
@@ -66,54 +66,22 @@ pub enum Observed {
     Read(u64),
 }
 
-/// The model's action for `event`: the action carries the event's values.
-#[must_use]
-pub fn action(event: &Event<Abstract>) -> Action {
-    match event {
-        Event::Message {
-            message,
-            turn,
-            text,
-        } => Action::Send(Message {
-            message: *message,
-            turn: *turn,
-            bytes: text.bytes,
-        }),
-        Event::Approve { call, verdict } => Action::Answer(call.clone(), *verdict),
-        Event::Interrupt { turn } => Action::Interrupt(*turn),
-        Event::ModelParts { id, parts } => Action::Parts(*id, parts.bytes),
-        Event::ModelDone {
-            id,
-            result: ModelExit::Finished(calls),
-        } => Action::Finish(*id, calls.clone()),
-        Event::ModelDone {
-            id,
-            result: ModelExit::Failed(cause),
-        } => Action::Fail(*id, *cause),
-        Event::ToolDone { id, exit, output } => Action::ToolDone(*id, *exit, output.bytes),
-        Event::Woke { id } => Action::Woke(*id),
+impl Observed {
+    /// The event this observation delivers to the core, if it delivers one.
+    #[must_use]
+    pub const fn event(&self) -> Option<&Event<Abstract>> {
+        match self {
+            Self::Decided(event, _) => Some(event),
+            Self::Booted(_)
+            | Self::Resumed(_)
+            | Self::Refused
+            | Self::Acked { .. }
+            | Self::Dispatched(_)
+            | Self::Mutated(_)
+            | Self::Ran(_)
+            | Self::Read(_) => None,
+        }
     }
-}
-
-/// A harness to replay `trace`, run under `limits`: its actions carry
-/// every value `trace`'s events do.
-#[must_use]
-pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
-    let actions: Vec<Action> = trace
-        .iter()
-        .filter_map(|observed| match observed {
-            Observed::Decided(event, _) => Some(action(event)),
-            Observed::Booted(_)
-            | Observed::Resumed(_)
-            | Observed::Refused
-            | Observed::Acked { .. }
-            | Observed::Dispatched(_)
-            | Observed::Mutated(_)
-            | Observed::Ran(_)
-            | Observed::Read(_) => None,
-        })
-        .collect();
-    Harness::trace(limits, Offers::of(&actions))
 }
 
 /// What a replay walked through.
@@ -327,7 +295,7 @@ fn means(
                 Err("the log refused a resume, but none is being persisted".to_owned())
             }
         }
-        Observed::Decided(event, _) => Ok(vec![action(event)]),
+        Observed::Decided(event, _) => Ok(vec![Action::Deliver(event.clone())]),
         Observed::Acked { first, .. } => {
             let at = usize::try_from(*first).map_err(|error| error.to_string())?;
             if at == world.log.len() {

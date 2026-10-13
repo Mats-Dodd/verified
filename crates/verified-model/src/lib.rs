@@ -19,7 +19,7 @@
 //!
 //! Two uses share one [`Harness`]: BFS over a small [`Bounded`] domain
 //! (`tests/model.rs`), and [`replay()`] of a run's observations, whose actions
-//! carry the ids and sizes the run had ([`Offers`]) under the limits it ran
+//! carry the ids and sizes the run had ([`Domain::Trace`]) under the limits it ran
 //! with, checking every property on every state the run passes through.
 
 pub mod alpha;
@@ -30,6 +30,6 @@ pub mod replay;
 pub mod suite;
 mod world;
 
-pub use harness::{Action, Bounded, Bug, Domain, Harness, Kind, Message, Offers};
+pub use harness::{Action, Bounded, Bug, Domain, Harness, Kind};
 pub use replay::{Divergence, Mismatch, Observed, Replayed, replay};
 pub use world::{Client, Flight, Job, Rec, Staged, World};

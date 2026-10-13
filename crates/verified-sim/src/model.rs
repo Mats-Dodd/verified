@@ -14,7 +14,7 @@
 
 use verified_domain::alpha::record;
 use verified_domain::{EffectId, Epoch, Limits, Record};
-use verified_model::{Mismatch, Observed, Replayed, alpha};
+use verified_model::{Harness, Mismatch, Observed, Replayed, alpha};
 use verified_server::payload::Parsed;
 use verified_server::shim::{Barrier, Observation};
 
@@ -90,5 +90,12 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
 /// # Errors
 /// The run is not a path of the model, or breaks one of its properties.
 pub fn replay(limits: Limits, trace: &[Observed]) -> Result<Replayed, Mismatch> {
-    verified_model::replay(&verified_model::replay::harness(limits, trace), trace)
+    verified_model::replay(&harness(limits, trace), trace)
+}
+
+/// The model in trace mode under the daemon's core `limits`, its
+/// deliveries carrying the values `trace`'s do.
+#[must_use]
+pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
+    Harness::trace(limits, trace.iter().filter_map(Observed::event).cloned())
 }

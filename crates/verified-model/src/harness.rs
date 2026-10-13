@@ -1,8 +1,6 @@
 //! The model: the real core inside an abstract world, its actions, and the
 //! properties every reachable state must keep.
 
-use std::collections::BTreeMap;
-
 use stateright::{Model, Property};
 use verified_core::{Core, Decision, Event, ModelExit, Outcome, Verdict};
 use verified_domain::{
@@ -14,37 +12,17 @@ use crate::alpha::{self, Work};
 use crate::audit::{Audit, Breach, audit};
 use crate::world::{Flight, Job, Rec, Staged, World};
 
-/// A message the user sends: the ids the client and the shell made for it,
-/// and its text's size.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Message {
-    pub message: MessageId,
-    pub turn: TurnId,
-    pub bytes: u64,
-}
-
-/// One step of the world. Each action carries the values its event does
-/// (ids, sizes, a model's proposals), so a trace's events are actions as
-/// they are; which values are offered is the [`Domain`]'s.
+/// One step of the world.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Action {
-    /// The user sends a message.
-    Send(Message),
-    /// The user answers an approval request.
-    Answer(CallId, Verdict),
-    /// The user asks to stop a turn.
-    Interrupt(TurnId),
+    /// An event enters the core: a user's command, or a reply of an effect
+    /// in flight. It carries the event's values (ids, sizes, a model's
+    /// proposals), so a trace's events are actions as they are; which
+    /// values are offered is the [`Domain`]'s.
+    Deliver(Event<Abstract>),
     /// A tool's side effect happens: the shell's `ToolRan` point, where its
     /// run has returned.
     Execute(EffectId),
-    /// A model call streams a batch of parts of this size.
-    Parts(EffectId, u64),
-    /// A model call finishes, proposing these calls.
-    Finish(EffectId, Vec<Proposal<Abstract>>),
-    Fail(EffectId, Cause),
-    /// A tool reports, with output of this size.
-    ToolDone(EffectId, Exit, u64),
-    Woke(EffectId),
     OrphanExecute(EffectId),
     OrphanComplete(EffectId),
     Duplicate,
@@ -58,7 +36,8 @@ pub enum Action {
     Reconnect,
 }
 
-/// The kind of an [`Action`], without its values.
+/// The kind of an [`Action`], without its values: a delivery by its
+/// event's.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     Send,
@@ -83,15 +62,21 @@ impl Action {
     #[must_use]
     pub const fn kind(&self) -> Kind {
         match self {
-            Self::Send(_) => Kind::Send,
-            Self::Answer(..) => Kind::Answer,
-            Self::Interrupt(_) => Kind::Interrupt,
+            Self::Deliver(Event::Message { .. }) => Kind::Send,
+            Self::Deliver(Event::Approve { .. }) => Kind::Answer,
+            Self::Deliver(Event::Interrupt { .. }) => Kind::Interrupt,
+            Self::Deliver(Event::ModelParts { .. }) => Kind::Parts,
+            Self::Deliver(Event::ModelDone {
+                result: ModelExit::Finished(_),
+                ..
+            }) => Kind::Finish,
+            Self::Deliver(Event::ModelDone {
+                result: ModelExit::Failed(_),
+                ..
+            }) => Kind::Fail,
+            Self::Deliver(Event::ToolDone { .. }) => Kind::ToolDone,
+            Self::Deliver(Event::Woke { .. }) => Kind::Woke,
             Self::Execute(_) => Kind::Execute,
-            Self::Parts(..) => Kind::Parts,
-            Self::Finish(..) => Kind::Finish,
-            Self::Fail(..) => Kind::Fail,
-            Self::ToolDone(..) => Kind::ToolDone,
-            Self::Woke(_) => Kind::Woke,
             Self::OrphanExecute(_) => Kind::OrphanExecute,
             Self::OrphanComplete(_) => Kind::OrphanComplete,
             Self::Duplicate => Kind::Duplicate,
@@ -101,6 +86,22 @@ impl Action {
             Self::Reconnect => Kind::Reconnect,
         }
     }
+
+    /// The event this action delivers, if it delivers one.
+    #[must_use]
+    pub const fn event(&self) -> Option<&Event<Abstract>> {
+        match self {
+            Self::Deliver(event) => Some(event),
+            Self::Execute(_)
+            | Self::OrphanExecute(_)
+            | Self::OrphanComplete(_)
+            | Self::Duplicate
+            | Self::Sync
+            | Self::Crash(_)
+            | Self::Read
+            | Self::Reconnect => None,
+        }
+    }
 }
 
 /// The values actions may carry.
@@ -108,8 +109,8 @@ impl Action {
 pub enum Domain {
     /// A small synthetic set, for BFS.
     Bounded(Bounded),
-    /// The values a trace carries, to replay it.
-    Trace(Offers),
+    /// The events a trace delivers (each once), to replay it.
+    Trace(Vec<Event<Abstract>>),
 }
 
 /// The BFS's values: one-byte payloads, ids made from small indices, and
@@ -132,66 +133,6 @@ pub struct Bounded {
     pub max_duplicates: u8,
     /// Whether a client follows the stream (and may reconnect this often).
     pub client: Option<u8>,
-}
-
-/// The values a trace carries, offered wherever the model allows them.
-///
-/// User commands are offered whenever the shell takes input (the user may
-/// repeat or race them); completions only for their own effect. Crashes,
-/// interrupts and reconnects are unbounded, and nothing only the model's
-/// world does (late duplicates, orphans acting or replying) is offered.
-#[derive(Clone, Debug, Default)]
-pub struct Offers {
-    pub messages: Vec<Message>,
-    pub answers: Vec<(CallId, Verdict)>,
-    pub interrupts: Vec<TurnId>,
-    /// Batch sizes each model call streamed.
-    pub parts: BTreeMap<EffectId, Vec<u64>>,
-    pub responses: BTreeMap<EffectId, Vec<Vec<Proposal<Abstract>>>>,
-    pub failures: BTreeMap<EffectId, Vec<Cause>>,
-    /// Each tool run's exit and output size.
-    pub reports: BTreeMap<EffectId, Vec<(Exit, u64)>>,
-}
-
-fn offer<T: PartialEq>(values: &mut Vec<T>, value: T) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
-impl Offers {
-    /// Every value `actions` carry.
-    #[must_use]
-    pub fn of(actions: &[Action]) -> Self {
-        let mut offers = Self::default();
-        for action in actions {
-            match action {
-                Action::Send(message) => offer(&mut offers.messages, *message),
-                Action::Answer(call, verdict) => {
-                    offer(&mut offers.answers, (call.clone(), *verdict));
-                }
-                Action::Interrupt(turn) => offer(&mut offers.interrupts, *turn),
-                Action::Parts(id, bytes) => offer(offers.parts.entry(*id).or_default(), *bytes),
-                Action::Finish(id, calls) => {
-                    offer(offers.responses.entry(*id).or_default(), calls.clone());
-                }
-                Action::Fail(id, cause) => offer(offers.failures.entry(*id).or_default(), *cause),
-                Action::ToolDone(id, exit, bytes) => {
-                    offer(offers.reports.entry(*id).or_default(), (*exit, *bytes));
-                }
-                Action::Execute(_)
-                | Action::Woke(_)
-                | Action::OrphanExecute(_)
-                | Action::OrphanComplete(_)
-                | Action::Duplicate
-                | Action::Sync
-                | Action::Crash(_)
-                | Action::Read
-                | Action::Reconnect => {}
-            }
-        }
-        offers
-    }
 }
 
 /// A deliberately broken shell, to show the properties can fail.
@@ -253,12 +194,70 @@ const fn size(bytes: u64) -> Measured<Unit> {
     Measured { body: Unit, bytes }
 }
 
-/// Whether a tool in `flight` may report `exit`: an interrupted run only
-/// once it was asked to stop; anything else only once it ran.
-const fn reportable(flight: &Flight, exit: Exit) -> bool {
-    match exit {
-        Exit::Err(Cause::Interrupted) => flight.cancelled,
-        Exit::Ok | Exit::Err(Cause::Failed(_) | Cause::Unknown | Cause::Denied) => flight.executed,
+/// Whether `flight`, effect `id`, may reply `event`: a reply of its own
+/// job's kind, an interrupted one only once it was asked to stop, and a
+/// tool's other reports only once it ran.
+fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
+    let (of, admitted) = match event {
+        Event::ModelParts { id, .. } => (id, matches!(flight.job, Job::Model { .. })),
+        Event::ModelDone { id, result } => (
+            id,
+            matches!(flight.job, Job::Model { .. })
+                && (flight.cancelled || !matches!(result, ModelExit::Failed(Cause::Interrupted))),
+        ),
+        Event::ToolDone { id, exit, .. } => (
+            id,
+            matches!(flight.job, Job::Tool { .. })
+                && match exit {
+                    Exit::Err(Cause::Interrupted) => flight.cancelled,
+                    Exit::Ok | Exit::Err(Cause::Failed(_) | Cause::Unknown | Cause::Denied) => {
+                        flight.executed
+                    }
+                },
+        ),
+        Event::Woke { id } => (id, matches!(flight.job, Job::Sleep)),
+        Event::Message { .. } | Event::Approve { .. } | Event::Interrupt { .. } => return false,
+    };
+    *of == id && admitted
+}
+
+/// The replies a bounded domain offers effect `id` doing `job`.
+fn replies(bounded: &Bounded, id: EffectId, job: &Job) -> Vec<Event<Abstract>> {
+    match job {
+        Job::Model { batches } => {
+            let mut replies = Vec::new();
+            if *batches < bounded.batches {
+                replies.push(Event::ModelParts { id, parts: size(1) });
+            }
+            replies.extend(bounded.scripts.iter().map(|script| Event::ModelDone {
+                id,
+                result: ModelExit::Finished(proposals(id, script)),
+            }));
+            replies.extend(
+                [
+                    Cause::Failed(Fault::Overloaded),
+                    Cause::Failed(Fault::Other),
+                    Cause::Interrupted,
+                ]
+                .map(|cause| Event::ModelDone {
+                    id,
+                    result: ModelExit::Failed(cause),
+                }),
+            );
+            replies
+        }
+        Job::Tool { .. } => [
+            Exit::Ok,
+            Exit::Err(Cause::Failed(Fault::Other)),
+            Exit::Err(Cause::Interrupted),
+        ]
+        .map(|exit| Event::ToolDone {
+            id,
+            exit,
+            output: size(1),
+        })
+        .to_vec(),
+        Job::Sleep => vec![Event::Woke { id }],
     }
 }
 
@@ -273,13 +272,19 @@ impl Harness {
         }
     }
 
-    /// A harness for replaying traces run under `limits`: actions carry the
-    /// values `offers` holds.
+    /// A harness for replaying traces run under `limits`: its deliveries
+    /// carry the values `events` do.
     #[must_use]
-    pub const fn trace(limits: Limits, offers: Offers) -> Self {
+    pub fn trace<E: IntoIterator<Item = Event<Abstract>>>(limits: Limits, events: E) -> Self {
+        let mut distinct: Vec<Event<Abstract>> = Vec::new();
+        for event in events {
+            if !distinct.contains(&event) {
+                distinct.push(event);
+            }
+        }
         Self {
             limits,
-            domain: Domain::Trace(offers),
+            domain: Domain::Trace(distinct),
             bug: None,
         }
     }
@@ -498,98 +503,70 @@ impl Harness {
                 if usize::from(state.sent) <= bounded.messages {
                     for slot in 0..bounded.messages {
                         let (message, turn) = message_ids(slot);
-                        actions.push(Action::Send(Message {
+                        actions.push(Action::Deliver(Event::Message {
                             message,
                             turn,
-                            bytes: 1,
+                            text: size(1),
                         }));
                     }
                 }
+                let answers = |call: &CallId, actions: &mut Vec<Action>| {
+                    for verdict in [Verdict::Approve, Verdict::Deny] {
+                        actions.push(Action::Deliver(Event::Approve {
+                            call: call.clone(),
+                            verdict,
+                        }));
+                    }
+                };
                 for call in &state.asks {
-                    actions.push(Action::Answer(call.clone(), Verdict::Approve));
-                    actions.push(Action::Answer(call.clone(), Verdict::Deny));
+                    answers(call, actions);
                 }
                 if state.stale_answers < bounded.stale_answers {
                     for call in self.audit(state).proposed {
                         if !state.asks.contains(&call) {
-                            actions.push(Action::Answer(call.clone(), Verdict::Approve));
-                            actions.push(Action::Answer(call, Verdict::Deny));
+                            answers(&call, actions);
                         }
                     }
                 }
                 if state.interrupts < bounded.max_interrupts
                     && let Some(turn) = self.core(state).and_then(|core| core.running())
                 {
-                    actions.push(Action::Interrupt(turn));
+                    actions.push(Action::Deliver(Event::Interrupt { turn }));
                 }
             }
-            Domain::Trace(offers) => {
-                actions.extend(offers.messages.iter().copied().map(Action::Send));
-                actions.extend(
-                    offers
-                        .answers
-                        .iter()
-                        .map(|(call, verdict)| Action::Answer(call.clone(), *verdict)),
-                );
-                actions.extend(offers.interrupts.iter().copied().map(Action::Interrupt));
-            }
+            Domain::Trace(events) => actions.extend(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            Event::Message { .. } | Event::Approve { .. } | Event::Interrupt { .. }
+                        )
+                    })
+                    .cloned()
+                    .map(Action::Deliver),
+            ),
         }
     }
 
-    /// What model call `id`, having streamed `batches`, may do next.
-    fn model_actions(&self, id: EffectId, batches: u8, cancelled: bool, actions: &mut Vec<Action>) {
-        let failures = [
-            Cause::Failed(Fault::Overloaded),
-            Cause::Failed(Fault::Other),
-            Cause::Interrupted,
-        ];
-        let (sizes, responses, failures): (Vec<u64>, Vec<Vec<Proposal<Abstract>>>, Vec<Cause>) =
-            match &self.domain {
-                Domain::Bounded(bounded) => (
-                    if batches < bounded.batches {
-                        vec![1]
-                    } else {
-                        Vec::new()
-                    },
-                    bounded
-                        .scripts
-                        .iter()
-                        .map(|script| proposals(id, script))
-                        .collect(),
-                    failures.to_vec(),
-                ),
-                Domain::Trace(offers) => (
-                    offers.parts.get(&id).cloned().unwrap_or_default(),
-                    offers.responses.get(&id).cloned().unwrap_or_default(),
-                    offers.failures.get(&id).cloned().unwrap_or_default(),
-                ),
-            };
-        actions.extend(sizes.into_iter().map(|bytes| Action::Parts(id, bytes)));
-        actions.extend(responses.into_iter().map(|calls| Action::Finish(id, calls)));
-        actions.extend(
-            failures
-                .into_iter()
-                .filter(|cause| *cause != Cause::Interrupted || cancelled)
-                .map(|cause| Action::Fail(id, cause)),
-        );
-    }
-
-    /// The reports tool run `id` may make.
-    fn tool_actions(&self, id: EffectId, flight: &Flight, actions: &mut Vec<Action>) {
-        let reports = match &self.domain {
-            Domain::Bounded(_) => vec![
-                (Exit::Ok, 1),
-                (Exit::Err(Cause::Failed(Fault::Other)), 1),
-                (Exit::Err(Cause::Interrupted), 1),
-            ],
-            Domain::Trace(offers) => offers.reports.get(&id).cloned().unwrap_or_default(),
-        };
-        actions.extend(
-            reports
-                .into_iter()
-                .filter(|(exit, _)| reportable(flight, *exit))
-                .map(|(exit, bytes)| Action::ToolDone(id, exit, bytes)),
-        );
+    /// The replies effect `id`, in flight, may make.
+    fn reply_actions(&self, id: EffectId, flight: &Flight, actions: &mut Vec<Action>) {
+        let admitted = |event: &Event<Abstract>| admits(id, flight, event);
+        match &self.domain {
+            Domain::Bounded(bounded) => actions.extend(
+                replies(bounded, id, &flight.job)
+                    .into_iter()
+                    .filter(admitted)
+                    .map(Action::Deliver),
+            ),
+            Domain::Trace(events) => actions.extend(
+                events
+                    .iter()
+                    .filter(|event| admitted(event))
+                    .cloned()
+                    .map(Action::Deliver),
+            ),
+        }
     }
 }
 
@@ -619,13 +596,7 @@ impl Model for Harness {
         self.user_actions(state, actions);
         self.executions(state, actions);
         for (id, flight) in &state.flights {
-            match &flight.job {
-                Job::Model { batches } => {
-                    self.model_actions(*id, *batches, flight.cancelled, actions);
-                }
-                Job::Tool { .. } => self.tool_actions(*id, flight, actions),
-                Job::Sleep => actions.push(Action::Woke(*id)),
-            }
+            self.reply_actions(*id, flight, actions);
         }
         if let Domain::Bounded(bounded) = &self.domain {
             for id in state.orphans.keys() {
@@ -708,80 +679,36 @@ impl Model for Harness {
                     }
                 }
             }
-            Action::Send(message) => {
-                world.sent = world.sent.saturating_add(1);
-                self.deliver(
-                    &mut world,
-                    Event::Message {
-                        message: message.message,
-                        turn: message.turn,
-                        text: size(message.bytes),
-                    },
-                );
-            }
-            Action::Answer(call, verdict) => {
-                if !world.asks.remove(&call) {
-                    world.stale_answers = world.stale_answers.saturating_add(1);
+            Action::Deliver(event) => {
+                match &event {
+                    Event::Message { .. } => world.sent = world.sent.saturating_add(1),
+                    Event::Approve { call, .. } => {
+                        if !world.asks.remove(call) {
+                            world.stale_answers = world.stale_answers.saturating_add(1);
+                        }
+                    }
+                    Event::Interrupt { .. } => {
+                        world.interrupts = world.interrupts.saturating_add(1);
+                    }
+                    Event::ModelParts { id, .. } => {
+                        let Job::Model { batches } = &mut world.flights.get_mut(id)?.job else {
+                            return None;
+                        };
+                        *batches = batches.saturating_add(1);
+                    }
+                    Event::ModelDone { id, .. }
+                    | Event::ToolDone { id, .. }
+                    | Event::Woke { id } => {
+                        world.flights.remove(id)?;
+                    }
                 }
-                self.deliver(&mut world, Event::Approve { call, verdict });
-            }
-            Action::Interrupt(turn) => {
-                world.interrupts = world.interrupts.saturating_add(1);
-                self.deliver(&mut world, Event::Interrupt { turn });
+                self.deliver(&mut world, event);
             }
             Action::Execute(id) => {
                 let flight = world.flights.get_mut(&id)?;
                 flight.executed = true;
                 let job = flight.job.clone();
                 Self::run(&mut world, &job);
-            }
-            Action::Parts(id, bytes) => {
-                let Job::Model { batches } = &mut world.flights.get_mut(&id)?.job else {
-                    return None;
-                };
-                *batches = batches.saturating_add(1);
-                self.deliver(
-                    &mut world,
-                    Event::ModelParts {
-                        id,
-                        parts: size(bytes),
-                    },
-                );
-            }
-            Action::Finish(id, calls) => {
-                world.flights.remove(&id)?;
-                self.deliver(
-                    &mut world,
-                    Event::ModelDone {
-                        id,
-                        result: ModelExit::Finished(calls),
-                    },
-                );
-            }
-            Action::Fail(id, cause) => {
-                world.flights.remove(&id)?;
-                self.deliver(
-                    &mut world,
-                    Event::ModelDone {
-                        id,
-                        result: ModelExit::Failed(cause),
-                    },
-                );
-            }
-            Action::ToolDone(id, exit, bytes) => {
-                world.flights.remove(&id)?;
-                self.deliver(
-                    &mut world,
-                    Event::ToolDone {
-                        id,
-                        exit,
-                        output: size(bytes),
-                    },
-                );
-            }
-            Action::Woke(id) => {
-                world.flights.remove(&id)?;
-                self.deliver(&mut world, Event::Woke { id });
             }
             Action::OrphanExecute(id) => {
                 let flight = world.orphans.get_mut(&id)?;
