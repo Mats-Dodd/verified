@@ -25,7 +25,7 @@ use verified_wire::transcript::{Part, ToolPart, ToolState, Transcript};
 
 use crate::Limits;
 use crate::client::{Answer, ClientError, Command, Position, StreamUpdate};
-use crate::tea::{Cmd, Feedback, FollowId, Model, Stamp};
+use crate::tea::{Cmd, Feedback, FollowId, Stamp};
 use crate::view::{self, Activity, Connection, Status};
 
 /// Which session the program shows.
@@ -35,13 +35,6 @@ pub enum Start {
     New(SessionId),
     /// Follow this existing session.
     Open(SessionId),
-}
-
-/// What the program starts with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Flags {
-    pub start: Start,
-    pub limits: Limits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,12 +59,6 @@ pub enum Msg {
     Reconnect,
     Quit,
     Feedback(Feedback),
-}
-
-impl From<Feedback> for Msg {
-    fn from(feedback: Feedback) -> Self {
-        Self::Feedback(feedback)
-    }
 }
 
 /// Whether the daemon has the session yet, and if not, whether creating it
@@ -563,66 +550,18 @@ impl App {
             .flat_map(|rendered| rendered.lines.iter().cloned())
             .collect()
     }
-}
 
-/// What to tell the user about a refusal. The match is exhaustive on
-/// purpose: each new kind of refusal gets its own thought here.
-fn refusal(rejection: &Rejection) -> String {
-    let hint = match rejection {
-        Rejection::SessionBusy { .. } => Some("esc cancels it"),
-        Rejection::SessionNotFound { .. } | Rejection::SessionFull { .. } => {
-            Some("restart verified for a new session")
-        }
-        Rejection::TooManySessions { .. } => Some("close another session's client"),
-        Rejection::TooManyFollowers { .. } => Some("close another client of this session"),
-        Rejection::Malformed { .. }
-        | Rejection::SessionExists { .. }
-        | Rejection::MessageExistsWithDifferentText { .. }
-        | Rejection::NoPendingApproval { .. }
-        | Rejection::ApprovalExistsWithDifferentVerdict { .. }
-        | Rejection::TurnNotRunning { .. } => None,
-    };
-    match hint {
-        Some(hint) => format!("{rejection} ({hint})"),
-        None => rejection.to_string(),
-    }
-}
-
-/// A failed command, for the status line.
-fn explain(error: &ClientError) -> String {
-    match error {
-        ClientError::Rejected(rejection) => refusal(rejection),
-        ClientError::Connect(_)
-        | ClientError::Http(_)
-        | ClientError::Status { .. }
-        | ClientError::Reply(_)
-        | ClientError::TooLarge { .. }
-        | ClientError::Stream(_)
-        | ClientError::UnpairedData
-        | ClientError::ClosedEarly
-        | ClientError::Offset { .. }
-        | ClientError::TimedOut { .. } => error.to_string(),
-    }
-}
-
-fn is_ctrl(key: &KeyEvent, letter: char) -> bool {
-    key.code == KeyCode::Char(letter) && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-impl Model for App {
-    type Msg = Msg;
-    type Flags = Flags;
-
-    fn init(flags: Flags) -> (Self, Cmd) {
-        let (session, phase) = match flags.start {
+    /// The app on `start`, and its startup effects.
+    pub fn init(start: Start, limits: Limits) -> (Self, Cmd) {
+        let (session, phase) = match start {
             Start::New(session) => (session, Phase::Creating(Delivery::Sending)),
             Start::Open(session) => (session, Phase::Ready),
         };
         let mut app = Self {
-            limits: flags.limits,
+            limits,
             session,
             phase,
-            transcript: Transcript::new(&flags.limits.wire),
+            transcript: Transcript::new(&limits.wire),
             position: START,
             folded: None,
             follow: FollowId(0),
@@ -643,7 +582,9 @@ impl Model for App {
         (app, cmd)
     }
 
-    fn on_event(&self, event: Event, stamp: Stamp) -> Option<Msg> {
+    /// Maps a terminal event to a message; `None` ignores it.
+    #[must_use]
+    pub fn on_event(&self, event: Event, stamp: Stamp) -> Option<Msg> {
         let key = match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             Event::Paste(text) => return Some(Msg::Paste(text)),
@@ -699,7 +640,8 @@ impl Model for App {
         }
     }
 
-    fn update(&mut self, msg: Msg) -> Cmd {
+    /// Applies a message, returning follow-up effects. Pure.
+    pub fn update(&mut self, msg: Msg) -> Cmd {
         match msg {
             Msg::Type(letter) => {
                 self.push_text(letter.encode_utf8(&mut [0; 4]));
@@ -731,7 +673,9 @@ impl Model for App {
         }
     }
 
-    fn view(&mut self, frame: &mut Frame<'_>) {
+    /// Draws the app. It may update render caches (never state `update`
+    /// reads), hence `&mut self`.
+    pub fn view(&mut self, frame: &mut Frame<'_>) {
         let draft_lines = u16::try_from(self.draft.split('\n').count()).unwrap_or(u16::MAX);
         let input_height = draft_lines
             .clamp(1, self.limits.input_lines.max(1))
@@ -809,6 +753,50 @@ impl Model for App {
         };
         frame.render_widget(Paragraph::new(view::status_line(&status)), footer);
     }
+}
+
+/// What to tell the user about a refusal. The match is exhaustive on
+/// purpose: each new kind of refusal gets its own thought here.
+fn refusal(rejection: &Rejection) -> String {
+    let hint = match rejection {
+        Rejection::SessionBusy { .. } => Some("esc cancels it"),
+        Rejection::SessionNotFound { .. } | Rejection::SessionFull { .. } => {
+            Some("restart verified for a new session")
+        }
+        Rejection::TooManySessions { .. } => Some("close another session's client"),
+        Rejection::TooManyFollowers { .. } => Some("close another client of this session"),
+        Rejection::Malformed { .. }
+        | Rejection::SessionExists { .. }
+        | Rejection::MessageExistsWithDifferentText { .. }
+        | Rejection::NoPendingApproval { .. }
+        | Rejection::ApprovalExistsWithDifferentVerdict { .. }
+        | Rejection::TurnNotRunning { .. } => None,
+    };
+    match hint {
+        Some(hint) => format!("{rejection} ({hint})"),
+        None => rejection.to_string(),
+    }
+}
+
+/// A failed command, for the status line.
+fn explain(error: &ClientError) -> String {
+    match error {
+        ClientError::Rejected(rejection) => refusal(rejection),
+        ClientError::Connect(_)
+        | ClientError::Http(_)
+        | ClientError::Status { .. }
+        | ClientError::Reply(_)
+        | ClientError::TooLarge { .. }
+        | ClientError::Stream(_)
+        | ClientError::UnpairedData
+        | ClientError::ClosedEarly
+        | ClientError::Offset { .. }
+        | ClientError::TimedOut { .. } => error.to_string(),
+    }
+}
+
+fn is_ctrl(key: &KeyEvent, letter: char) -> bool {
+    key.code == KeyCode::Char(letter) && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 #[cfg(test)]

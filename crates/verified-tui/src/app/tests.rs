@@ -86,10 +86,7 @@ fn sent(byte: u8, text: &str) -> Cmd {
 }
 
 fn opened() -> App {
-    let (app, cmd) = App::init(Flags {
-        start: Start::Open(session()),
-        limits: Limits::DEFAULT,
-    });
+    let (app, cmd) = App::init(Start::Open(session()), Limits::DEFAULT);
     assert!(
         matches!(cmd, Cmd::Follow { .. }),
         "opening follows the stream"
@@ -148,10 +145,7 @@ fn screen(app: &mut App, width: u16, height: u16) -> String {
 
 #[test]
 fn a_new_session_is_created_before_it_is_followed() {
-    let (mut app, cmd) = App::init(Flags {
-        start: Start::New(session()),
-        limits: Limits::DEFAULT,
-    });
+    let (mut app, cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     assert_eq!(
         cmd,
         Cmd::Send(Command::CreateSession(CreateSession {
@@ -183,10 +177,7 @@ fn a_new_session_is_created_before_it_is_followed() {
 
 #[test]
 fn a_session_that_cannot_be_created_is_retried_with_the_same_id() {
-    let (mut app, _cmd) = App::init(Flags {
-        start: Start::New(session()),
-        limits: Limits::DEFAULT,
-    });
+    let (mut app, _cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     let _cmd = answer(
         &mut app,
         Answer::SessionCreated {
@@ -639,10 +630,7 @@ fn ctrl_r_retries_at_once_while_retrying() {
 fn the_draft_is_bounded() {
     let mut limits = Limits::DEFAULT;
     limits.wire.max_message_text_bytes = 4;
-    let (mut app, _cmd) = App::init(Flags {
-        start: Start::Open(session()),
-        limits,
-    });
+    let (mut app, _cmd) = App::init(Start::Open(session()), limits);
     type_text(&mut app, "abcd");
     let _cmd = app.update(Msg::Type('e'));
     assert_eq!(app.draft(), "abcd");
@@ -711,10 +699,7 @@ fn renders_every_golden_stream() {
 
 #[test]
 fn renders_a_new_session_being_created() {
-    let (mut app, _cmd) = App::init(Flags {
-        start: Start::New(session()),
-        limits: Limits::DEFAULT,
-    });
+    let (mut app, _cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     type_text(&mut app, "first line\nsecond line");
     insta::assert_snapshot!(screen(&mut app, 80, 10));
 }

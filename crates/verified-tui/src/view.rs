@@ -1,4 +1,4 @@
-//! Renders the model to the terminal: turns as styled lines (Markdown for
+//! Renders the app to the terminal: turns as styled lines (Markdown for
 //! replies, a summary per tool call), the approval prompt and the status line.
 //! Ported from q's `view.rs`, with tool parts added.
 
