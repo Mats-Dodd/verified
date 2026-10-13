@@ -32,12 +32,11 @@ macro_rules! fixture {
 }
 
 /// The wire crate's golden streams and the turns the AI SDK folds them into.
-const FIXTURES: [(&str, &str, &str); 8] = [
+const FIXTURES: [(&str, &str, &str); 7] = [
     fixture!("cancelled"),
     fixture!("conversation"),
     fixture!("failed"),
     fixture!("in-progress"),
-    fixture!("metadata"),
     fixture!("simple"),
     fixture!("steps"),
     fixture!("tools"),

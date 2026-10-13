@@ -2,10 +2,6 @@
 {"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000001","data":{"model":"claude-haiku-4-5"}}
 {"type":"start","messageId":"01a10400-0000-7000-8000-000000000001"}
 {"type":"start-step"}
-{"type":"reasoning-start","id":"r0"}
-{"type":"reasoning-delta","id":"r0","delta":"Let me "}
-{"type":"reasoning-delta","id":"r0","delta":"think."}
-{"type":"reasoning-end","id":"r0"}
 {"type":"text-start","id":"t0"}
 {"type":"text-delta","id":"t0","delta":"First step."}
 {"type":"text-end","id":"t0"}

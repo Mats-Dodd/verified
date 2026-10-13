@@ -21,7 +21,7 @@ pub struct WireLimits {
     pub max_turns: usize,
     /// Most parts one assistant reply holds.
     pub max_parts_per_reply: usize,
-    /// Longest accumulated part text (text, reasoning, raw tool input), in bytes.
+    /// Longest accumulated part text (text, raw tool input), in bytes.
     pub max_part_bytes: usize,
     /// Most `error` chunks one turn records.
     pub max_errors_per_turn: usize,

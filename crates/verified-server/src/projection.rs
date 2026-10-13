@@ -6,7 +6,7 @@
 //! Stream offsets are record seqs; a record may project to no chunks.
 
 use serde_json::json;
-use verified_domain::id::{ApprovalId, CallId, PartId, ToolName, TurnId};
+use verified_domain::id::{ApprovalId, CallId, PartId, TurnId};
 use verified_domain::{
     Approver, Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, TurnOutcome,
 };
@@ -15,7 +15,7 @@ use verified_wire::chunk::{
 };
 
 use crate::history::synthesized_text;
-use crate::payload::{ModelPart, Parsed, ToolInput};
+use crate::payload::{ModelPart, Parsed};
 
 /// Where the current step is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +125,6 @@ impl Projector {
                 });
                 chunks.push(UiChunk::Start {
                     message_id: Some(id.to_string()),
-                    message_metadata: None,
                 });
             }
             Record::StepStarted { step } => {
@@ -169,11 +168,8 @@ impl Projector {
                             chunks.push(UiChunk::ToolApprovalRequest {
                                 approval_id: approval_id(&id),
                                 tool_call_id: id.clone(),
-                                approval_descriptor: None,
-                                input_schema_input: None,
                                 reason: None,
                                 is_automatic: None,
-                                signature: None,
                             });
                         }
                         turn.calls.push(Call { id, reason });
@@ -187,19 +183,13 @@ impl Projector {
                         chunks.push(UiChunk::ToolApprovalRequest {
                             approval_id: approval_id(&id),
                             tool_call_id: id.clone(),
-                            approval_descriptor: None,
-                            input_schema_input: None,
                             reason: Some("read-only".to_owned()),
                             is_automatic: Some(true),
-                            signature: None,
                         });
                     }
                     chunks.push(UiChunk::ToolApprovalResponse {
                         approval_id: approval_id(&id),
                         approved: true,
-                        reason: None,
-                        provider_executed: None,
-                        provider_metadata: None,
                     });
                 }
             }
@@ -240,7 +230,6 @@ fn end_chunks(id: TurnId, outcome: TurnOutcome, finish: FinishReason, chunks: &m
         TurnOutcome::Completed => {
             chunks.push(UiChunk::Finish {
                 finish_reason: Some(finish),
-                message_metadata: None,
             });
             TurnEndReason::Completed
         }
@@ -267,25 +256,17 @@ fn part_chunks(step: u32, part: &ModelPart, turn: &mut Turn, chunks: &mut Vec<Ui
     match part {
         ModelPart::TextStart { block } => chunks.push(UiChunk::TextStart {
             id: part_id(step, *block),
-            provider_metadata: None,
         }),
         ModelPart::TextDelta { block, delta } => chunks.push(UiChunk::TextDelta {
             id: part_id(step, *block),
             delta: delta.clone(),
-            provider_metadata: None,
         }),
         ModelPart::TextEnd { block } => chunks.push(UiChunk::TextEnd {
             id: part_id(step, *block),
-            provider_metadata: None,
         }),
         ModelPart::ToolInputStart { id, tool_name } => chunks.push(UiChunk::ToolInputStart {
             tool_call_id: id.clone(),
             tool_name: tool_name.clone(),
-            title: None,
-            provider_executed: None,
-            provider_metadata: None,
-            tool_metadata: None,
-            dynamic: None,
         }),
         ModelPart::ToolInputDelta { id, delta } => chunks.push(UiChunk::ToolInputDelta {
             tool_call_id: id.clone(),
@@ -296,21 +277,12 @@ fn part_chunks(step: u32, part: &ModelPart, turn: &mut Turn, chunks: &mut Vec<Ui
             tool_call_id,
             tool_name,
             input,
-        } => chunks.push(tool_call_chunk(tool_call_id, tool_name, input)),
+        } => chunks.push(UiChunk::ToolInputAvailable {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            input: input.to_value(),
+        }),
         ModelPart::Finish { finish_reason } => turn.finish = *finish_reason,
-    }
-}
-
-fn tool_call_chunk(id: &CallId, name: &ToolName, input: &ToolInput) -> UiChunk {
-    UiChunk::ToolInputAvailable {
-        tool_call_id: id.clone(),
-        tool_name: name.clone(),
-        input: input.to_value(),
-        title: None,
-        provider_executed: None,
-        provider_metadata: None,
-        tool_metadata: None,
-        dynamic: None,
     }
 }
 
@@ -320,19 +292,11 @@ fn result_chunks(call: &Call, exit: Exit, text: Option<String>, chunks: &mut Vec
         Exit::Ok => chunks.push(UiChunk::ToolOutputAvailable {
             tool_call_id: id,
             output: json!({"text": text.unwrap_or_default()}),
-            preliminary: None,
-            provider_executed: None,
-            provider_metadata: None,
-            tool_metadata: None,
-            dynamic: None,
         }),
         Exit::Err(Cause::Denied) => {
             chunks.push(UiChunk::ToolApprovalResponse {
                 approval_id: approval_id(&id),
                 approved: false,
-                reason: None,
-                provider_executed: None,
-                provider_metadata: None,
             });
             chunks.push(UiChunk::ToolOutputDenied { tool_call_id: id });
         }
@@ -343,10 +307,6 @@ fn result_chunks(call: &Call, exit: Exit, text: Option<String>, chunks: &mut Vec
             chunks.push(UiChunk::ToolOutputError {
                 tool_call_id: id,
                 error_text,
-                provider_executed: None,
-                provider_metadata: None,
-                tool_metadata: None,
-                dynamic: None,
             });
         }
     }

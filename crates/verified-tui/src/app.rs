@@ -229,15 +229,7 @@ impl App {
         let reply = self.transcript.running()?.reply()?;
         reply.parts.iter().find_map(|part| match part {
             Part::Tool(tool) if tool.state == ToolState::ApprovalRequested => Some(&**tool),
-            Part::Tool(_)
-            | Part::StepStart
-            | Part::Text { .. }
-            | Part::Reasoning { .. }
-            | Part::File { .. }
-            | Part::ReasoningFile { .. }
-            | Part::SourceUrl { .. }
-            | Part::SourceDocument { .. }
-            | Part::Custom { .. } => None,
+            Part::Tool(_) | Part::StepStart | Part::Text { .. } => None,
         })
     }
 

@@ -2,6 +2,7 @@
 source: crates/verified-tui/src/app/tests.rs
 expression: "screen(&mut app, 80, 30)"
 ---
+ › run the tests
 
  ⚙ bash  denied
    {"command":"cargo test"}
@@ -9,17 +10,16 @@ expression: "screen(&mut app, 80, 30)"
  › search for it
 
  ⚙ read  error
-   {"path": [1, tr
+   {"path":[1,true]}
    ✗ invalid input
  ⚙ grep  error
    {"q":1}
    ✗ no such tool
- ⚙ search · Search  done
-   {"q":"mian"}
-   → {"hits":2}
- ⚙ search  error
-   {}
+ ⚙ read  error
+   {"path":"README.md"}
    ✗ interrupted
+ ⚙ read  preparing
+   {}
  ⏹ cancelled
 
  › delete the build dir

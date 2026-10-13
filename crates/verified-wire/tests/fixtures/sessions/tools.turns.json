@@ -24,24 +24,11 @@
           "output": {
             "text": "fn mian() {}"
           },
-          "toolMetadata": {
-            "class": "safe"
-          },
-          "callProviderMetadata": {
-            "anthropic": {
-              "caller": "direct"
-            }
-          },
           "approval": {
             "id": "toolu_1",
             "requestReason": "read-only",
             "isAutomatic": true,
             "approved": true
-          },
-          "resultProviderMetadata": {
-            "anthropic": {
-              "cached": false
-            }
           }
         },
         {
@@ -51,7 +38,6 @@
           "type": "tool-edit",
           "toolCallId": "toolu_2",
           "state": "output-error",
-          "title": "Edit src/lib.rs",
           "input": {
             "path": "src/lib.rs",
             "old": "mian",
@@ -60,13 +46,7 @@
           "errorText": "old text not found",
           "approval": {
             "id": "toolu_2",
-            "descriptor": {
-              "summary": "replace 1 line"
-            },
-            "inputSchemaInput": null,
-            "signature": "sig-2",
-            "approved": true,
-            "reason": "looks right"
+            "approved": true
           }
         },
         {
@@ -87,12 +67,6 @@
     "text": "run the tests",
     "reply": {
       "id": "01a10400-0000-7000-8000-000000000002",
-      "metadata": {
-        "usage": {
-          "input": 10,
-          "output": 3
-        }
-      },
       "role": "assistant",
       "parts": [
         {
@@ -107,9 +81,7 @@
           },
           "approval": {
             "id": "toolu_3",
-            "requestReason": "runs a shell command",
-            "approved": false,
-            "reason": "not now"
+            "approved": false
           }
         }
       ]
@@ -131,13 +103,16 @@
           "type": "tool-read",
           "toolCallId": "toolu_5",
           "state": "output-error",
-          "input": "{\"path\": [1, tr",
-          "errorText": "invalid input",
-          "providerExecuted": false
+          "input": {
+            "path": [
+              1,
+              true
+            ]
+          },
+          "errorText": "invalid input"
         },
         {
-          "type": "dynamic-tool",
-          "toolName": "grep",
+          "type": "tool-grep",
           "toolCallId": "toolu_9",
           "state": "output-error",
           "input": {
@@ -146,28 +121,26 @@
           "errorText": "no such tool"
         },
         {
-          "type": "dynamic-tool",
-          "toolName": "search",
+          "type": "tool-read",
           "toolCallId": "toolu_6",
-          "state": "output-available",
+          "state": "output-error",
           "input": {
-            "q": "mian"
+            "path": "README.md"
           },
-          "output": {
-            "hits": 2
-          },
-          "title": "Search",
-          "toolMetadata": {
-            "source": "index"
+          "errorText": "interrupted",
+          "approval": {
+            "id": "toolu_6",
+            "requestReason": "read-only",
+            "isAutomatic": true,
+            "approved": true
           }
         },
         {
-          "type": "dynamic-tool",
-          "toolName": "search",
+          "type": "tool-read",
           "toolCallId": "toolu_7",
-          "state": "output-error",
+          "state": "input-streaming",
           "input": {},
-          "errorText": "interrupted"
+          "rawInput": "{\"path\":"
         }
       ]
     },

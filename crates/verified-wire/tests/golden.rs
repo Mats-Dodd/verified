@@ -3,8 +3,9 @@
 //! Each fixture in `tests/fixtures/sessions` is a session stream
 //! (`<name>.jsonl`, one chunk per line) and the turns `readUIMessageStream`
 //! from `ai@7.0.127` makes of it (`<name>.turns.json`). The first six are q's
-//! fixtures, copied unchanged; `tools` and `metadata` cover tool parts,
-//! approvals, dynamic tools, sources, files and metadata merging.
+//! fixtures, copied unchanged but for `steps`, which lost its reasoning part
+//! when the wire vocabulary was cut to what the daemon emits; `tools` covers
+//! tool parts and approvals.
 //! Regenerate the goldens with `tests/fixtures/golden.ts`.
 
 use proptest::prelude::*;
@@ -25,12 +26,11 @@ macro_rules! fixture {
     };
 }
 
-const FIXTURES: [(&str, &str, &str); 8] = [
+const FIXTURES: [(&str, &str, &str); 7] = [
     fixture!("cancelled"),
     fixture!("conversation"),
     fixture!("failed"),
     fixture!("in-progress"),
-    fixture!("metadata"),
     fixture!("simple"),
     fixture!("steps"),
     fixture!("tools"),
@@ -116,19 +116,6 @@ fn the_last_turn_runs_until_it_ends() {
     );
 }
 
-#[test]
-fn skips_chunks_it_does_not_know() {
-    let mut transcript = fold(&fixture("in-progress"));
-    let before = serde_json::to_value(transcript.turns()).expect("turns serialize");
-    let unknown: UiChunk =
-        serde_json::from_str(r#"{"type":"from-the-future","x":"y"}"#).expect("a chunk");
-    transcript.apply(&unknown).expect("skipped");
-    assert_eq!(
-        serde_json::to_value(transcript.turns()).expect("turns serialize"),
-        before
-    );
-}
-
 fn decode(line: &str) -> UiChunk {
     serde_json::from_str(line).expect("a chunk")
 }
@@ -147,7 +134,7 @@ fn rejects_chunks_that_do_not_fit_without_changing_anything() {
     let before = serde_json::to_value(transcript.turns()).expect("turns serialize");
     for line in [
         r#"{"type":"text-delta","id":"t9","delta":"x"}"#,
-        r#"{"type":"reasoning-end","id":"t0"}"#,
+        r#"{"type":"text-end","id":"t9"}"#,
         r#"{"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"{"}"#,
         r#"{"type":"tool-output-available","toolCallId":"toolu_1","output":null}"#,
         r#"{"type":"tool-approval-response","approvalId":"a","approved":true}"#,

@@ -9,16 +9,16 @@
 {"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"{\"pa"}
 {"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"th\":\"src/li"}
 {"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"b.rs\"}"}
-{"type":"tool-input-available","toolCallId":"toolu_1","toolName":"read","input":{"path":"src/lib.rs"},"providerMetadata":{"anthropic":{"caller":"direct"}},"toolMetadata":{"class":"safe"}}
-{"type":"tool-approval-request","approvalId":"toolu_1","toolCallId":"toolu_1","isAutomatic":true,"reason":"read-only"}
+{"type":"tool-input-available","toolCallId":"toolu_1","toolName":"read","input":{"path":"src/lib.rs"}}
+{"type":"tool-approval-request","approvalId":"toolu_1","toolCallId":"toolu_1","reason":"read-only","isAutomatic":true}
 {"type":"tool-approval-response","approvalId":"toolu_1","approved":true}
-{"type":"tool-output-available","toolCallId":"toolu_1","output":{"text":"fn mian() {}"},"providerMetadata":{"anthropic":{"cached":false}}}
+{"type":"tool-output-available","toolCallId":"toolu_1","output":{"text":"fn mian() {}"}}
 {"type":"finish-step"}
 {"type":"start-step"}
-{"type":"tool-input-start","toolCallId":"toolu_2","toolName":"edit","title":"Edit src/lib.rs"}
+{"type":"tool-input-start","toolCallId":"toolu_2","toolName":"edit"}
 {"type":"tool-input-available","toolCallId":"toolu_2","toolName":"edit","input":{"path":"src/lib.rs","old":"mian","new":"main"}}
-{"type":"tool-approval-request","approvalId":"toolu_2","toolCallId":"toolu_2","approvalDescriptor":{"summary":"replace 1 line"},"inputSchemaInput":null,"signature":"sig-2"}
-{"type":"tool-approval-response","approvalId":"toolu_2","approved":true,"reason":"looks right"}
+{"type":"tool-approval-request","approvalId":"toolu_2","toolCallId":"toolu_2"}
+{"type":"tool-approval-response","approvalId":"toolu_2","approved":true}
 {"type":"tool-output-error","toolCallId":"toolu_2","errorText":"old text not found"}
 {"type":"finish-step"}
 {"type":"start-step"}
@@ -30,15 +30,15 @@
 {"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000001","data":{"reason":"completed"}}
 {"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000002","data":{"text":"run the tests"}}
 {"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000002","data":{"model":"claude-sonnet-4-5"}}
-{"type":"start","messageId":"01a10400-0000-7000-8000-000000000002","messageMetadata":{"usage":{"input":10}}}
+{"type":"start","messageId":"01a10400-0000-7000-8000-000000000002"}
 {"type":"start-step"}
 {"type":"tool-input-start","toolCallId":"toolu_3","toolName":"bash"}
 {"type":"tool-input-available","toolCallId":"toolu_3","toolName":"bash","input":{"command":"cargo test"}}
-{"type":"tool-approval-request","approvalId":"toolu_3","toolCallId":"toolu_3","reason":"runs a shell command"}
-{"type":"tool-approval-response","approvalId":"toolu_3","approved":false,"reason":"not now"}
+{"type":"tool-approval-request","approvalId":"toolu_3","toolCallId":"toolu_3"}
+{"type":"tool-approval-response","approvalId":"toolu_3","approved":false}
 {"type":"tool-output-denied","toolCallId":"toolu_3"}
 {"type":"finish-step"}
-{"type":"finish","finishReason":"tool-calls","messageMetadata":{"usage":{"output":3}}}
+{"type":"finish","finishReason":"tool-calls"}
 {"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000002","data":{"reason":"completed"}}
 {"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000003","data":{"text":"search for it"}}
 {"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000003","data":{"model":"claude-sonnet-4-5"}}
@@ -47,18 +47,22 @@
 {"type":"tool-input-start","toolCallId":"toolu_4","toolName":"read"}
 {"type":"tool-input-delta","toolCallId":"toolu_4","inputTextDelta":"{\"path\":"}
 {"type":"reset-step"}
-{"type":"tool-input-start","toolCallId":"toolu_5","toolName":"read","providerExecuted":false}
+{"type":"tool-input-start","toolCallId":"toolu_5","toolName":"read"}
 {"type":"tool-input-delta","toolCallId":"toolu_5","inputTextDelta":"{\"path\": [1, tr"}
-{"type":"tool-input-error","toolCallId":"toolu_5","toolName":"read","input":"{\"path\": [1, tr","errorText":"invalid input"}
-{"type":"tool-input-error","toolCallId":"toolu_9","toolName":"grep","input":{"q":1},"errorText":"no such tool","dynamic":true}
-{"type":"tool-input-start","toolCallId":"toolu_6","toolName":"search","dynamic":true,"title":"Search"}
-{"type":"tool-input-delta","toolCallId":"toolu_6","inputTextDelta":"{\"q\":\"mi"}
-{"type":"tool-input-available","toolCallId":"toolu_6","toolName":"search","input":{"q":"mian"},"dynamic":true}
-{"type":"tool-output-available","toolCallId":"toolu_6","output":{"hits":1},"preliminary":true,"dynamic":true}
-{"type":"tool-output-available","toolCallId":"toolu_6","output":{"hits":2},"toolMetadata":{"source":"index"},"dynamic":true}
-{"type":"tool-input-start","toolCallId":"toolu_7","toolName":"search","dynamic":true}
-{"type":"tool-input-delta","toolCallId":"toolu_7","inputTextDelta":"{\"q\":"}
-{"type":"tool-output-error","toolCallId":"toolu_7","errorText":"interrupted","dynamic":true}
+{"type":"tool-input-delta","toolCallId":"toolu_5","inputTextDelta":"ue]}"}
+{"type":"tool-input-available","toolCallId":"toolu_5","toolName":"read","input":{"path":[1,true]}}
+{"type":"tool-input-start","toolCallId":"toolu_9","toolName":"grep"}
+{"type":"tool-input-available","toolCallId":"toolu_9","toolName":"grep","input":{"q":1}}
+{"type":"tool-input-start","toolCallId":"toolu_6","toolName":"read"}
+{"type":"tool-input-delta","toolCallId":"toolu_6","inputTextDelta":"{\"path\":\"REA"}
+{"type":"tool-input-available","toolCallId":"toolu_6","toolName":"read","input":{"path":"README.md"}}
+{"type":"tool-approval-request","approvalId":"toolu_6","toolCallId":"toolu_6","reason":"read-only","isAutomatic":true}
+{"type":"tool-approval-response","approvalId":"toolu_6","approved":true}
+{"type":"tool-output-error","toolCallId":"toolu_5","errorText":"invalid input"}
+{"type":"tool-output-error","toolCallId":"toolu_9","errorText":"no such tool"}
+{"type":"tool-input-start","toolCallId":"toolu_7","toolName":"read"}
+{"type":"tool-input-delta","toolCallId":"toolu_7","inputTextDelta":"{\"path\":"}
+{"type":"tool-output-error","toolCallId":"toolu_6","errorText":"interrupted"}
 {"type":"finish-step"}
 {"type":"abort","reason":"cancelled"}
 {"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000003","data":{"reason":"cancelled"}}
@@ -68,4 +72,4 @@
 {"type":"start-step"}
 {"type":"tool-input-start","toolCallId":"toolu_8","toolName":"bash"}
 {"type":"tool-input-available","toolCallId":"toolu_8","toolName":"bash","input":{"command":"rm -rf target"}}
-{"type":"tool-approval-request","approvalId":"toolu_8","toolCallId":"toolu_8","isAutomatic":false}
+{"type":"tool-approval-request","approvalId":"toolu_8","toolCallId":"toolu_8"}

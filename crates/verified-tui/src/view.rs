@@ -10,9 +10,6 @@ use verified_wire::stream::Freshness;
 use verified_wire::transcript::{Part, ToolPart, ToolState, TranscriptTurn};
 
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-const REASONING: Style = Style::new()
-    .fg(Color::DarkGray)
-    .add_modifier(Modifier::ITALIC);
 const ERROR: Style = Style::new().fg(Color::Red);
 const QUIET: Style = Style::new().fg(Color::DarkGray);
 const TOOL: Style = Style::new().fg(Color::Magenta);
@@ -41,25 +38,6 @@ pub fn turn_lines(turn: &TranscriptTurn) -> Vec<Line<'static>> {
         match part {
             Part::StepStart => {}
             Part::Text { text, .. } => lines.extend(markdown(text)),
-            Part::Reasoning { text, .. } => {
-                lines.extend(
-                    text.lines()
-                        .map(|line| Line::styled(line.to_owned(), REASONING)),
-                );
-            }
-            Part::File { url, .. } | Part::ReasoningFile { url, .. } => {
-                lines.push(Line::styled(format!("[file] {url}"), QUIET));
-            }
-            Part::SourceUrl { url, title, .. } => {
-                lines.push(Line::styled(
-                    format!("[source] {}", title.as_deref().unwrap_or(url)),
-                    QUIET,
-                ));
-            }
-            Part::SourceDocument { title, .. } => {
-                lines.push(Line::styled(format!("[source] {title}"), QUIET));
-            }
-            Part::Custom { kind, .. } => lines.push(Line::styled(format!("[{kind}]"), QUIET)),
             Part::Tool(tool) => lines.extend(tool_lines(tool)),
         }
     }
@@ -78,15 +56,6 @@ pub fn turn_lines(turn: &TranscriptTurn) -> Vec<Line<'static>> {
     lines
 }
 
-/// What a tool call is called on screen: its title, or its name.
-#[must_use]
-pub fn tool_label(tool: &ToolPart) -> String {
-    match &tool.title {
-        Some(title) => format!("{} · {title}", tool.tool_name),
-        None => tool.tool_name.to_string(),
-    }
-}
-
 const fn state_label(state: ToolState) -> &'static str {
     match state {
         ToolState::InputStreaming => "preparing",
@@ -103,7 +72,7 @@ const fn state_label(state: ToolState) -> &'static str {
 fn tool_lines(tool: &ToolPart) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         Span::styled("⚙ ", TOOL),
-        Span::styled(tool_label(tool), TOOL),
+        Span::styled(tool.tool_name.to_string(), TOOL),
         Span::styled(format!("  {}", state_label(tool.state)), QUIET),
     ])];
     let input = tool.input.as_ref().or(tool.raw_input.as_ref());
@@ -165,7 +134,7 @@ fn markdown(text: &str) -> Vec<Line<'static>> {
 #[must_use]
 pub fn approval_line(tool: &ToolPart) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!(" allow {}? ", tool_label(tool)), PROMPT.bold()),
+        Span::styled(format!(" allow {}? ", tool.tool_name), PROMPT.bold()),
         Span::styled("y allow · n deny · esc cancel turn", QUIET),
     ])
 }

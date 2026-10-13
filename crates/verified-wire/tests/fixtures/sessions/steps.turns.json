@@ -10,12 +10,6 @@
           "type": "step-start"
         },
         {
-          "type": "reasoning",
-          "id": "r0",
-          "text": "Let me think.",
-          "state": "done"
-        },
-        {
           "type": "text",
           "text": "First step.",
           "state": "done"
