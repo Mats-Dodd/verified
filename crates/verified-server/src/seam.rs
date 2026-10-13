@@ -205,6 +205,10 @@ pub struct World {
     groups: ProcessGroups,
 }
 
+/// How often [`ProcessGroups::kill_all`] tries the set's lock, yielding
+/// between tries, before it gives up.
+const KILL_ATTEMPTS: u32 = 10_000;
+
 /// The process groups of the commands running now.
 ///
 /// On a panic ([`ProcessGroups::kill_on_panic`]) or a fatal error (as each
@@ -268,12 +272,24 @@ impl ProcessGroups {
 
     /// Sends `SIGKILL` to every running group. Best effort: the daemon is
     /// going down, and a group that is gone already is what it wants. It
-    /// never blocks on the set's lock: a panic inside `insert` or `remove`
-    /// holds it (or poisoned it), and waiting there from the panic hook
-    /// would never reach the abort, so then it kills nothing.
+    /// never blocks on the set's lock, since the panic hook may run on the
+    /// thread holding it (a panic inside `insert` or `remove`) and would
+    /// then never reach the abort: it tries [`KILL_ATTEMPTS`] times, which
+    /// outlasts another thread's insert or remove, and only then kills
+    /// nothing. A poisoned set is still accurate (see `lock`).
     pub fn kill_all(&self) {
-        let Ok(live) = self.live.try_lock() else {
-            return;
+        let mut attempts = 0..KILL_ATTEMPTS;
+        let live = loop {
+            match self.live.try_lock() {
+                Ok(live) => break live,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if attempts.next().is_none() {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            }
         };
         for group in live.iter().copied() {
             if let Some(pid) = rustix::process::Pid::from_raw(group) {
@@ -358,5 +374,44 @@ impl Future for Supervised {
                 Poll::Ready(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+    use super::ProcessGroups;
+
+    /// A panic that poisoned the set leaves it accurate, so a later panic's
+    /// hook still kills every running group.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test starts its own command, as the Env seam does"
+    )]
+    fn a_poisoned_set_still_kills() {
+        let groups = ProcessGroups::default();
+        let mut command = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("a command");
+        groups.insert(i32::try_from(command.id()).expect("a pid"));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _held = groups.lock();
+            #[expect(clippy::panic, reason = "the test's point: poison the set")]
+            {
+                panic!("a panic while the set is held");
+            }
+        });
+        assert!(poisoned.is_err() && groups.live.is_poisoned(), "poisoned");
+        groups.kill_all();
+        let status = command.wait().expect("the command ends");
+        assert_eq!(
+            status.signal(),
+            Some(rustix::process::Signal::KILL.as_raw()),
+            "killed: {status:?}"
+        );
     }
 }
