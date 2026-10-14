@@ -124,9 +124,9 @@ pub struct Actor {
     pub starts: BTreeMap<CallId, (Tool, u8)>,
     /// The last completion delivered, for late-duplicate redelivery.
     pub last: Option<Event<Abstract>>,
-    /// A full log refused the boot's resume: the shell owes it, and decides
-    /// it again once the running turn is interrupted. Only a replay sets
-    /// it ([`crate::Observed::Refused`]); BFS never fills the log.
+    /// A full log refused the boot's resume: the shell fails stop until it
+    /// boots again. Only a replay sets it ([`crate::Observed::Refused`]);
+    /// BFS never fills the log.
     pub refused: bool,
 }
 

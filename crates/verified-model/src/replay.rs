@@ -50,10 +50,10 @@ pub enum Observed {
     /// birth, are a delivery's steps landing.
     Decided(Event<Abstract>, Vec<Rec>),
     /// A full log refused the boot's resume: nothing of it was written, and
-    /// none of its effects start. The shell interrupts the running turn
-    /// and resumes again ([`Observed::Resumed`], on a log not being
-    /// persisted). A refused `Decided` never reaches the model: the
-    /// simulation's fold drops it, since the core never took its event.
+    /// none of its effects start. The shell fails stop (L3): it decides
+    /// nothing more until it boots again. A refused `Decided` never reaches
+    /// the model: the simulation's fold drops it, since the core never took
+    /// its event.
     Refused,
     /// A group commit from `first` became durable: these records.
     Acked { first: u64, records: Vec<Rec> },
@@ -431,15 +431,9 @@ fn means(
 
 /// The state the run is in after observation `observed` of the actor at
 /// `slot`, whose actions took the model from `before` to `after`: `after`
-/// itself, if it agrees with what was observed, or for a refusal and the
-/// resume after one, `after` changed as the shell changed it.
-fn agrees(
-    harness: &Harness,
-    before: &World,
-    after: World,
-    slot: Slot,
-    observed: &Observed,
-) -> Result<World, String> {
+/// itself, if it agrees with what was observed, or for a refusal, `after`
+/// changed as the shell changed it.
+fn agrees(before: &World, after: World, slot: Slot, observed: &Observed) -> Result<World, String> {
     let (Some(was), Some(now)) = (before.actor(slot), after.actor(slot)) else {
         return Err(format!("no actor at slot {slot}"));
     };
@@ -457,19 +451,17 @@ fn agrees(
             }
         }
         Observed::Resumed(records) => {
-            let resumed = if now.refused {
-                harness
-                    .resumed(&after)
-                    .ok_or_else(|| "the log the shell resumes on does not recover".to_owned())?
-            } else {
-                after
-            };
-            let pending = resumed.actor(slot).map(|actor| &actor.pending);
-            if pending == Some(records) {
-                Ok(resumed)
+            if now.refused {
+                return Err(
+                    "the shell resumed again after its log refused, without a boot".to_owned(),
+                );
+            }
+            if now.pending == *records {
+                Ok(after)
             } else {
                 Err(format!(
-                    "the model resumed to {pending:?}, the shell to {records:?}"
+                    "the model resumed to {:?}, the shell to {records:?}",
+                    now.pending
                 ))
             }
         }
@@ -622,7 +614,7 @@ pub fn replay_actors(
                 keys.extend(coverage::keys(harness, &after, &action, &next));
                 after = next;
             }
-            agrees(harness, &world, after, *slot, observed)
+            agrees(&world, after, *slot, observed)
         });
         world = stepped.map_err(|why| diverged(index, *actor, observed, why, &world))?;
         if let Some(property) = broken(harness, &world) {

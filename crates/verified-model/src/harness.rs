@@ -865,23 +865,6 @@ impl Harness {
         world
     }
 
-    /// `world` with the root's resume staged without a crash: the boot's
-    /// resume was refused by a full log, and is decided again once the
-    /// running turn is interrupted. `None` if the log does not recover.
-    pub(crate) fn resumed(&self, world: &World) -> Option<World> {
-        let mut next = world.clone();
-        next.actors.first_mut()?.refused = false;
-        let core = self.core(world, 0)?;
-        let from = world.root().log.len();
-        self.stage(
-            &mut next,
-            0,
-            &core.resume(Some(self.born.clone()), self.load(&core)),
-            Some(from),
-        );
-        Some(next)
-    }
-
     /// The decision the actor at `slot` is persisting is durable: its
     /// records join the log and its effects start.
     fn sync(world: &mut World, slot: Slot) {
