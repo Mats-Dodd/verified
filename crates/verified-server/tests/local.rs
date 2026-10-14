@@ -129,6 +129,7 @@ fn approved(args: ToolArgs) -> ToolCall<Approved, Parsed> {
 fn bash(command: &str) -> ToolCall<Approved, Parsed> {
     approved(ToolArgs::Bash {
         command: Command::parse(command.to_owned()).expect("a command"),
+        background: false,
     })
 }
 
@@ -872,9 +873,15 @@ async fn file_log_refuses_what_replay_would_cut() {
 /// A daemon on a real project: its log on disk, `LocalEnv`, and the fake
 /// model on loopback. Its registry, and the tasks to shut it down with.
 async fn real_daemon(project: &std::path::Path) -> (daemon::Registry, Tasks) {
+    real_daemon_with(project, ServerLimits::v0()).await
+}
+
+async fn real_daemon_with(
+    project: &std::path::Path,
+    limits: ServerLimits,
+) -> (daemon::Registry, Tasks) {
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let limits = ServerLimits::v0();
     let seams = Seams {
         model: Arc::new(fake_model(&limits, &clock, &tasks).await),
         env: Arc::new(LocalEnv::new(
@@ -981,5 +988,70 @@ async fn a_rules_file_on_disk_grants_a_real_command() {
         )),
         "the command ran under the rule: {log:?}"
     );
+    tasks.shutdown().cancel();
+}
+
+/// Writes `rules` as the project's rules file.
+async fn write_rules(project: &std::path::Path, rules: &str) {
+    fs::create_dir_all(&project.join(".verified"))
+        .await
+        .expect("the daemon's dir");
+    fs::write_synced(&project.join(".verified/v.toml"), rules.as_bytes())
+        .await
+        .expect("the rules file");
+}
+
+/// The end of the first task in `log`, once it has one.
+fn first_task_end(log: &[Record<Parsed>]) -> Option<(Exit, String)> {
+    log.iter().find_map(|record| {
+        if let Record::TaskEnded {
+            exit,
+            output: Some(output),
+            ..
+        } = record
+        {
+            Some((*exit, output.body.text.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+/// A real background command: the call resolves at its start, the real
+/// shell runs on, and its end is recorded with what it printed. A second
+/// one past its own timeout is killed and ends `Unknown` (B2, H2).
+#[tokio::test]
+async fn a_real_background_command_runs_on_and_times_out_honestly() {
+    let project = scratch("background").await;
+    write_rules(&project, "[[allow]]\ntool = \"bash\"\n").await;
+    let mut limits = ServerLimits::v0();
+    limits.task_timeout = Millis::new(300);
+    let (registry, tasks) = real_daemon_with(&project, limits).await;
+    let (_, handle) = registry.create(session()).await.expect("created");
+    handle
+        .send_message(message(1, "bg sleep 0.1 && echo background-done"))
+        .await
+        .expect("accepted");
+    let log = records_until(&handle, |log| first_task_end(log).is_some()).await;
+    let (exit, output) = first_task_end(&log).expect("ended");
+    assert_eq!(exit, Exit::Ok, "{output}");
+    assert!(output.contains("background-done"), "{output}");
+
+    let (_, other) = registry
+        .create(ActorId::from_parts(at(), &[5; 10]))
+        .await
+        .expect("created");
+    other
+        .send_message(message(2, "bg sleep 30"))
+        .await
+        .expect("accepted");
+    let log = records_until(&other, |log| first_task_end(log).is_some()).await;
+    let (exit, output) = first_task_end(&log).expect("ended");
+    assert_eq!(
+        exit,
+        Exit::Unknown,
+        "a killed command may have acted: {output}"
+    );
+    assert!(output.contains("timed out"), "{output}");
     tasks.shutdown().cancel();
 }

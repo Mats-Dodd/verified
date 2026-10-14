@@ -6,6 +6,8 @@
 use verified_domain::{Limits, Millis};
 use verified_wire::WireLimits;
 
+use crate::payload::ToolArgs;
+
 /// The daemon's bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerLimits {
@@ -78,6 +80,16 @@ pub struct ServerLimits {
     pub rules_file_bytes: u64,
     /// Most rules one rules file may hold; one with more grants nothing.
     pub rules_count: usize,
+    /// How much longer than a run's own bound v waits for its report
+    /// before it stops waiting and records `Unknown` (B2). A `read` or an
+    /// `edit` has no bound of its own: this is its deadline.
+    pub deadline_slack: Millis,
+    /// The deadline of a delivery between actors (a `send`, a `spawn`, a
+    /// stop): the recipient's append, bounded.
+    pub deliver_deadline: Millis,
+    /// How long a background `bash` may run before its process group is
+    /// killed: its own timeout, as `exec_timeout` is a foreground one's.
+    pub task_timeout: Millis,
 }
 
 /// Bytes of a log line around a record's payloads: the frame header, the
@@ -172,6 +184,31 @@ impl ServerLimits {
         fits("one log line", Some(self.log_line_bytes), file)
     }
 
+    /// When v stops waiting for a run of `args` and records `Unknown`: past
+    /// the run's own timeout and drains, so a run's honest report normally
+    /// comes first (B2). `None` for a run that reports at once (`tasks`)
+    /// or is a timer (`wake`), and for a `cancel`, which the core does.
+    #[must_use]
+    pub const fn deadline(&self, args: &ToolArgs) -> Option<Millis> {
+        let drains = self.exec_drain.get().saturating_mul(2);
+        let slack = self.deadline_slack.get();
+        match args {
+            ToolArgs::Read { .. } | ToolArgs::Edit { .. } => Some(self.deadline_slack),
+            ToolArgs::Bash { background, .. } => {
+                let timeout = if *background {
+                    self.task_timeout
+                } else {
+                    self.exec_timeout
+                };
+                Some(Millis::new(
+                    timeout.get().saturating_add(drains).saturating_add(slack),
+                ))
+            }
+            ToolArgs::Spawn { .. } | ToolArgs::Send { .. } => Some(self.deliver_deadline),
+            ToolArgs::Wake { .. } | ToolArgs::Tasks | ToolArgs::Cancel { .. } => None,
+        }
+    }
+
     /// The bounds v0 ships with.
     #[must_use]
     pub fn v0() -> Self {
@@ -204,6 +241,9 @@ impl ServerLimits {
             session_bytes: 64 << 20,
             rules_file_bytes: 64 << 10,
             rules_count: 256,
+            deadline_slack: Millis::new(30_000),
+            deliver_deadline: Millis::new(60_000),
+            task_timeout: Millis::new(1_800_000),
         }
     }
 }

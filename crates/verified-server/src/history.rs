@@ -278,9 +278,32 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
     {
         builder.close_step();
     }
+    // The tools the actor was born with.
+    let tools = records
+        .iter()
+        .find_map(|record| match record {
+            Record::Born { born } => Some(born.tools.clone()),
+            Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => None,
+        })
+        .unwrap_or_default();
     ModelRequest {
         system: system.to_owned(),
         messages: builder.messages,
         max_tokens,
+        tools,
     }
 }

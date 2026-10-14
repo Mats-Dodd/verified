@@ -1,4 +1,6 @@
-//! The tools: `read` (Safe), `edit` and `bash` (Unsafe).
+//! The tools that act on the world: `read` (Safe), `edit` and `bash`
+//! (Unsafe). The runtime's own tools (`spawn`, `send`, `wake`, `tasks`,
+//! `cancel`) are the shell's.
 //!
 //! A tool runs an approved call against the [`Env`] and reports what
 //! actually happened as an [`Exit`] and a bounded [`ToolOutput`]. The
@@ -23,13 +25,14 @@ use core::fmt::Write as _;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
 use verified_domain::id::ActorId;
-use verified_domain::{Exit, Unstarted};
+use verified_domain::{Exit, Millis, Unstarted};
 
+use crate::defect;
 use crate::env::{
     BashGrant, EditGrant, Env, EnvError, ExecOptions, ExitStatus, Grant, Stopped, Written,
 };
 use crate::limits::ServerLimits;
-use crate::payload::{Parsed, ProjectPath, ToolOutput, Truncation};
+use crate::payload::{Parsed, ProjectPath, ToolArgs, ToolOutput, Truncation};
 
 /// The environment variable `bash` commands see their call id in.
 pub const CALL_ID_VAR: &str = "VERIFIED_CALL_ID";
@@ -74,10 +77,25 @@ pub async fn run(
             ToolOutput::complete("Not started: cancelled.".to_owned()),
         );
     }
+    let background = matches!(
+        call.args(),
+        ToolArgs::Bash {
+            background: true,
+            ..
+        }
+    );
     match Grant::of(call, session) {
-        Grant::Read(path) => read(env, path, limits).await,
-        Grant::Edit(grant) => edit(env, &grant, limits).await,
-        Grant::Bash(grant) => bash(env, &grant, cancel, limits).await,
+        Some(Grant::Read(path)) => read(env, path, limits).await,
+        Some(Grant::Edit(grant)) => edit(env, &grant, limits).await,
+        Some(Grant::Bash(grant)) => {
+            let timeout = if background {
+                limits.task_timeout
+            } else {
+                limits.exec_timeout
+            };
+            bash(env, &grant, cancel, limits, timeout).await
+        }
+        None => defect("the shell runs only a world tool through `tool::run`"),
     }
 }
 
@@ -154,9 +172,10 @@ async fn bash(
     grant: &BashGrant<'_>,
     cancel: &CancellationToken,
     limits: &ServerLimits,
+    timeout: Millis,
 ) -> (Exit, ToolOutput) {
     let options = ExecOptions {
-        timeout: limits.exec_timeout,
+        timeout,
         drain: limits.exec_drain,
         output_bytes: limits.tool_output_bytes,
         env: vec![(CALL_ID_VAR.to_owned(), grant.id().as_str().to_owned())],

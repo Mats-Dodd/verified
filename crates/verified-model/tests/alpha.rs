@@ -9,11 +9,14 @@ use proptest::prelude::*;
 use verified_core::{Core, Decision, Effect, Event, Loaded, ModelExit, Verdict};
 use verified_domain::{
     Address, Body, CallId, EffectId, Envelope, EnvelopeId, Epoch, Exit, Limits, LimitsConfig,
-    MessageId, Millis, ModelFault, Record, ToolName, TurnId, UnixMillis, Unstarted,
+    MessageId, Millis, ModelFault, Record, Tool, ToolName, TurnId, UnixMillis, Unstarted,
 };
 use verified_model::alpha::record;
 use verified_model::{alpha, born};
-use verified_server::payload::{ModelPart, Parsed, ToolInput, ToolOutput, measure, proposal};
+use verified_server::payload::{
+    Boundary, ModelPart, Parsed, ToolInput, ToolOutput, measure, proposal,
+};
+use verified_server::seam::{OsEntropy, SystemClock};
 
 /// Small bounds, so that sizes reach the context limit and calls reach
 /// theirs.
@@ -176,6 +179,12 @@ impl Seen {
                     &id,
                     &ToolName::parse(name).expect("a tool name"),
                     &ToolInput::parse(&input).expect("a JSON object"),
+                    &Boundary {
+                        tools: &[Tool::Read, Tool::Edit, Tool::Bash],
+                        text_bytes: usize::MAX,
+                        clock: &SystemClock,
+                        entropy: &OsEntropy,
+                    },
                 )
             })
             .collect()

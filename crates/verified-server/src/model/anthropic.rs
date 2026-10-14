@@ -74,7 +74,7 @@ pub fn request_json(model: &str, request: &ModelRequest) -> Value {
         "max_tokens": request.max_tokens,
         "system": request.system,
         "messages": messages,
-        "tools": tool_definitions(),
+        "tools": tool_definitions(&request.tools),
         "stream": true,
     })
 }

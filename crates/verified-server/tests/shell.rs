@@ -165,6 +165,10 @@ impl Env for MemEnv {
             cancel.cancelled().await;
             return Ok((ExitStatus::Stopped(Stopped::Cancelled), kept));
         }
+        if command.as_str() == "hang" {
+            // A run that ignores its cancel and never reports.
+            core::future::pending::<()>().await;
+        }
         kept.push(format!("ran {}\n", command.as_str()).as_bytes());
         Ok((ExitStatus::Code(0), kept))
     }
@@ -1456,4 +1460,246 @@ async fn the_rules_file_grants_and_is_read_before_each_message() {
         .await
         .expect("cancelled");
     daemon.tasks.shutdown().cancel();
+}
+
+/// Waits until `ready` holds for the log, and returns it.
+async fn until_log<F>(handle: &SessionHandle, ready: F) -> Vec<Record<Parsed>>
+where
+    F: Fn(&[Record<Parsed>]) -> bool,
+{
+    let committed = handle.committed();
+    loop {
+        let seen = committed.get();
+        let log = records(handle).await;
+        if ready(&log) {
+            return log;
+        }
+        within(Duration::from_secs(20), committed.past(seen))
+            .await
+            .expect("the log grows within 20s")
+            .expect("the session runs");
+    }
+}
+
+/// The seq of the first `Dispatched` in `log` after `from`.
+fn dispatched_after(log: &[Record<Parsed>], from: usize) -> Option<u64> {
+    log.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, record)| matches!(record, Record::Dispatched { .. }))
+        .and_then(|(seq, _)| u64::try_from(seq).ok())
+}
+
+/// Whether a step carried task `task`'s end: its notification was read.
+fn carried(log: &[Record<Parsed>], task: u64) -> bool {
+    log.iter().any(|record| {
+        matches!(record, Record::StepStarted { carries, .. }
+            if carries.contains(&verified_domain::EnvelopeId::Task(verified_domain::TaskId(task))))
+    })
+}
+
+/// The end of task `task`, once it has one.
+fn task_end(log: &[Record<Parsed>], task: u64) -> Option<(Exit, Option<String>)> {
+    log.iter().find_map(|record| {
+        if let Record::TaskEnded {
+            task: ended,
+            exit,
+            output,
+        } = record
+            && ended.0 == task
+        {
+            Some((
+                *exit,
+                output.as_ref().map(|output| output.body.text.clone()),
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// A background command resolves its call at its durable start (no turn
+/// waits for it, B1), runs on as a task, and its end reaches the actor as
+/// a notification a later model call carries (H3).
+#[tokio::test]
+async fn a_background_command_resolves_at_once_and_notifies_when_it_ends() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some("[[allow]]\ntool = \"bash\"\n"));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "bg echo later"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        dispatched_after(log, 0).is_some_and(|task| carried(log, task))
+    })
+    .await;
+    let task = dispatched_after(&log, 0).expect("dispatched");
+    let at = usize::try_from(task).expect("small");
+    assert!(
+        matches!(
+            log.get(at.saturating_add(1)),
+            Some(Record::ToolResult {
+                exit: Exit::Ok,
+                output: None,
+                ..
+            })
+        ),
+        "the call resolved in the decision that started it: {log:?}"
+    );
+    assert_eq!(
+        task_end(&log, task),
+        Some((Exit::Ok, Some("ran echo later\n[exit status 0]".to_owned()))),
+        "the task ended once, with what it reported"
+    );
+    assert_eq!(env.commands().len(), 1, "it ran once");
+    daemon.tasks.shutdown().cancel();
+}
+
+/// `wake` is a timer task: it ends `Ok` at its deadline, and its end
+/// starts a turn that carries it.
+#[tokio::test]
+async fn a_timer_wakes_its_actor() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some("[[allow]]\ntool = \"wake\"\n"));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "wake 50"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        dispatched_after(log, 0).is_some_and(|task| carried(log, task))
+    })
+    .await;
+    let task = dispatched_after(&log, 0).expect("dispatched");
+    assert_eq!(
+        task_end(&log, task),
+        Some((Exit::Ok, Some("woke".to_owned())))
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// `tasks` lists the actor's tasks, and `cancel` signals a running one,
+/// which then records what came back: a command stopped mid-run is
+/// `Unknown` (H2).
+#[tokio::test]
+async fn tasks_lists_and_cancel_signals_a_running_task() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(
+        "[[allow]]\ntool = \"bash\"\n[[allow]]\ntool = \"tasks\"\n[[allow]]\ntool = \"cancel\"\n",
+    ));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let first = handle
+        .send_message(send(1, "bg block"))
+        .await
+        .expect("accepted");
+    until(&handle, ended(first.turn_id)).await;
+    let task = dispatched_after(&records(&handle).await, 0).expect("dispatched");
+    let listed = handle
+        .send_message(send(2, "tasks"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        log.iter().any(
+            |record| matches!(record, Record::TurnEnded { turn, .. } if *turn == listed.turn_id),
+        )
+    })
+    .await;
+    assert!(
+        log.iter().any(|record| matches!(
+            record,
+            Record::ToolResult { exit: Exit::Ok, output: Some(output), .. }
+                if output.body.text == format!("task {task}: bash `block`: running")
+        )),
+        "the listing names the running task: {log:?}"
+    );
+    handle
+        .send_message(send(3, &format!("cancel {task}")))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| task_end(log, task).is_some()).await;
+    assert!(
+        matches!(task_end(&log, task), Some((Exit::Unknown, Some(_)))),
+        "a command stopped mid-run may have acted: {log:?}"
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// B2, checked: a foreground `bash` and a background one whose runs never
+/// report (they ignore their cancel). What broke, if anything: a call or a
+/// task not resolved `Unknown` within two seconds of its deadline.
+async fn deadlines(planted: Planted) -> Result<(), String> {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some("[[allow]]\ntool = \"bash\"\n"));
+    let mut limits = limits();
+    limits.exec_timeout = Millis::new(50);
+    limits.task_timeout = Millis::new(50);
+    limits.exec_drain = Millis::new(10);
+    limits.deadline_slack = Millis::new(50);
+    let store = Arc::new(MemLogStore::new(
+        MemDisk::new(),
+        limits.log_line_bytes,
+        limits.log_file_bytes,
+    ));
+    let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "bash hang ; bg hang"))
+        .await
+        .expect("accepted");
+    let resolved = |log: &[Record<Parsed>]| {
+        let foreground = log.iter().any(|record| {
+            matches!(
+                record,
+                Record::ToolResult {
+                    exit: Exit::Unknown,
+                    output: None,
+                    ..
+                }
+            )
+        });
+        let background = log.iter().any(|record| {
+            matches!(
+                record,
+                Record::TaskEnded {
+                    exit: Exit::Unknown,
+                    output: None,
+                    ..
+                }
+            )
+        });
+        foreground && background
+    };
+    let waited = within(Duration::from_secs(2), until_log(&handle, resolved)).await;
+    let log = records(&handle).await;
+    daemon.tasks.shutdown().cancel();
+    match waited {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "a run that never reports was waited on past its deadline: {log:?}"
+        )),
+    }
+}
+
+/// Every in-flight effect resolves by its deadline (B2): a run that never
+/// reports is `Unknown` once v stops waiting.
+#[tokio::test]
+async fn a_run_that_never_reports_resolves_unknown_at_its_deadline() {
+    deadlines(Planted::None)
+        .await
+        .expect("every run resolves by its deadline");
+}
+
+/// The planted bug for B2: no deadline is armed. The check must catch the
+/// wait.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn waiting_on_a_run_that_never_reports_is_caught() {
+    let broken = deadlines(Planted::NoDeadline)
+        .await
+        .expect_err("the check catches a run waited on for good");
+    assert!(broken.contains("past its deadline"), "{broken}");
 }

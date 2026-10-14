@@ -10,8 +10,12 @@
 //! - `fail …`        starts a reply, then sends an `overloaded_error` event
 //! - `overloaded …`  answers 529 before streaming anything
 //! - `error …`       answers 400 (not retried)
-//! - `read P`, `edit P OLD NEW`, `bash CMD`: a tool call; several calls are
-//!   separated by ` ; ` and come in one response
+//! - `read P`, `edit P OLD NEW`, `bash CMD`, `bg CMD` (in the background),
+//!   `wake MS`, `tasks`, `cancel N`, `spawn NAME PROMPT…`, `send ADDR TEXT…`:
+//!   a tool call; several calls are separated by ` ; ` and come in one
+//!   response
+//! - an envelope from an agent or from v is scripted by its text, without
+//!   the header the history gives it
 //! - anything else   streams `Echo: <message>`, a word per delta
 //!
 //! A last user message of only tool results is answered `Result: <first result>`.
@@ -176,6 +180,20 @@ fn last_said(request: &Value) -> (String, Option<(String, bool)>) {
     (text, result)
 }
 
+/// The tools a scripted `spawn` offers its child.
+const SPAWNED_TOOLS: [&str; 6] = ["read", "bash", "send", "wake", "tasks", "cancel"];
+
+/// What an envelope says, without the header the history gives one from
+/// an agent (`[from ADDR] `) or from v (`[v] `): an agent's message is
+/// scripted like the user's.
+fn body(said: &str) -> &str {
+    if said.starts_with("[from ") || said.starts_with("[v] ") {
+        said.split_once("] ").map_or(said, |(_, body)| body)
+    } else {
+        said
+    }
+}
+
 /// One scripted tool call, if `command` is one.
 fn tool_call(command: &str) -> Option<(&'static str, Value)> {
     let command = command.trim();
@@ -190,12 +208,43 @@ fn tool_call(command: &str) -> Option<(&'static str, Value)> {
     if let Some(script) = command.strip_prefix("bash ") {
         return Some(("bash", json!({"command": script})));
     }
+    if let Some(script) = command.strip_prefix("bg ") {
+        return Some(("bash", json!({"command": script, "background": true})));
+    }
+    if let Some(after) = command.strip_prefix("wake ") {
+        return Some((
+            "wake",
+            json!({"after_ms": after.trim().parse::<u64>().ok()?}),
+        ));
+    }
+    if command == "tasks" {
+        return Some(("tasks", json!({})));
+    }
+    if let Some(task) = command.strip_prefix("cancel ") {
+        return Some(("cancel", json!({"task": task.trim().parse::<u64>().ok()?})));
+    }
+    if let Some(rest) = command.strip_prefix("spawn ") {
+        let (name, prompt) = rest.trim().split_once(' ')?;
+        return Some((
+            "spawn",
+            json!({"name": name, "tools": SPAWNED_TOOLS, "prompt": prompt}),
+        ));
+    }
+    if let Some(rest) = command.strip_prefix("send ") {
+        let (to, text) = rest.trim().split_once(' ')?;
+        return Some(("send", json!({"to": to, "text": text})));
+    }
     if let Some(raw) = command.strip_prefix("call ") {
         let (name, input) = raw.split_once(' ').unwrap_or((raw, "{}"));
         let name: &'static str = match name {
             "read" => "read",
             "edit" => "edit",
             "bash" => "bash",
+            "spawn" => "spawn",
+            "send" => "send",
+            "wake" => "wake",
+            "tasks" => "tasks",
+            "cancel" => "cancel",
             _ => "unknown_tool",
         };
         let input = serde_json::from_str(input).unwrap_or(Value::String(input.to_owned()));
@@ -208,6 +257,7 @@ fn tool_call(command: &str) -> Option<(&'static str, Value)> {
 #[must_use]
 pub fn reply(request: &Value) -> Reply {
     let (said, result) = last_said(request);
+    let said = body(&said).to_owned();
     let turn = request
         .get("messages")
         .and_then(Value::as_array)

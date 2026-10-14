@@ -200,26 +200,32 @@ pub struct BashGrant<'call> {
 }
 
 impl<'call> Grant<'call> {
-    /// What `call`, of `session`, may do. The only way to make an
-    /// [`EditGrant`] or a [`BashGrant`].
+    /// What `call`, of `session`, may do to the world; `None` for a call
+    /// that acts only on the runtime (`spawn`, `send`, `wake`, `tasks`,
+    /// `cancel`). The only way to make an [`EditGrant`] or a [`BashGrant`].
     #[must_use]
-    pub fn of(call: &'call ToolCall<Approved, Parsed>, session: ActorId) -> Self {
+    pub fn of(call: &'call ToolCall<Approved, Parsed>, session: ActorId) -> Option<Self> {
         let effect = call.effect();
         match call.args() {
-            ToolArgs::Read { path } => Self::Read(path),
-            ToolArgs::Edit { path, old, new } => Self::Edit(EditGrant {
+            ToolArgs::Read { path } => Some(Self::Read(path)),
+            ToolArgs::Edit { path, old, new } => Some(Self::Edit(EditGrant {
                 id: call.id(),
                 effect,
                 path,
                 old,
                 new,
                 staged: Sibling::staged(session, effect.seq),
-            }),
-            ToolArgs::Bash { command } => Self::Bash(BashGrant {
+            })),
+            ToolArgs::Bash { command, .. } => Some(Self::Bash(BashGrant {
                 id: call.id(),
                 effect,
                 command,
-            }),
+            })),
+            ToolArgs::Spawn { .. }
+            | ToolArgs::Send { .. }
+            | ToolArgs::Wake { .. }
+            | ToolArgs::Tasks
+            | ToolArgs::Cancel { .. } => None,
         }
     }
 }

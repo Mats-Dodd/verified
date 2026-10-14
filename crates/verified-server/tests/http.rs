@@ -451,6 +451,7 @@ const fn request() -> ModelRequest {
         system: String::new(),
         messages: Vec::new(),
         max_tokens: 16,
+        tools: Vec::new(),
     }
 }
 

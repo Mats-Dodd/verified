@@ -52,7 +52,7 @@ use verified_core::{
 };
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_domain::{
-    ActorName, Address, Body, Born, EffectId, Envelope, EnvelopeId, Exit, Grant, Measured,
+    ActorName, Address, Body, Born, EffectId, Envelope, EnvelopeId, Exit, Grant, Measured, Millis,
     ModelFault, Proposal, Record, Tool, TurnOutcome, Unstarted, named,
 };
 use verified_wire::chunk::UiChunk;
@@ -68,7 +68,7 @@ use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
 use crate::model::Model;
-use crate::payload::{ModelPart, Parsed, ToolOutput, measure, proposal};
+use crate::payload::{Boundary, ModelPart, Parsed, ToolArgs, ToolOutput, measure, proposal};
 use crate::projection::Projector;
 use crate::rules_file;
 use crate::seam::{Clock, Entropy, Tasks};
@@ -126,6 +126,10 @@ pub enum Planted {
     /// (breaks L3's fail-stop: nothing acts without a durable record).
     #[cfg(feature = "sim")]
     ActAfterRefusal,
+    /// Arm no deadline (breaks B2): a run that never reports is waited on
+    /// for good.
+    #[cfg(feature = "sim")]
+    NoDeadline,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -398,6 +402,8 @@ pub struct Session {
     inbox: mpsc::Sender<Input>,
     committed: CommittedWriter,
     cancels: BTreeMap<EffectId, CancellationToken>,
+    /// The deadline of each run in flight (B2): cancelled when it reports.
+    deadlines: BTreeMap<EffectId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
     /// Why the log stopped taking records, once it has: from then on the
@@ -473,6 +479,7 @@ impl Session {
             inbox,
             committed: writer,
             cancels: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
             held_bytes,
             full: None,
         };
@@ -658,10 +665,19 @@ impl Session {
         match input {
             Input::Done(event) => {
                 match &event {
-                    Event::ModelDone { id, .. }
-                    | Event::ToolDone { id, .. }
-                    | Event::Expired { id } => {
+                    Event::ModelDone { id, .. } => {
                         self.cancels.remove(id);
+                    }
+                    Event::ToolDone { id, .. } => {
+                        self.cancels.remove(id);
+                        if let Some(deadline) = self.deadlines.remove(id) {
+                            deadline.cancel();
+                        }
+                    }
+                    // The run is still asked to stop (`CancelTool`), so
+                    // its token stays until it reports.
+                    Event::Expired { id } => {
+                        self.deadlines.remove(id);
                     }
                     Event::Born { .. }
                     | Event::Rules { .. }
@@ -988,8 +1004,10 @@ impl Session {
                 let task = ModelTask {
                     model: Arc::clone(&self.seams.model),
                     clock: Arc::clone(&self.seams.clock),
+                    entropy: Arc::clone(&self.seams.entropy),
                     inbox: self.inbox.clone(),
                     config: Arc::clone(&self.config),
+                    tools: request.tools.clone(),
                     id,
                     cancel,
                 };
@@ -1005,20 +1023,7 @@ impl Session {
                 // from `StepFinished`); the answer arrives as a command.
                 drop::<ToolCall<_, Parsed>>(request);
             }
-            Effect::RunTool { call } => {
-                let id = call.effect();
-                let cancel = CancellationToken::new();
-                self.cancels.insert(id, cancel.clone());
-                self.seams.tasks.spawn(run_tool(
-                    Arc::clone(&self.seams.env),
-                    self.id,
-                    call,
-                    id,
-                    self.inbox.clone(),
-                    cancel,
-                    Arc::clone(&self.config),
-                ));
-            }
+            Effect::RunTool { call } => self.run_call(call),
             Effect::Sleep { id, delay } => {
                 let clock = Arc::clone(&self.seams.clock);
                 let inbox = self.inbox.clone();
@@ -1039,6 +1044,160 @@ impl Session {
             }
         }
     }
+
+    /// Runs an approved call (a foreground run or a task's), and arms its
+    /// deadline (B2).
+    fn run_call(&mut self, call: ToolCall<Approved, Parsed>) {
+        let id = call.effect();
+        let deadline = self.config.limits.deadline(call.args());
+        match call.args() {
+            ToolArgs::Read { .. } | ToolArgs::Edit { .. } | ToolArgs::Bash { .. } => {
+                let cancel = CancellationToken::new();
+                self.cancels.insert(id, cancel.clone());
+                self.seams.tasks.spawn(run_tool(
+                    Arc::clone(&self.seams.env),
+                    self.id,
+                    call,
+                    id,
+                    self.inbox.clone(),
+                    cancel,
+                    Arc::clone(&self.config),
+                ));
+            }
+            ToolArgs::Wake { at, .. } => {
+                // A timer re-arms from its durable deadline after a crash.
+                let at = *at;
+                let clock = Arc::clone(&self.seams.clock);
+                let inbox = self.inbox.clone();
+                self.seams.tasks.spawn(async move {
+                    let left = at.get().saturating_sub(clock.now().get());
+                    clock.sleep(Millis::new(left)).await;
+                    let output = measure(ToolOutput::complete("woke".to_owned()));
+                    report(
+                        &inbox,
+                        Event::ToolDone {
+                            id,
+                            exit: Exit::Ok,
+                            output,
+                        },
+                    )
+                    .await;
+                });
+            }
+            ToolArgs::Tasks => {
+                let listing = tasks(&self.records);
+                let inbox = self.inbox.clone();
+                self.seams.tasks.spawn(async move {
+                    let output = measure(ToolOutput::complete(listing));
+                    report(
+                        &inbox,
+                        Event::ToolDone {
+                            id,
+                            exit: Exit::Ok,
+                            output,
+                        },
+                    )
+                    .await;
+                });
+            }
+            ToolArgs::Spawn { .. } | ToolArgs::Send { .. } => {
+                // No delivery between actors yet: refused, and says so.
+                let inbox = self.inbox.clone();
+                self.seams.tasks.spawn(async move {
+                    let output = measure(ToolOutput::complete("no such actor".to_owned()));
+                    let exit = Exit::NotStarted(Unstarted::Refused);
+                    report(&inbox, Event::ToolDone { id, exit, output }).await;
+                });
+            }
+            ToolArgs::Cancel { .. } => defect("the core does a `cancel` itself"),
+        }
+        if let Some(after) = deadline {
+            self.arm(id, after);
+        }
+    }
+
+    /// The deadline of run `id`: past `after`, v stops waiting and the core
+    /// records `Unknown` (`Expired`), unless the run reported first.
+    fn arm(&mut self, id: EffectId, after: Millis) {
+        // The planted defect: no run ever has a deadline.
+        #[cfg(feature = "sim")]
+        if self.config.planted == Planted::NoDeadline {
+            return;
+        }
+        let reported = CancellationToken::new();
+        self.deadlines.insert(id, reported.clone());
+        let clock = Arc::clone(&self.seams.clock);
+        let inbox = self.inbox.clone();
+        self.seams.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = reported.cancelled() => {}
+                () = clock.sleep(after) => report(&inbox, Event::Expired { id }).await,
+            }
+        });
+    }
+}
+
+/// The `tasks` tool's answer: each task of `records` (a background call, a
+/// timer, a stop), what started it and whether it ended.
+fn tasks(records: &[Record<Parsed>]) -> String {
+    let mut started: Vec<(u64, String)> = Vec::new();
+    let mut ended: BTreeMap<u64, Exit> = BTreeMap::new();
+    for (seq, (record, call)) in (0u64..).zip(named(records)) {
+        match record {
+            Record::Dispatched { .. } => {
+                let Some((_, proposal)) = call else {
+                    continue;
+                };
+                let verified_domain::Request::Run { args } = &proposal.request else {
+                    continue;
+                };
+                let what = match args {
+                    ToolArgs::Bash {
+                        command,
+                        background: true,
+                    } => format!("bash `{}`", command.as_str()),
+                    ToolArgs::Wake { after, .. } => format!("wake after {} ms", after.get()),
+                    ToolArgs::Read { .. }
+                    | ToolArgs::Edit { .. }
+                    | ToolArgs::Bash { .. }
+                    | ToolArgs::Spawn { .. }
+                    | ToolArgs::Send { .. }
+                    | ToolArgs::Tasks
+                    | ToolArgs::Cancel { .. } => continue,
+                };
+                started.push((seq, what));
+            }
+            Record::StopSent { child } => started.push((seq, format!("stop {child}"))),
+            Record::TaskEnded { task, exit, .. } => {
+                ended.insert(task.0, *exit);
+            }
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::ToolResult { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => {}
+        }
+    }
+    if started.is_empty() {
+        return "No tasks.".to_owned();
+    }
+    started
+        .into_iter()
+        .map(|(seq, what)| match ended.get(&seq) {
+            Some(exit) => format!("task {seq}: {what}: ended {exit:?}"),
+            None => format!("task {seq}: {what}: running"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Who a session's actor is: a root actor the user made, named `main`,
@@ -1047,7 +1206,14 @@ fn born(actor: ActorId) -> Born {
     Born::root(
         actor,
         ActorName::parse("main").unwrap_or_else(|_name| defect("`main` is an actor name")),
-        vec![Tool::Read, Tool::Edit, Tool::Bash],
+        vec![
+            Tool::Read,
+            Tool::Edit,
+            Tool::Bash,
+            Tool::Wake,
+            Tool::Tasks,
+            Tool::Cancel,
+        ],
     )
 }
 
@@ -1125,8 +1291,11 @@ async fn run_tool(
 struct ModelTask {
     model: Arc<dyn Model>,
     clock: Arc<dyn Clock>,
+    entropy: Arc<dyn Entropy>,
     inbox: mpsc::Sender<Input>,
     config: Arc<ShellConfig>,
+    /// The tools the actor is offered: what its calls may name.
+    tools: Vec<Tool>,
     id: EffectId,
     cancel: CancellationToken,
 }
@@ -1183,7 +1352,11 @@ impl Batcher {
     ///
     /// # Errors
     /// `part`, or the calls with it, would not fit a log line.
-    fn push(&mut self, part: ModelPart) -> Result<Vec<Vec<ModelPart>>, TooLarge> {
+    fn push(
+        &mut self,
+        part: ModelPart,
+        at: &Boundary<'_>,
+    ) -> Result<Vec<Vec<ModelPart>>, TooLarge> {
         // A JSON array of n elements is its brackets, the elements and n - 1
         // commas: at most 2 plus each element and a separator.
         let bytes = json_len(&part).saturating_add(1);
@@ -1196,7 +1369,7 @@ impl Batcher {
             input,
         } = &part
         {
-            let call = proposal(tool_call_id, tool_name, input);
+            let call = proposal(tool_call_id, tool_name, input, at);
             let total = self
                 .proposal_bytes
                 .saturating_add(json_len(&call).saturating_add(1));
@@ -1313,7 +1486,13 @@ impl ModelTask {
                     return Ok(batcher.proposals);
                 }
                 Next::Part(Some(part)) => {
-                    let Ok(ready) = batcher.push(part) else {
+                    let boundary = Boundary {
+                        tools: &self.tools,
+                        text_bytes: limits.wire.max_message_text_bytes,
+                        clock: self.clock.as_ref(),
+                        entropy: self.entropy.as_ref(),
+                    };
+                    let Ok(ready) = batcher.push(part, &boundary) else {
                         stop.cancel();
                         while receiver.recv().await.is_some() {}
                         return Err(TooLarge);
@@ -1416,7 +1595,19 @@ mod tests {
     use verified_domain::id::{CallId, ToolName};
 
     use super::{Batcher, ModelPart, TooLarge, json_len};
-    use crate::payload::ToolInput;
+    use crate::payload::{Boundary, ToolInput};
+    use crate::seam::{OsEntropy, SystemClock};
+    use verified_domain::Tool;
+
+    /// The boundary of an actor offered `read`.
+    fn at() -> Boundary<'static> {
+        Boundary {
+            tools: &[Tool::Read],
+            text_bytes: 1_000,
+            clock: &SystemClock,
+            entropy: &OsEntropy,
+        }
+    }
 
     fn delta(text: &str) -> ModelPart {
         ModelPart::TextDelta {
@@ -1441,7 +1632,7 @@ mod tests {
         let mut batcher = Batcher::new(budget, 64);
         let mut flushed = Vec::new();
         for _ in 0..7u8 {
-            flushed.extend(batcher.push(part.clone()).expect("fits"));
+            flushed.extend(batcher.push(part.clone(), &at()).expect("fits"));
         }
         flushed.extend(batcher.take());
         assert_eq!(
@@ -1453,9 +1644,9 @@ mod tests {
             assert!(json_len(batch) <= budget, "a batch fits the budget");
         }
         let mut by_count = Batcher::new(1 << 20, 2);
-        assert_eq!(by_count.push(part.clone()), Ok(Vec::new()));
+        assert_eq!(by_count.push(part.clone(), &at()), Ok(Vec::new()));
         assert_eq!(
-            by_count.push(part.clone()),
+            by_count.push(part.clone(), &at()),
             Ok(vec![vec![part.clone(), part]])
         );
     }
@@ -1464,7 +1655,7 @@ mod tests {
     fn a_response_too_large_to_record_is_refused() {
         let mut batcher = Batcher::new(64, 64);
         assert_eq!(
-            batcher.push(delta(&"x".repeat(100))),
+            batcher.push(delta(&"x".repeat(100)), &at()),
             Err(TooLarge),
             "one part"
         );
@@ -1472,7 +1663,7 @@ mod tests {
         let mut calls = Batcher::new(one * 2, 64);
         let mut refused = false;
         for index in 0..16 {
-            if calls.push(call(index)).is_err() {
+            if calls.push(call(index), &at()).is_err() {
                 refused = true;
                 break;
             }
