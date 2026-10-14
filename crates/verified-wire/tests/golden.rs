@@ -138,7 +138,7 @@ fn rejects_chunks_that_do_not_fit_without_changing_anything() {
         r#"{"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"{"}"#,
         r#"{"type":"tool-output-available","toolCallId":"toolu_1","output":null}"#,
         r#"{"type":"tool-approval-response","approvalId":"a","approved":true}"#,
-        r#"{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000009","data":{"reason":"failed"}}"#,
+        r#"{"type":"data-turn-end","id":"9","data":{"reason":"failed"}}"#,
     ] {
         assert!(
             transcript.apply(&decode(line)).is_err(),
@@ -162,7 +162,7 @@ fn bounds_turns_parts_part_text_and_errors() {
         ..WireLimits::DEFAULT
     };
     let mut transcript = Transcript::new(&tight);
-    let user = r#"{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000001","data":{"text":"a"}}"#;
+    let user = r#"{"type":"data-user-message","id":"1","data":{"text":"a"}}"#;
     transcript
         .apply(&decode(user))
         .expect("the first turn fits");

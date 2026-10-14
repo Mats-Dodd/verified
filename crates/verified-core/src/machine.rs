@@ -21,36 +21,58 @@
 //! - every grant is the user's command or a rule in force that fits the
 //!   call (A2, `grant_fits`): `apply` refuses any other `Approved`, and
 //!   `decide` grants by the first fitting rule (`rules::grant`) or asks.
-//! - one message, one turn: a `TurnStarted` for a message that already
-//!   started one does not apply (recovery refuses such a log).
+//! - an envelope is delivered at most once (O2, L4): a `Delivered` for an id
+//!   already seen does not apply.
 //! - `decide` and `resume` return records that apply, one after another,
-//!   to the state they were given (never a refusal), and every `RunTool` they
-//!   return is for a call that, once those records apply, is approved and
-//!   dispatched by the very record its effect id names, in the current epoch.
-//!   For `decide` that record is one of the decision's own (`decided`): a
-//!   call is never started twice by later decisions. Only `resume` may rerun
-//!   a call dispatched before it, and only a `Safe` one, in the new epoch
-//!   (`resumed`).
+//!   to the state they were given (never a refusal), and every effect they
+//!   start is licensed (A1, `runs_ok`): a `RunTool` by its call's
+//!   `Dispatched` or a running task's, and a `Stop` by a running stop task's
+//!   `StopSent`, the very record its effect id names, in the current epoch.
+//!   For `decide` that record is one of the decision's own (`decided`):
+//!   nothing is started twice by later decisions. Only `resume` may start
+//!   again what was started before it, and never an `Unsafe` call or task,
+//!   in the new epoch (`resumed`, O1).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
-//! - a result claims no more than v knows (H2, `result_fits`): one the core
-//!   synthesizes is `NotStarted` only for a call never dispatched and
-//!   `Unknown` for one that was, and a run reports only for a dispatched
-//!   call.
+//! - a result claims no more than v knows (H2, `result_fits`, `end_fits`):
+//!   one the core synthesizes is `NotStarted` only for a call never
+//!   dispatched (or a timer that never fired) and `Unknown` for one that
+//!   may have acted, besides what the core itself does at dispatch (a
+//!   background call's start, a `cancel`); a run reports only once
+//!   dispatched.
 //! - cancel is revocation (A3): once a turn's cancel is durable, no step,
 //!   retry, approval or dispatch applies until the turn ends
-//!   (`lemma_nothing_starts_after_a_cancel`).
-//! - a known outcome is never overwritten (H1): no record gives a resolved
-//!   call another result (`lemma_known_outcome_stays`), so of a run's report
-//!   and its deadline (`Expired`), the first to reach the core wins.
+//!   (`lemma_nothing_starts_after_a_cancel`); once a stop is durable, no
+//!   turn, step, approval, dispatch or delivery applies, ever
+//!   (`lemma_nothing_starts_after_a_stop`).
+//! - a known outcome is never overwritten, and a task ends at most once
+//!   (H1): no record gives a resolved call another result
+//!   (`lemma_known_outcome_stays`) or ends an ended task
+//!   (`lemma_a_task_ends_once`), so of a run's report and its deadline
+//!   (`Expired`), the first to reach the core wins.
+//! - the mailbox (L4, H3): every envelope the actor held, carried or still
+//!   waiting, appears once (`actor_ok`, kept by `lemma_actor_keeps`), so a
+//!   model call never carries one twice and a task's notification lands
+//!   once; a step carries exactly the batch at the head of the mailbox, and
+//!   only at a step boundary, once every call of the step before resolved
+//!   (`lemma_carried_at_boundaries`, L5).
 //!
-//! Model-checked, not proved (Stateright, `verified-model`, and the scenario
-//! tests in `tests/turns.rs`):
+//! Model-checked or tested, not proved (Stateright, `verified-model`, and
+//! the scenario tests in `tests/turns.rs` and `tests/actors.rs`):
 //!
 //! - the core has no concurrency rules: every approved call is dispatched
 //!   at once, in proposal order, beside whatever already runs.
 //! - after a crash, a dispatched `Unsafe` call without a result is resolved
 //!   `Unknown`, never rerun or reported otherwise.
+//! - no turn waits on another actor or on a task (B1): a background call
+//!   resolves `Ok` in the decision that dispatches it, and a `send` or
+//!   `spawn` on its delivery, never on another actor's turn.
+//! - the limits (B3): `decide` delivers no envelope past
+//!   `messages_per_actor`, starts no turn past `turns_per_actor`, no task
+//!   past `tasks_per_actor`, and no spawn past `depth`.
+//! - steering: a user's message while a step waits for approvals denies
+//!   them (`NotStarted(Steered)`), and notifications and agents' messages
+//!   that arrive together are carried together.
 
 #![expect(
     clippy::indexing_slicing,
@@ -64,6 +86,7 @@
     clippy::unreachable,
     reason = "vstd's `Ghost(..)` erases to `unreachable!()` in plain builds; ghost code never runs"
 )]
+#![expect(clippy::len_zero, reason = "vstd specifies `len`, not `is_empty`")]
 
 use core::fmt;
 
@@ -74,15 +97,18 @@ use verified_domain::record::class_of;
 use verified_domain::rules::RuleView;
 use verified_domain::shape::ShapeView;
 use verified_domain::{
-    ActorName, CallId, CallIx, Class, EffectId, Epoch, Exit, Failure, Grant, Limit, Limits,
-    Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules,
-    Shape, StepId, TurnId, TurnOutcome, Unstarted,
+    ActorId, ActorName, Address, Body, Born, CallId, CallIx, Class, EffectId, Envelope, EnvelopeId,
+    Epoch, Exit, Failure, Grant, Limit, Limits, Measured, Millis, ModelFault, Payload, Proposal,
+    Record, Request, Reset, Rules, Shape, StepId, TaskId, Tool, TurnId, TurnOutcome, Unstarted,
 };
 
 use crate::effect::{self, Decision, Effect, Outcome, Rejection};
 #[cfg(verus_only)]
 use crate::effect::{Approved, ToolCall};
 use crate::event::{Event, Loaded, ModelExit, Verdict};
+use crate::mailbox::{self, Waiting};
+#[cfg(verus_only)]
+use crate::mailbox::{held, ids_of, is_batch};
 use crate::rules;
 #[cfg(verus_only)]
 use crate::rules::fits;
@@ -152,6 +178,28 @@ pub enum Turn {
 // fold over a log.
 // ---------------------------------------------------------------------------
 
+/// What started a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[verifier::external_derive]
+pub enum Origin {
+    /// A background call (`bash` in the background, `wake`).
+    Call,
+    /// A `StopSent`: the stop of a child.
+    Stop { child: ActorId },
+}
+
+/// A task: an effect that runs on beside the actor's turns, and ends once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[verifier::external_derive]
+pub struct Task {
+    /// The seq of the record that started it: its `TaskId`, and its
+    /// effect's.
+    pub seq: u64,
+    pub class: Class,
+    pub origin: Origin,
+    pub ended: bool,
+}
+
 /// One call as the spec sees it, with how many `Approved` and `Dispatched`
 /// records were applied to it.
 #[expect(missing_debug_implementations, reason = "spec-only type: it holds ghost `nat` values that exist only while verifying")]
@@ -160,7 +208,7 @@ pub struct CallView {
     /// The class of the call's tool; `None` for a request that did not
     /// parse into a known tool's arguments.
     pub class: Option<Class>,
-    /// The call's tool and subject; `None` for an invalid request.
+    /// The call's shape; `None` for an invalid request.
     pub shape: Option<ShapeView>,
     pub approvals: nat,
     pub dispatches: nat,
@@ -171,14 +219,31 @@ pub struct CallView {
 pub struct CoreView {
     pub epoch: u64,
     pub seq: u64,
-    /// Every message that started a turn, in order.
-    pub messages: Seq<MessageId>,
     /// This actor's name, once it is born.
     pub name: Option<Seq<u8>>,
+    /// This actor's address, once it is born.
+    pub actor: Option<ActorId>,
+    /// Its spawn depth (0 until it is born).
+    pub depth: u32,
+    /// A stop was delivered: nothing starts any more (A3).
+    pub stopped: bool,
     /// The rules in force: the seq of their `RulesLoaded` record, and them.
     pub rules: Option<(u64, Seq<RuleView>)>,
+    /// Every envelope delivered, for deduplication.
+    pub envelopes: Seq<EnvelopeId>,
+    /// Envelopes delivered or notifications, not yet carried, in arrival
+    /// order.
+    pub mailbox: Seq<Waiting>,
+    /// Every envelope a model call carried, in order (L4).
+    pub consumed: Seq<EnvelopeId>,
+    /// Turns started.
+    pub turns: nat,
     pub turn: Turn,
     pub calls: Seq<CallView>,
+    /// Every task started, in order.
+    pub tasks: Seq<Task>,
+    /// Every actor a dispatched `spawn` names: the stop cascade's targets.
+    pub children: Seq<ActorId>,
 }
 
 /// Approve before dispatch, at most once each, and only a valid request.
@@ -191,9 +256,9 @@ pub open spec fn call_ok(call: CallView) -> bool {
     &&& (call.shape is None ==> call.approvals == 0)
 }
 
-/// Whether `message` already started a turn.
-pub open spec fn seen_message(messages: Seq<MessageId>, message: MessageId) -> bool {
-    exists|at: int| 0 <= at < messages.len() && #[trigger] messages[at] == message
+/// Whether envelope `id` was already delivered.
+pub open spec fn seen(envelopes: Seq<EnvelopeId>, id: EnvelopeId) -> bool {
+    exists|at: int| 0 <= at < envelopes.len() && #[trigger] envelopes[at] == id
 }
 
 /// A2: a grant names the user's command, or a rule of the rules in force
@@ -223,9 +288,9 @@ pub open spec fn resolved(calls: Seq<CallView>, from: int, to: int) -> bool {
     forall|index: int| from <= index < to ==> (#[trigger] calls[index]).phase is Resolved
 }
 
-/// The invariant of every state a log reaches: the ledger holds, and only
-/// the current step's calls may be unresolved (none, outside `Tools`).
-pub open spec fn state_ok(view: CoreView) -> bool {
+/// The turn's part of the invariant: the ledger holds, and only the
+/// current step's calls may be unresolved (none, outside `Tools`).
+pub open spec fn turn_ok(view: CoreView) -> bool {
     &&& ledger_ok(view.calls)
     &&& match view.turn {
         Turn::Idle => resolved(view.calls, 0, view.calls.len() as int),
@@ -242,6 +307,39 @@ pub open spec fn state_ok(view: CoreView) -> bool {
             }
         },
     }
+}
+
+/// The actor's part of the invariant: a turn that has not called its model
+/// yet has mail to carry; tasks are named by distinct seqs of earlier
+/// records; and every envelope the actor ever held (carried, then still
+/// waiting) appears once (L4), each a delivered one or the notification of a
+/// task that ended (H3).
+pub open spec fn actor_ok(view: CoreView) -> bool {
+    let ids = held(view.consumed, view.mailbox);
+    &&& match view.turn {
+        Turn::Open(open) => open.stage is Starting ==> view.mailbox.len() > 0,
+        Turn::Idle => true,
+    }
+    &&& forall|at: int| 0 <= at < view.tasks.len() ==> (#[trigger] view.tasks[at]).seq < view.seq
+    &&& forall|first: int, second: int|
+        0 <= first < second < view.tasks.len() ==> (#[trigger] view.tasks[first]).seq < (
+        #[trigger] view.tasks[second]).seq
+    &&& ids.no_duplicates()
+    &&& forall|at: int| 0 <= at < ids.len() ==> held_ok(view, #[trigger] ids[at])
+}
+
+/// Where an envelope the actor holds came from: a delivery, or the end of
+/// a task that is over (its notification).
+pub open spec fn held_ok(view: CoreView, id: EnvelopeId) -> bool {
+    match id {
+        EnvelopeId::Task(task) => task.0 < view.seq && ended(view.tasks, task.0),
+        EnvelopeId::User(_) | EnvelopeId::Minted { .. } => seen(view.envelopes, id),
+    }
+}
+
+/// The invariant of every state a log reaches.
+pub open spec fn state_ok(view: CoreView) -> bool {
+    turn_ok(view) && actor_ok(view)
 }
 
 pub open spec fn fresh_call(shape: Option<ShapeView>) -> CallView {
@@ -261,11 +359,19 @@ pub open spec fn initial() -> CoreView {
     CoreView {
         epoch: 0,
         seq: 0,
-        messages: Seq::empty(),
         name: None,
+        actor: None,
+        depth: 0,
+        stopped: false,
         rules: None,
+        envelopes: Seq::empty(),
+        mailbox: Seq::empty(),
+        consumed: Seq::empty(),
+        turns: 0,
         turn: Turn::Idle,
         calls: Seq::empty(),
+        tasks: Seq::empty(),
+        children: Seq::empty(),
     }
 }
 
@@ -282,16 +388,39 @@ pub open spec fn proposed<P: Payload>(calls: Seq<Proposal<P>>) -> Seq<CallView> 
     Seq::new(calls.len(), |index: int| fresh_call(request_shape(calls[index].request)))
 }
 
+/// Whether a call of `shape` starts a task.
+pub open spec fn background(shape: Option<ShapeView>) -> bool {
+    match shape {
+        Some(shape) => shape.background,
+        None => false,
+    }
+}
+
+/// Whether a call of `shape` cancels a task.
+pub open spec fn cancels(shape: Option<ShapeView>) -> bool {
+    match shape {
+        Some(shape) => shape.tool == Tool::Cancel,
+        None => false,
+    }
+}
+
 /// H2: a result claims no more than v knows. One the core synthesizes
 /// (`reported` false) is `NotStarted` only for a call never dispatched, and
-/// `Unknown` for one that was: a dispatched call may have acted. A run's
-/// own report (`reported`) comes only for a dispatched call; whether a run
-/// that says it never began really did not act is the world's to tell, and
-/// the replay checks it.
-pub open spec fn result_fits(phase: Phase, exit: Exit, reported: bool) -> bool {
+/// `Unknown` for one that was (a dispatched call may have acted), except
+/// for what the core itself did at dispatch: a background call's start
+/// (`Ok`: its task runs) and a `cancel` (`Ok` or `Failed`). A run's own
+/// report (`reported`) comes only for a dispatched call; whether a run that
+/// says it never began really did not act is the world's to tell, and the
+/// replay checks it.
+pub open spec fn result_fits(phase: Phase, shape: Option<ShapeView>, exit: Exit, reported: bool) -> bool {
     match phase {
         Phase::Proposed | Phase::Approved => !reported && exit is NotStarted,
-        Phase::Dispatched { .. } => reported || exit is Unknown,
+        Phase::Dispatched { .. } => {
+            ||| reported
+            ||| exit is Unknown
+            ||| (exit is Ok && background(shape))
+            ||| ((exit is Ok || exit is Failed) && cancels(shape))
+        },
         Phase::Resolved => false,
     }
 }
@@ -301,48 +430,179 @@ pub open spec fn ending_fits(intent: Intent, outcome: TurnOutcome) -> bool {
     (intent is Cancel) == (outcome is Cancelled)
 }
 
+/// Born and not stopped: the actor may start things.
+pub open spec fn live(view: CoreView) -> bool {
+    view.actor is Some && !view.stopped
+}
+
+/// Whether a task started by record `seq` is running.
+pub open spec fn running(tasks: Seq<Task>, seq: u64) -> bool {
+    exists|at: int| 0 <= at < tasks.len() && (#[trigger] tasks[at]).seq == seq && !tasks[at].ended
+}
+
+/// Whether every task started by record `seq` has ended (true when there is
+/// none).
+pub open spec fn ended(tasks: Seq<Task>, seq: u64) -> bool {
+    forall|at: int| 0 <= at < tasks.len() && (#[trigger] tasks[at]).seq == seq ==> tasks[at].ended
+}
+
+/// `tasks` with the task started by record `seq` ended.
+pub open spec fn end_task(tasks: Seq<Task>, seq: u64) -> Seq<Task> {
+    Seq::new(
+        tasks.len(),
+        |at: int| if tasks[at].seq == seq {
+            Task { ended: true, ..tasks[at] }
+        } else {
+            tasks[at]
+        },
+    )
+}
+
+/// H2 for a task's end the core synthesizes: `Unknown` (it may have acted),
+/// or `NotStarted` only for a `Safe` one (a timer has no effect to have
+/// had).
+pub open spec fn end_fits(tasks: Seq<Task>, seq: u64, exit: Exit, reported: bool) -> bool {
+    ||| reported
+    ||| exit is Unknown
+    ||| (exit is NotStarted && forall|at: int|
+        0 <= at < tasks.len() && (#[trigger] tasks[at]).seq == seq ==> tasks[at].class == Class::Safe)
+}
+
+/// Whether a stop task for `child` exists.
+pub open spec fn stopping(tasks: Seq<Task>, child: ActorId) -> bool {
+    exists|at: int| 0 <= at < tasks.len() && (#[trigger] tasks[at]).origin == Origin::Stop { child }
+}
+
+/// Whether a dispatched `spawn` named `child`.
+pub open spec fn spawned(children: Seq<ActorId>, child: ActorId) -> bool {
+    exists|at: int| 0 <= at < children.len() && #[trigger] children[at] == child
+}
+
+/// What an envelope's text adds to the conversation.
+pub open spec fn body_bytes<P: Payload>(body: Body<P>) -> u64 {
+    match body {
+        Body::Text(text) => text.bytes,
+        Body::Stop => 0,
+    }
+}
+
+/// What a task's end adds to the conversation.
+pub open spec fn output_bytes<T>(output: Option<Measured<T>>) -> u64 {
+    match output {
+        Some(output) => output.bytes,
+        None => 0,
+    }
+}
+
+/// The batch carried by a step that starts from `stage`, if `carries` is
+/// the one it must carry: nothing for a retry, the batch at the head of the
+/// mailbox otherwise (and something, for a turn's first step).
+pub open spec fn carries_fit(stage: Stage, mailbox: Seq<Waiting>, carries: Seq<EnvelopeId>) -> bool {
+    match stage {
+        Stage::Backoff { .. } => carries.len() == 0,
+        Stage::Starting => carries.len() > 0 && is_batch(mailbox, carries.len() as int) && carries
+            == ids_of(mailbox, carries.len() as int),
+        Stage::Tools => is_batch(mailbox, carries.len() as int) && carries == ids_of(
+            mailbox,
+            carries.len() as int,
+        ),
+        Stage::Model { .. } => false,
+    }
+}
+
+/// What a `Dispatched` of call `index` does besides its phase: a background
+/// call starts a task, and a `spawn` names a child.
+pub open spec fn dispatch(view: CoreView, index: int) -> CoreView {
+    let shape = view.calls[index].shape;
+    CoreView {
+        tasks: if background(shape) {
+            view.tasks.push(
+                Task {
+                    seq: view.seq,
+                    class: class_of(shape->Some_0.tool),
+                    origin: Origin::Call,
+                    ended: false,
+                },
+            )
+        } else {
+            view.tasks
+        },
+        children: match shape {
+            Some(shape) => match shape.child {
+                Some(child) => view.children.push(child),
+                None => view.children,
+            },
+            None => view.children,
+        },
+        ..view
+    }
+}
+
 /// What one record does to the abstract state; `None` when it cannot
 /// follow it.
 pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Option<CoreView> {
     let seq = (view.seq + 1) as u64;
     match record {
         Record::Born { born } => if view.name is None {
-            Some(CoreView { seq, name: Some(born.name@), ..view })
+            Some(CoreView { seq, name: Some(born.name@), actor: Some(born.actor), depth: born.depth, ..view })
         } else {
             None
         },
         Record::RulesLoaded { rules, .. } => Some(
             CoreView { seq, rules: Some((view.seq, rules@)), ..view },
         ),
-        Record::TurnStarted { turn, message, .. } => match view.turn {
-            Turn::Idle => if seen_message(view.messages, message) {
-                None
-            } else {
+        Record::Delivered { envelope } => if view.actor == Some(envelope.to) && !view.stopped
+            && !(envelope.id is Task) && !seen(view.envelopes, envelope.id) {
+            let envelopes = view.envelopes.push(envelope.id);
+            match envelope.body {
+                Body::Text(text) => Some(
+                    CoreView {
+                        seq,
+                        envelopes,
+                        mailbox: view.mailbox.push(
+                            Waiting { id: envelope.id, user: envelope.from is User, bytes: text.bytes },
+                        ),
+                        ..view
+                    },
+                ),
+                Body::Stop => Some(CoreView { seq, envelopes, stopped: true, ..view }),
+            }
+        } else {
+            None
+        },
+        Record::TurnStarted { turn } => match view.turn {
+            Turn::Idle => if live(view) && turn.0 == view.seq && view.mailbox.len() > 0 {
                 Some(
-                CoreView {
-                    seq,
-                    messages: view.messages.push(message),
-                    turn: Turn::Open(
-                        Open {
-                            turn,
-                            step: StepId { turn, index: 0 },
-                            retries: 0,
-                            stage: Stage::Starting,
-                            intent: Intent::Proceed,
-                            first_call: 0,
-                        },
-                    ),
-                    calls: Seq::empty(),
-                    ..view
-                },
-            )
+                    CoreView {
+                        seq,
+                        turns: view.turns + 1,
+                        turn: Turn::Open(
+                            Open {
+                                turn,
+                                step: StepId { turn, index: 0 },
+                                retries: 0,
+                                stage: Stage::Starting,
+                                intent: Intent::Proceed,
+                                first_call: 0,
+                            },
+                        ),
+                        calls: Seq::empty(),
+                        ..view
+                    },
+                )
+            } else {
+                None
             },
             Turn::Open(_) => None,
         },
-        Record::StepStarted { step } => match view.turn {
+        Record::StepStarted { step, carries } => match view.turn {
             Turn::Idle => None,
             Turn::Open(open) => {
-                if step.turn != open.turn || open.intent is Cancel {
+                if step.turn != open.turn || open.intent is Cancel || view.stopped || !carries_fit(
+                    open.stage,
+                    view.mailbox,
+                    carries@,
+                ) {
                     None
                 } else {
                     let retries: Option<usize> = match open.stage {
@@ -375,6 +635,8 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                                 turn: Turn::Open(
                                     Open { step, retries, stage: Stage::Model { since: view.seq }, ..open },
                                 ),
+                                mailbox: view.mailbox.skip(carries@.len() as int),
+                                consumed: view.consumed + carries@,
                                 ..view
                             },
                         ),
@@ -393,7 +655,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         },
         Record::StepReset { step, reason } => match view.turn {
             Turn::Open(open) => {
-                if !(open.stage is Model) || open.intent is Cancel || step != open.step {
+                if !(open.stage is Model) || open.intent is Cancel || view.stopped || step != open.step {
                     None
                 } else {
                     let retries = match reason {
@@ -445,8 +707,8 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         Record::Approved { call, by } => match view.turn {
             Turn::Open(open) => {
                 let index = call.0 as int;
-                if open.stage is Tools && open.intent is Proceed && open.first_call <= index
-                    < view.calls.len() && view.calls[index].phase is Proposed
+                if open.stage is Tools && open.intent is Proceed && !view.stopped && open.first_call
+                    <= index < view.calls.len() && view.calls[index].phase is Proposed
                     && view.calls[index].shape is Some && grant_fits(by, view, index) {
                     Some(
                         CoreView {
@@ -471,8 +733,8 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         Record::Dispatched { call } => match view.turn {
             Turn::Open(open) => {
                 let index = call.0 as int;
-                if open.stage is Tools && open.intent is Proceed && open.first_call <= index
-                    < view.calls.len() && view.calls[index].phase is Approved {
+                if open.stage is Tools && open.intent is Proceed && !view.stopped && open.first_call
+                    <= index < view.calls.len() && view.calls[index].phase is Approved {
                     Some(
                         CoreView {
                             seq,
@@ -484,7 +746,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                                     ..view.calls[index]
                                 },
                             ),
-                            ..view
+                            ..dispatch(view, index)
                         },
                     )
                 } else {
@@ -499,6 +761,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                 if open.stage is Tools && open.first_call <= index < view.calls.len()
                     && !(view.calls[index].phase is Resolved) && result_fits(
                     view.calls[index].phase,
+                    view.calls[index].shape,
                     exit,
                     output is Some,
                 ) {
@@ -517,6 +780,41 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                 }
             },
             Turn::Idle => None,
+        },
+        Record::TaskEnded { task, exit, output } => if running(view.tasks, task.0) && end_fits(
+            view.tasks,
+            task.0,
+            exit,
+            output is Some,
+        ) {
+            Some(
+                CoreView {
+                    seq,
+                    tasks: end_task(view.tasks, task.0),
+                    mailbox: view.mailbox.push(
+                        Waiting { id: EnvelopeId::Task(task), user: false, bytes: output_bytes(output) },
+                    ),
+                    ..view
+                },
+            )
+        } else {
+            None
+        },
+        Record::StopSent { child } => if view.stopped && spawned(view.children, child) && !stopping(
+            view.tasks,
+            child,
+        ) {
+            Some(
+                CoreView {
+                    seq,
+                    tasks: view.tasks.push(
+                        Task { seq: view.seq, class: Class::Keyed, origin: Origin::Stop { child }, ended: false },
+                    ),
+                    ..view
+                },
+            )
+        } else {
+            None
         },
         Record::CancelRequested { turn } => match view.turn {
             Turn::Open(open) => if turn == open.turn && open.intent is Proceed {
@@ -596,26 +894,64 @@ pub open spec fn rerun<P: Payload>(start: CoreView, end: CoreView, call: ToolCal
     &&& end.calls[index].class != Some(Class::Unsafe)
 }
 
-/// Every `RunTool` in `effects` is licensed by `end` and dispatched by the
-/// decision itself, or (only if `reruns`) a rerun after recovery.
+/// Task `at` of `end` may run as effect `id`: it is running, started by a
+/// call, and `id` names its starting record in the current epoch; and that
+/// record is one of the decision's own, or (only if `reruns`) the task is
+/// not `Unsafe` and runs again in a new epoch.
+pub open spec fn task_runs(start: CoreView, end: CoreView, at: int, id: EffectId, reruns: bool) -> bool {
+    &&& 0 <= at < end.tasks.len()
+    &&& end.tasks[at].seq == id.seq
+    &&& !end.tasks[at].ended
+    &&& id.epoch.0 == end.epoch
+    &&& (id.seq >= start.seq || (reruns && end.epoch > start.epoch && end.tasks[at].class
+        != Class::Unsafe))
+}
+
+/// A1 for a tool run: licensed by its call's `Dispatched`, or by a running
+/// task's.
+pub open spec fn run_ok<P: Payload>(
+    start: CoreView,
+    end: CoreView,
+    call: ToolCall<Approved, P>,
+    reruns: bool,
+) -> bool {
+    ||| (licensed(end, call) && (fresh(start, call) || (reruns && rerun(start, end, call))))
+    ||| exists|at: int| #[trigger] task_runs(start, end, at, call.spec_effect(), reruns)
+        && end.tasks[at].origin is Call
+}
+
+/// A1 for a stop: licensed by a running stop task for `child`, whose
+/// `StopSent` `id` names.
+pub open spec fn stop_ok(start: CoreView, end: CoreView, id: EffectId, child: ActorId, reruns: bool) -> bool {
+    exists|at: int| #[trigger] task_runs(start, end, at, id, reruns) && end.tasks[at].origin
+        == Origin::Stop { child }
+}
+
+/// Every `RunTool` and `Stop` in `effects` is licensed by `end` and
+/// started by the decision itself, or (only if `reruns`) a rerun after
+/// recovery.
 pub open spec fn runs_ok<P: Payload>(
     start: CoreView,
     end: CoreView,
     effects: Seq<Effect<P>>,
     reruns: bool,
 ) -> bool {
-    forall|index: int|
-        0 <= index < effects.len() && (#[trigger] effects[index]) is RunTool ==> {
-            let call = effects[index]->call;
-            &&& licensed(end, call)
-            &&& (fresh(start, call) || (reruns && rerun(start, end, call)))
-        }
+    forall|index: int| 0 <= index < effects.len() ==> effect_ok(start, end, #[trigger] effects[index], reruns)
+}
+
+/// `effect` is licensed, if it is a tool run or a stop.
+pub open spec fn effect_ok<P: Payload>(start: CoreView, end: CoreView, effect: Effect<P>, reruns: bool) -> bool {
+    match effect {
+        Effect::RunTool { call } => run_ok(start, end, call, reruns),
+        Effect::Stop { id, child } => stop_ok(start, end, id, child, reruns),
+        _ => true,
+    }
 }
 
 /// What `decide` promises: the records apply to `start` one after another,
-/// and every tool it starts is licensed by the result and dispatched by one
-/// of its own records. So a call runs at most once per `Dispatched`, and
-/// nothing a decision did not dispatch is ever started by it.
+/// and every effect it starts is licensed by the result and started by one
+/// of its own records. So an effect runs at most once per licensing record,
+/// and nothing a decision did not license is ever started by it.
 pub open spec fn decided<P: Payload>(start: CoreView, decision: Decision<P>) -> bool {
     match applies(start, decision.records@) {
         Some(end) => state_ok(end) && runs_ok(start, end, decision.effects@, false),
@@ -623,8 +959,8 @@ pub open spec fn decided<P: Payload>(start: CoreView, decision: Decision<P>) -> 
     }
 }
 
-/// What `resume` promises: as `decided`, except that a call dispatched
-/// before the crash may run again if it is `Safe`, in the new epoch.
+/// What `resume` promises: as `decided`, except that an effect licensed
+/// before the crash may run again if it is not `Unsafe`, in the new epoch.
 pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> bool {
     match applies(start, decision.records@) {
         Some(end) => state_ok(end) && runs_ok(start, end, decision.effects@, true),
@@ -640,8 +976,8 @@ pub open spec fn cancelled(view: CoreView, turn: TurnId) -> bool {
     }
 }
 
-/// A record that starts something: a model call, a retry, an approval, a
-/// dispatch.
+/// A record that starts something within a turn: a model call, a retry,
+/// an approval, a dispatch.
 pub open spec fn starts<P: Payload>(record: Record<P>) -> bool {
     ||| record is StepStarted
     ||| record is StepReset
@@ -693,6 +1029,50 @@ pub proof fn lemma_nothing_starts_after_a_cancel<P: Payload>(
     }
 }
 
+/// A record that starts anything at all for an actor: what a stop revokes.
+/// A turn, everything `starts`, and the delivery of more work.
+pub open spec fn acts<P: Payload>(record: Record<P>) -> bool {
+    ||| starts(record)
+    ||| record is TurnStarted
+    ||| record is Delivered
+}
+
+/// A3 for a stopped actor, one record: once its stop is durable, no turn,
+/// step, retry, approval, dispatch or delivery applies, and it stays
+/// stopped.
+pub proof fn lemma_stop_revokes<P: Payload>(view: CoreView, record: Record<P>)
+    requires
+        view.stopped,
+        spec_apply(view, record) is Some,
+    ensures
+        !acts(record),
+        spec_apply(view, record)->0.stopped,
+{
+}
+
+/// A3 for a stopped actor, a log: after a durable stop, no record starts
+/// anything.
+pub proof fn lemma_nothing_starts_after_a_stop<P: Payload>(view: CoreView, records: Seq<Record<P>>)
+    requires
+        view.stopped,
+        applies(view, records) is Some,
+    ensures
+        forall|at: int| 0 <= at < records.len() ==> !acts(#[trigger] records[at]),
+        applies(view, records)->0.stopped,
+    decreases records.len(),
+{
+    if records.len() > 0 {
+        let before = records.drop_last();
+        lemma_nothing_starts_after_a_stop(view, before);
+        lemma_stop_revokes(applies(view, before)->0, records.last());
+        assert forall|at: int| 0 <= at < records.len() implies !acts(#[trigger] records[at]) by {
+            if at < before.len() {
+                assert(before[at] == records[at]);
+            }
+        }
+    }
+}
+
 /// H1: a known outcome is never overwritten. Within its turn, no record
 /// gives a resolved call another result, and none changes it.
 pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, record: Record<P>)
@@ -706,6 +1086,188 @@ pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, r
         index < spec_apply(view, record)->0.calls.len(),
         spec_apply(view, record)->0.calls[index] == view.calls[index],
 {
+}
+
+/// H1 for tasks: a task ends at most once. Once every task started by
+/// record `seq` (an earlier one) has ended, no `TaskEnded` for it applies,
+/// and none starts again.
+pub proof fn lemma_a_task_ends_once<P: Payload>(view: CoreView, seq: u64, record: Record<P>)
+    requires
+        seq < view.seq,
+        ended(view.tasks, seq),
+        spec_apply(view, record) is Some,
+    ensures
+        !(record is TaskEnded && record->TaskEnded_task.0 == seq),
+        ended(spec_apply(view, record)->0.tasks, seq),
+{
+    let next = spec_apply(view, record)->0;
+    assert forall|at: int| 0 <= at < next.tasks.len() && (#[trigger] next.tasks[at]).seq == seq implies next.tasks[at].ended by {
+        if at < view.tasks.len() {
+            assert(view.tasks[at].seq == seq);
+        }
+    }
+}
+
+/// L5, the core's part: an envelope reaches the model only at a step
+/// boundary: a step that carries one starts a turn, or follows a step whose
+/// calls have all resolved.
+pub proof fn lemma_carried_at_boundaries<P: Payload>(view: CoreView, record: Record<P>)
+    requires
+        record is StepStarted,
+        record->StepStarted_carries@.len() > 0,
+        spec_apply(view, record) is Some,
+    ensures
+        view.turn is Open,
+        view.turn->Open_0.stage is Starting || (view.turn->Open_0.stage is Tools && resolved(
+            view.calls,
+            view.turn->Open_0.first_call as int,
+            view.calls.len() as int,
+        )),
+{
+}
+
+/// The batch at the head of a mailbox has one size.
+pub proof fn lemma_batch_unique(mailbox: Seq<Waiting>, first: int, second: int)
+    requires
+        is_batch(mailbox, first),
+        is_batch(mailbox, second),
+    ensures
+        first == second,
+{
+    if mailbox.len() > 0 && !mailbox[0].user {
+        if first < second {
+            assert(!mailbox[first].user);
+        } else if second < first {
+            assert(!mailbox[second].user);
+        }
+    }
+}
+
+/// Appending an element not in a sequence without duplicates keeps it
+/// without duplicates.
+proof fn lemma_push_distinct<T>(items: Seq<T>, item: T)
+    requires
+        items.no_duplicates(),
+        forall|at: int| 0 <= at < items.len() ==> items[at] != item,
+    ensures
+        items.push(item).no_duplicates(),
+{
+    let pushed = items.push(item);
+    assert forall|first: int, second: int|
+        0 <= first < pushed.len() && 0 <= second < pushed.len() && first != second implies pushed[first]
+        != pushed[second] by {
+        if first < items.len() && second < items.len() {
+            assert(pushed[first] == items[first] && pushed[second] == items[second]);
+        }
+    }
+}
+
+/// A record that changes none of the actor's mail and tasks keeps its
+/// invariant.
+proof fn lemma_actor_frame(view: CoreView, next: CoreView)
+    requires
+        actor_ok(view),
+        next.consumed == view.consumed,
+        next.mailbox == view.mailbox,
+        next.tasks == view.tasks,
+        next.seq >= view.seq,
+        forall|id: EnvelopeId| seen(view.envelopes, id) ==> seen(next.envelopes, id),
+        match next.turn {
+            Turn::Open(open) => open.stage is Starting ==> next.mailbox.len() > 0,
+            Turn::Idle => true,
+        },
+    ensures
+        actor_ok(next),
+{
+    let ids = held(view.consumed, view.mailbox);
+    assert forall|at: int| 0 <= at < ids.len() implies held_ok(next, #[trigger] ids[at]) by {
+        assert(held_ok(view, ids[at]));
+    }
+}
+
+/// Every record that applies keeps the actor's part of the invariant: in
+/// particular, no envelope is ever carried twice (L4), and a task's
+/// notification lands once (H3).
+pub proof fn lemma_actor_keeps<P: Payload>(view: CoreView, record: Record<P>)
+    requires
+        actor_ok(view),
+        view.seq < u64::MAX,
+        spec_apply(view, record) is Some,
+    ensures
+        actor_ok(spec_apply(view, record)->0),
+{
+    let next = spec_apply(view, record)->0;
+    let ids = held(view.consumed, view.mailbox);
+    match record {
+        Record::Delivered { envelope } => {
+            assert forall|id: EnvelopeId| seen(view.envelopes, id) implies seen(next.envelopes, id) by {
+                let at = choose|at: int| 0 <= at < view.envelopes.len() && view.envelopes[at] == id;
+                assert(next.envelopes[at] == id);
+            }
+            assert(next.envelopes[view.envelopes.len() as int] == envelope.id);
+            if next.mailbox == view.mailbox {
+                lemma_actor_frame(view, next);
+            } else {
+                let added = ids_of(next.mailbox, next.mailbox.len() as int);
+                assert(held(next.consumed, next.mailbox) =~= ids.push(envelope.id));
+                assert forall|at: int| 0 <= at < ids.len() implies ids[at] != envelope.id by {
+                    assert(held_ok(view, ids[at]));
+                }
+                lemma_push_distinct(ids, envelope.id);
+                let next_ids = held(next.consumed, next.mailbox);
+                assert forall|at: int| 0 <= at < next_ids.len() implies held_ok(next, #[trigger] next_ids[at]) by {
+                    if at < ids.len() {
+                        assert(next_ids[at] == ids[at]);
+                        assert(held_ok(view, ids[at]));
+                    }
+                }
+            }
+        },
+        Record::StepStarted { carries, .. } => {
+            let n = carries@.len() as int;
+            assert(n <= view.mailbox.len());
+            assert(held(next.consumed, next.mailbox) =~= ids);
+            assert forall|at: int| 0 <= at < ids.len() implies held_ok(next, #[trigger] ids[at]) by {
+                assert(held_ok(view, ids[at]));
+            }
+        },
+        Record::TaskEnded { task, output, .. } => {
+            let found = choose|at: int| 0 <= at < view.tasks.len() && (#[trigger] view.tasks[at]).seq == task.0 && !view.tasks[at].ended;
+            let notice = EnvelopeId::Task(task);
+            assert(held(next.consumed, next.mailbox) =~= ids.push(notice));
+            assert forall|at: int| 0 <= at < ids.len() implies ids[at] != notice by {
+                assert(held_ok(view, ids[at]));
+                if ids[at] == notice {
+                    assert(view.tasks[found].ended);
+                }
+            }
+            lemma_push_distinct(ids, notice);
+            let next_ids = held(next.consumed, next.mailbox);
+            assert forall|at: int| 0 <= at < next_ids.len() implies held_ok(next, #[trigger] next_ids[at]) by {
+                if at < ids.len() {
+                    assert(next_ids[at] == ids[at]);
+                    assert(held_ok(view, ids[at]));
+                } else {
+                    assert(next_ids[at] == notice);
+                }
+            }
+        },
+        Record::Dispatched { .. } | Record::StopSent { .. } => {
+            assert forall|at: int| 0 <= at < ids.len() implies held_ok(next, #[trigger] ids[at]) by {
+                assert(held_ok(view, ids[at]));
+                if let EnvelopeId::Task(task) = ids[at] {
+                    assert forall|t: int| 0 <= t < next.tasks.len() && (#[trigger] next.tasks[t]).seq == task.0 implies next.tasks[t].ended by {
+                        if t < view.tasks.len() {
+                            assert(view.tasks[t] == next.tasks[t]);
+                        }
+                    }
+                }
+            }
+        },
+        _ => {
+            lemma_actor_frame(view, next);
+        },
+    }
 }
 
 proof fn lemma_refusal_sticks<P: Payload>(view: CoreView, log: Seq<Record<P>>, at: int)
@@ -781,10 +1343,18 @@ impl<P: Payload> Call<P> {
             None => None,
         };
         let shape = match &self.shape {
-            Some(shape) => Some(Shape { tool: shape.tool, subject: shape.subject.clone() }),
+            Some(shape) => Some(shape.copy()),
             None => None,
         };
         Call { id: self.id.clone(), args, class: self.class, shape, phase: self.phase }
+    }
+
+    /// Whether the call is a `spawn`.
+    const fn spawns(&self) -> bool {
+        match &self.shape {
+            Some(shape) => shape.child().is_some(),
+            None => false,
+        }
     }
 }
 
@@ -831,12 +1401,27 @@ pub enum Violation {
     WrongEnding,
     /// A counter would overflow.
     Overflow,
-    /// A turn starts from a message that already started one.
-    DuplicateMessage,
+    /// An envelope is delivered a second time.
+    DuplicateEnvelope,
     /// A grant names a rule that is not in force or does not fit the call.
     WrongGrant,
     /// The actor is born a second time.
     Reborn,
+    /// The record needs the actor born, and it is not.
+    Unborn,
+    /// The actor is stopped: nothing starts for it.
+    Stopped,
+    /// An envelope for another actor, or one only this log may mint.
+    Mismatch,
+    /// A turn starts with nothing in the mailbox.
+    NoMail,
+    /// A step carries other than the batch at the head of the mailbox.
+    WrongCarry,
+    /// No running task has that id.
+    UnknownTask,
+    /// A stop of an actor this one did not spawn, or stops already, or
+    /// sent while this one is not stopped.
+    WrongStop,
     /// A result claims more than v knows (H2): a synthesized `NotStarted`
     /// for a dispatched call, anything but `NotStarted` for an undispatched
     /// one, or a run's report for a call never dispatched.
@@ -851,16 +1436,32 @@ pub struct Corrupt {
     pub violation: Violation,
 }
 
-/// The agent's state for one session.
+/// What a call-started task runs: its call's arguments, kept past its turn
+/// (a `Safe` one reruns after a crash).
+struct TaskRun<P: Payload> {
+    call: CallIx,
+    id: CallId,
+    args: P::Args,
+}
+
+/// The agent's state for one actor.
 pub struct Core<P: Payload> {
     limits: Limits,
     epoch: Epoch,
     /// Records applied so far: the sequence number of the next one.
     seq: u64,
-    /// Every message the session accepted, for deduplication.
-    messages: Vec<MessageId>,
-    /// This actor's name, once it is born.
-    name: Option<ActorName>,
+    /// Who this actor is, once it is born.
+    born: Option<Born>,
+    /// A stop was delivered.
+    stopped: bool,
+    /// Every envelope delivered, for deduplication.
+    envelopes: Vec<EnvelopeId>,
+    /// Delivered or notified, not yet carried, in arrival order.
+    mailbox: Vec<Waiting>,
+    /// Ghost: every envelope a step carried.
+    consumed: Ghost<Seq<EnvelopeId>>,
+    /// Turns started.
+    turns: u64,
     /// The rules in force and the seq of the `RulesLoaded` that holds them.
     rules: Option<(u64, Rules)>,
     turn: Turn,
@@ -872,6 +1473,12 @@ pub struct Core<P: Payload> {
     step_base: Context,
     /// Ghost audit of the calls: approvals and dispatches applied.
     ledger: Ghost<Seq<CallView>>,
+    /// Every task started, in order.
+    tasks: Vec<Task>,
+    /// What each task runs, beside `tasks` (`None` for a stop).
+    runs: Vec<Option<TaskRun<P>>>,
+    /// Every actor a dispatched `spawn` names.
+    children: Vec<ActorId>,
 }
 
 impl<P: Payload> View for Core<P> {
@@ -881,17 +1488,31 @@ impl<P: Payload> View for Core<P> {
         CoreView {
             epoch: self.epoch.0,
             seq: self.seq,
-            messages: self.messages@,
-            name: match &self.name {
-                Some(name) => Some(name@),
+            name: match &self.born {
+                Some(born) => Some(born.name@),
                 None => None,
             },
+            actor: match &self.born {
+                Some(born) => Some(born.actor),
+                None => None,
+            },
+            depth: match &self.born {
+                Some(born) => born.depth,
+                None => 0,
+            },
+            stopped: self.stopped,
             rules: match &self.rules {
                 Some((seq, rules)) => Some((*seq, rules@)),
                 None => None,
             },
+            envelopes: self.envelopes@,
+            mailbox: self.mailbox@,
+            consumed: self.consumed@,
+            turns: self.turns as nat,
             turn: self.turn,
             calls: self.ledger@,
+            tasks: self.tasks@,
+            children: self.children@,
         }
     }
 }
@@ -966,7 +1587,8 @@ impl<P: Payload> Plan<P> {
         &&& applies(self.start@, self.records@) == Some(self.scratch@)
         &&& self.from == self.start@.seq
         &&& forall|index: int|
-            0 <= index < self.effects@.len() ==> !((#[trigger] self.effects@[index]) is RunTool)
+            0 <= index < self.effects@.len() ==> !((#[trigger] self.effects@[index]) is RunTool) && !(
+            self.effects@[index] is Stop)
     }
 
     /// Appends `record`, applying it to the scratch copy, and returns its
@@ -997,11 +1619,13 @@ impl<P: Payload> Plan<P> {
         seq
     }
 
-    /// Adds an effect that is not a tool run (those come from `finish`).
+    /// Adds an effect that is neither a tool run nor a stop (those come
+    /// from `finish`).
     fn effect(&mut self, effect: Effect<P>)
         requires
             old(self).inv(),
             !(effect is RunTool),
+            !(effect is Stop),
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
@@ -1036,13 +1660,21 @@ impl<P: Payload> Plan<P> {
             old(self).scratch@.turn is Open,
             old(self).scratch@.turn->Open_0.stage is Tools,
             old(self).scratch@.turn->Open_0.first_call <= index < old(self).scratch@.calls.len(),
-            result_fits(old(self).scratch@.calls[index as int].phase, exit, false),
+            result_fits(
+                old(self).scratch@.calls[index as int].phase,
+                old(self).scratch@.calls[index as int].shape,
+                exit,
+                false,
+            ),
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
             final(self).from == old(self).from,
             final(self).scratch@.turn == old(self).scratch@.turn,
             final(self).scratch@.epoch == old(self).scratch@.epoch,
+            final(self).scratch@.stopped == old(self).scratch@.stopped,
+            final(self).scratch@.tasks == old(self).scratch@.tasks,
+            final(self).scratch@.children == old(self).scratch@.children,
             final(self).scratch@.calls.len() == old(self).scratch@.calls.len(),
             final(self).scratch@.calls[index as int].phase is Resolved,
             forall|other: int|
@@ -1050,6 +1682,47 @@ impl<P: Payload> Plan<P> {
                 #[trigger] final(self).scratch@.calls[other]) == old(self).scratch@.calls[other],
     {
         self.emit(Record::ToolResult { call: CallIx(index), exit, output: None });
+    }
+
+    /// Ends running task `at` without a report: the core synthesizes its
+    /// end (H2: `Unknown`, or `NotStarted` for a `Safe` task).
+    fn end_task(&mut self, at: usize, exit: Exit)
+        requires
+            old(self).inv(),
+            at < old(self).scratch@.tasks.len(),
+            !old(self).scratch@.tasks[at as int].ended,
+            exit is Unknown || (exit is NotStarted && old(self).scratch@.tasks[at as int].class
+                == Class::Safe),
+        ensures
+            final(self).inv(),
+            final(self).start == old(self).start,
+            final(self).from == old(self).from,
+            final(self).scratch@.turn == old(self).scratch@.turn,
+            final(self).scratch@.epoch == old(self).scratch@.epoch,
+            final(self).scratch@.stopped == old(self).scratch@.stopped,
+            final(self).scratch@.calls == old(self).scratch@.calls,
+            final(self).scratch@.children == old(self).scratch@.children,
+            final(self).scratch@.tasks.len() == old(self).scratch@.tasks.len(),
+            final(self).scratch@.tasks[at as int].ended,
+            forall|other: int|
+                0 <= other < final(self).scratch@.tasks.len() && other != at ==> (
+                #[trigger] final(self).scratch@.tasks[other]) == old(self).scratch@.tasks[other],
+    {
+        let ghost view = self.scratch@;
+        let seq = self.scratch.task_seq(at);
+        proof {
+            // Task seqs are distinct: `at` is the only task `seq` names.
+            assert forall|other: int| 0 <= other < view.tasks.len() && (#[trigger] view.tasks[other]).seq
+                == seq implies other == at by {
+                if other < at {
+                    assert(view.tasks[other].seq < view.tasks[at as int].seq);
+                } else if other > at {
+                    assert(view.tasks[at as int].seq < view.tasks[other].seq);
+                }
+            }
+            assert(running(view.tasks, seq));
+        };
+        self.emit(Record::TaskEnded { task: TaskId(seq), exit, output: None });
     }
 
     /// Announces each call of the current step that awaits the user: a
@@ -1092,10 +1765,8 @@ impl<P: Payload> Plan<P> {
         }
     }
 
-    /// Starts every tool run the decision licenses and hands the decision
-    /// over.
-    #[verifier::loop_isolation(false)]
-    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    /// Starts every effect the decision licenses (tool runs, task runs and
+    /// stops) and hands the decision over.
     fn finish(self, outcome: Outcome, runs: Runs) -> (decision: Decision<P>)
         requires
             self.inv(),
@@ -1107,59 +1778,217 @@ impl<P: Payload> Plan<P> {
             },
     {
         let mut plan = self;
-        let count = plan.scratch.calls.len();
+        proof {
+            assert forall|at: int| 0 <= at < plan.effects@.len() implies effect_ok(
+                plan.start@,
+                plan.scratch@,
+                #[trigger] plan.effects@[at],
+                runs is All,
+            ) by {}
+        };
+        plan.start_calls(runs);
+        plan.start_tasks(runs);
+        Decision { records: plan.records, effects: plan.effects, outcome }
+    }
+
+    /// The records are final, and every effect so far is licensed.
+    spec fn started(&self, reruns: bool) -> bool {
+        &&& self.scratch.wf()
+        &&& applies(self.start@, self.records@) == Some(self.scratch@)
+        &&& self.from == self.start@.seq
+        &&& reruns ==> self.scratch@.epoch > self.start@.epoch
+        &&& runs_ok(self.start@, self.scratch@, self.effects@, reruns)
+    }
+
+    /// Adds a licensed effect.
+    #[cfg_attr(not(verus_keep_ghost), expect(unused_variables, reason = "ghost argument: read only by the proofs, erased in plain builds"))]
+    fn start(&mut self, effect: Effect<P>, reruns: Ghost<bool>)
+        requires
+            old(self).started(reruns@),
+            effect_ok(old(self).start@, old(self).scratch@, effect, reruns@),
+        ensures
+            final(self).started(reruns@),
+            final(self).start == old(self).start,
+            final(self).scratch@ == old(self).scratch@,
+            final(self).scratch.calls@ == old(self).scratch.calls@,
+            final(self).scratch.tasks@ == old(self).scratch.tasks@,
+            final(self).scratch.runs@ == old(self).scratch.runs@,
+            final(self).from == old(self).from,
+    {
+        let ghost before = self.effects@;
+        self.effects.push(effect);
+        proof {
+            assert forall|at: int| 0 <= at < self.effects@.len() implies effect_ok(
+                self.start@,
+                self.scratch@,
+                #[trigger] self.effects@[at],
+                reruns@,
+            ) by {
+                if at < before.len() {
+                    assert(self.effects@[at] == before[at]);
+                }
+            }
+        };
+    }
+
+    /// Runs every dispatched call of the current step: those the decision
+    /// dispatched, and under `Runs::All` every one not `Unsafe` dispatched
+    /// before it (a rerun after a crash).
+    #[verifier::loop_isolation(false)]
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn start_calls(&mut self, runs: Runs)
+        requires
+            old(self).started(runs is All),
+        ensures
+            final(self).started(runs is All),
+            final(self).start == old(self).start,
+            final(self).scratch@ == old(self).scratch@,
+            final(self).scratch.tasks@ == old(self).scratch.tasks@,
+            final(self).scratch.runs@ == old(self).scratch.runs@,
+            final(self).from == old(self).from,
+    {
         let ghost reruns = runs is All;
-        let ghost origin = plan.start@;
+        let ghost start = self.start@;
+        let ghost scratch = self.scratch@;
+        let ghost tasks = self.scratch.tasks@;
+        let ghost task_runs = self.scratch.runs@;
+        let ghost from = self.from;
+        let count = self.scratch.calls.len();
         let mut index: usize = 0;
         while index < count
             invariant
-                plan.scratch.wf(),
-                plan.start@ == origin,
-                applies(origin, plan.records@) == Some(plan.scratch@),
-                plan.from == origin.seq,
-                reruns ==> plan.scratch@.epoch > origin.epoch,
-                count == plan.scratch.calls@.len(),
-                runs_ok(origin, plan.scratch@, plan.effects@, reruns),
+                self.started(reruns),
+                self.start@ == start,
+                self.scratch@ == scratch,
+                self.scratch.tasks@ == tasks,
+                self.scratch.runs@ == task_runs,
+                self.from == from,
+                count == self.scratch.calls@.len(),
             decreases count - index,
         {
-            if let Phase::Dispatched { seq } = plan.scratch.calls[index].phase {
-                let start = seq >= plan.from || (matches!(runs, Runs::All) && matches!(
-                    plan.scratch.calls[index].class,
+            if let Phase::Dispatched { seq } = self.scratch.calls[index].phase {
+                let run = seq >= self.from || (matches!(runs, Runs::All) && matches!(
+                    self.scratch.calls[index].class,
                     Some(Class::Safe | Class::Keyed),
                 ));
-                if start {
-                    if let Some(args) = &plan.scratch.calls[index].args {
+                if run {
+                    if let Some(args) = &self.scratch.calls[index].args {
                         let call = effect::approved(
                             CallIx(index),
-                            plan.scratch.calls[index].id.clone(),
+                            self.scratch.calls[index].id.clone(),
                             args.clone(),
-                            EffectId { epoch: plan.scratch.epoch, seq },
+                            EffectId { epoch: self.scratch.epoch, seq },
                         );
                         proof {
-                            assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-                            assert(call_ok(plan.scratch@.calls[index as int]));
+                            assert(mirrors(self.scratch.calls@[index as int], self.scratch.ledger@[index as int]));
+                            assert(call_ok(self.scratch@.calls[index as int]));
+                            assert(licensed(self.scratch@, call));
                         };
-                        let ghost before = plan.effects@;
-                        plan.effects.push(Effect::RunTool { call });
-                        proof {
-                            assert forall|at: int|
-                                0 <= at < plan.effects@.len() && (#[trigger] plan.effects@[at]) is RunTool
-                                implies licensed(plan.scratch@, plan.effects@[at]->call) && (fresh(
-                                origin,
-                                plan.effects@[at]->call,
-                            ) || (reruns && rerun(origin, plan.scratch@, plan.effects@[at]->call))) by {
-                                if at < before.len() {
-                                    assert(plan.effects@[at] == before[at]);
-                                }
-                            }
-                        };
+                        self.start(Effect::RunTool { call }, Ghost(reruns));
                     }
                 }
             }
             index += 1;
         }
-        Decision { records: plan.records, effects: plan.effects, outcome }
     }
+
+    /// Runs every running task: a call's (a background run, a timer) or a
+    /// stop. Each runs when the decision started it, and under `Runs::All`
+    /// again if it is not `Unsafe` (a rerun after a crash: the same seq, so
+    /// a `Keyed` stop delivers the same envelope id).
+    #[verifier::loop_isolation(false)]
+    fn start_tasks(&mut self, runs: Runs)
+        requires
+            old(self).started(runs is All),
+        ensures
+            final(self).started(runs is All),
+            final(self).start == old(self).start,
+            final(self).scratch@ == old(self).scratch@,
+            final(self).from == old(self).from,
+    {
+        let ghost reruns = runs is All;
+        let ghost start = self.start@;
+        let ghost scratch = self.scratch@;
+        let ghost from = self.from;
+        let count = self.scratch.tasks.len();
+        let mut at: usize = 0;
+        while at < count
+            invariant
+                self.started(reruns),
+                self.start@ == start,
+                self.scratch@ == scratch,
+                self.from == from,
+                count == self.scratch.tasks@.len(),
+                self.scratch.runs@.len() == count,
+            decreases count - at,
+        {
+            let task = self.scratch.tasks[at];
+            let run = !task.ended && (task.seq >= self.from || (matches!(runs, Runs::All)
+                && !matches!(task.class, Class::Unsafe)));
+            if run {
+                let id = EffectId { epoch: self.scratch.epoch, seq: task.seq };
+                proof {
+                    assert(task_runs(self.start@, self.scratch@, at as int, id, reruns));
+                };
+                match task.origin {
+                    Origin::Call => {
+                        if let Some(run) = &self.scratch.runs[at] {
+                            let call = effect::approved(run.call, run.id.clone(), run.args.clone(), id);
+                            self.start(Effect::RunTool { call }, Ghost(reruns));
+                        }
+                    },
+                    Origin::Stop { child } => {
+                        self.start(Effect::Stop { id, child }, Ghost(reruns));
+                    },
+                }
+            }
+            at += 1;
+        }
+    }
+}
+
+/// A copy of `source`.
+fn copy_of<T: Copy>(source: &[T]) -> (copy: Vec<T>)
+    ensures
+        copy@ == source@,
+{
+    let mut copy: Vec<T> = Vec::with_capacity(source.len());
+    let mut index: usize = 0;
+    while index < source.len()
+        invariant
+            index <= source@.len(),
+            copy@ == source@.take(index as int),
+        decreases source@.len() - index,
+    {
+        copy.push(source[index]);
+        index += 1;
+        assert(copy@ =~= source@.take(index as int));
+    }
+    assert(source@.take(source@.len() as int) =~= source@);
+    copy
+}
+
+/// `source` without its first `count`.
+fn skip_of<T: Copy>(source: &[T], count: usize) -> (rest: Vec<T>)
+    requires
+        count <= source@.len(),
+    ensures
+        rest@ == source@.skip(count as int),
+{
+    let mut rest: Vec<T> = Vec::with_capacity(source.len() - count);
+    let mut index: usize = count;
+    while index < source.len()
+        invariant
+            count <= index <= source@.len(),
+            rest@ == source@.subrange(count as int, index as int),
+        decreases source@.len() - index,
+    {
+        rest.push(source[index]);
+        index += 1;
+        assert(rest@ =~= source@.subrange(count as int, index as int));
+    }
+    assert(source@.skip(count as int) =~= source@.subrange(count as int, source@.len() as int));
+    rest
 }
 
 impl<P: Payload> Core<P> {
@@ -1168,33 +1997,45 @@ impl<P: Payload> Core<P> {
         &&& self.ledger@.len() == self.calls@.len()
         &&& forall|index: int|
             0 <= index < self.calls@.len() ==> mirrors(#[trigger] self.calls@[index], self.ledger@[index])
+        &&& self.runs@.len() == self.tasks@.len()
         &&& state_ok(self@)
     }
 
-    /// An empty session.
+    /// An unborn actor.
     #[must_use]
     pub fn new(limits: Limits) -> (core: Core<P>)
         ensures
             core.wf(),
             core@ == initial(),
     {
-        let messages = Vec::with_capacity(limits.turns_per_session());
+        let envelopes = Vec::with_capacity(limits.messages_per_actor());
         let calls = Vec::with_capacity(limits.calls_per_turn());
         let core = Core {
             limits,
             epoch: Epoch(0),
             seq: 0,
-            messages,
-            name: None,
+            born: None,
+            stopped: false,
+            envelopes,
+            mailbox: Vec::new(),
+            consumed: Ghost(Seq::empty()),
+            turns: 0,
             rules: None,
             turn: Turn::Idle,
             calls,
             context: Context::Within(0),
             step_base: Context::Within(0),
             ledger: Ghost(Seq::empty()),
+            tasks: Vec::new(),
+            runs: Vec::new(),
+            children: Vec::new(),
         };
         assert(core@.calls =~= initial().calls);
-        assert(core@.messages =~= initial().messages);
+        assert(core@.envelopes =~= initial().envelopes);
+        assert(core@.mailbox =~= initial().mailbox);
+        assert(core@.tasks =~= initial().tasks);
+        assert(core@.children =~= initial().children);
+        assert(held(core@.consumed, core@.mailbox) =~= Seq::<EnvelopeId>::empty());
         core
     }
 
@@ -1216,6 +2057,21 @@ impl<P: Payload> Core<P> {
         self.seq
     }
 
+    /// Who this actor is, once it is born.
+    #[must_use]
+    pub const fn born(&self) -> Option<&Born> {
+        match &self.born {
+            Some(born) => Some(born),
+            None => None,
+        }
+    }
+
+    /// Whether a stop was delivered.
+    #[must_use]
+    pub const fn stopped(&self) -> bool {
+        self.stopped
+    }
+
     /// The rules in force and the seq of the `RulesLoaded` that holds them,
     /// if any were ever loaded.
     #[must_use]
@@ -1233,6 +2089,12 @@ impl<P: Payload> Core<P> {
             Turn::Open(open) => Some(open.turn),
             Turn::Idle => None,
         }
+    }
+
+    /// Envelopes delivered and not yet carried by a model call.
+    #[must_use]
+    pub const fn unread(&self) -> usize {
+        self.mailbox.len()
     }
 
     /// A scratch copy to plan on: same state, same view.
@@ -1260,21 +2122,23 @@ impl<P: Payload> Core<P> {
             calls.push(self.calls[index].copy());
             index += 1;
         }
-        let mut messages: Vec<MessageId> = Vec::with_capacity(self.messages.len());
+        let mut runs: Vec<Option<TaskRun<P>>> = Vec::with_capacity(self.runs.len());
         let mut at: usize = 0;
-        while at < self.messages.len()
+        while at < self.runs.len()
             invariant
-                at <= self.messages@.len(),
-                messages@ == self.messages@.take(at as int),
-            decreases self.messages@.len() - at,
+                at <= self.runs@.len(),
+                runs@.len() == at,
+            decreases self.runs@.len() - at,
         {
-            messages.push(self.messages[at]);
+            let run = match &self.runs[at] {
+                Some(run) => Some(TaskRun { call: run.call, id: run.id.clone(), args: run.args.clone() }),
+                None => None,
+            };
+            runs.push(run);
             at += 1;
-            assert(messages@ =~= self.messages@.take(at as int));
         }
-        assert(self.messages@.take(self.messages@.len() as int) =~= self.messages@);
-        let name = match &self.name {
-            Some(name) => Some(name.copy()),
+        let born = match &self.born {
+            Some(born) => Some(born.copy()),
             None => None,
         };
         let rules = match &self.rules {
@@ -1285,14 +2149,21 @@ impl<P: Payload> Core<P> {
             limits: self.limits.clone(),
             epoch: self.epoch,
             seq: self.seq,
-            messages,
-            name,
+            born,
+            stopped: self.stopped,
+            envelopes: copy_of(self.envelopes.as_slice()),
+            mailbox: copy_of(self.mailbox.as_slice()),
+            consumed: Ghost(self.consumed@),
+            turns: self.turns,
             rules,
             turn: self.turn,
             calls,
             context: self.context,
             step_base: self.step_base,
             ledger: Ghost(self.ledger@),
+            tasks: copy_of(self.tasks.as_slice()),
+            runs,
+            children: copy_of(self.children.as_slice()),
         };
         proof {
             assert forall|at: int| 0 <= at < copy.calls@.len() implies mirrors(
@@ -1406,10 +2277,21 @@ impl<P: Payload> Core<P> {
                         reason = "Verus proves the index is below the rules' length, a usize"
                     )]
                     let at = rule as usize;
-                    rules::rule_fits(&in_force.rules[at], self.name.as_ref(), shape)
+                    rules::rule_fits(&in_force.rules[at], self.name(), shape)
                 },
                 None => false,
             },
+        }
+    }
+
+    /// This actor's name, once it is born.
+    const fn name(&self) -> (name: Option<&ActorName>)
+        ensures
+            rules::name_view(name) == self@.name,
+    {
+        match &self.born {
+            Some(born) => Some(&born.name),
+            None => None,
         }
     }
 
@@ -1437,9 +2319,128 @@ impl<P: Payload> Core<P> {
         let Some((seq, rules)) = &self.rules else {
             return Granted::Ask;
         };
-        match rules::grant(rules, self.name.as_ref(), shape) {
+        match rules::grant(rules, self.name(), shape) {
             Some(rule) => Granted::Rule(Grant::Rule { rule, rules: *seq }),
             None => Granted::Ask,
+        }
+    }
+
+    /// The seq of task `at`.
+    fn task_seq(&self, at: usize) -> (seq: u64)
+        requires
+            at < self@.tasks.len(),
+        ensures
+            seq == self@.tasks[at as int].seq,
+    {
+        self.tasks[at].seq
+    }
+
+    /// Whether envelope `id` was already delivered.
+    fn seen(&self, id: EnvelopeId) -> (found: bool)
+        ensures
+            found == seen(self@.envelopes, id),
+    {
+        let mut index: usize = 0;
+        while index < self.envelopes.len()
+            invariant
+                index <= self.envelopes@.len(),
+                forall|at: int| 0 <= at < index ==> #[trigger] self.envelopes@[at] != id,
+            decreases self.envelopes@.len() - index,
+        {
+            if self.envelopes[index].same(id) {
+                assert(self.envelopes@[index as int] == id);
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The index of the running task that record `seq` started, if any.
+    fn running_task(&self, seq: u64) -> (found: Option<usize>)
+        requires
+            self.wf(),
+        ensures
+            match found {
+                Some(at) => at < self@.tasks.len() && self@.tasks[at as int].seq == seq
+                    && !self@.tasks[at as int].ended,
+                None => !running(self@.tasks, seq),
+            },
+    {
+        let mut at: usize = 0;
+        while at < self.tasks.len()
+            invariant
+                at <= self@.tasks.len(),
+                forall|other: int| 0 <= other < at ==> !((#[trigger] self@.tasks[other]).seq == seq
+                    && !self@.tasks[other].ended),
+            decreases self@.tasks.len() - at,
+        {
+            if self.tasks[at].seq == seq && !self.tasks[at].ended {
+                return Some(at);
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// Whether a stop task for `child` exists.
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn stopping(&self, child: ActorId) -> (found: bool)
+        ensures
+            found == stopping(self@.tasks, child),
+    {
+        let mut at: usize = 0;
+        while at < self.tasks.len()
+            invariant
+                at <= self@.tasks.len(),
+                forall|other: int| 0 <= other < at ==> (#[trigger] self@.tasks[other]).origin
+                    != (Origin::Stop { child }),
+            decreases self@.tasks.len() - at,
+        {
+            if let Origin::Stop { child: stopped } = self.tasks[at].origin {
+                if stopped.same(child) {
+                    return true;
+                }
+            }
+            at += 1;
+        }
+        false
+    }
+
+    /// Whether a dispatched `spawn` named `child`.
+    fn spawned(&self, child: ActorId) -> (found: bool)
+        ensures
+            found == spawned(self@.children, child),
+    {
+        let mut at: usize = 0;
+        while at < self.children.len()
+            invariant
+                at <= self@.children.len(),
+                forall|other: int| 0 <= other < at ==> #[trigger] self@.children[other] != child,
+            decreases self@.children.len() - at,
+        {
+            if self.children[at].same(child) {
+                return true;
+            }
+            at += 1;
+        }
+        false
+    }
+
+    /// The actor's address, if it is born and not stopped.
+    const fn live(&self) -> (actor: Option<ActorId>)
+        ensures
+            match actor {
+                Some(actor) => live(self@) && self@.actor == Some(actor),
+                None => !live(self@),
+            },
+    {
+        if self.stopped {
+            return None;
+        }
+        match &self.born {
+            Some(born) => Some(born.actor),
+            None => None,
         }
     }
 
@@ -1464,6 +2465,9 @@ impl<P: Payload> Core<P> {
         if !step.same(open.step) {
             return self.refuse(Violation::WrongStep);
         }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::StepFinished { step, calls: *calls });
+        };
         let first_call = self.calls.len();
         let ghost before = self.ledger@;
         let mut index: usize = 0;
@@ -1483,7 +2487,7 @@ impl<P: Payload> Core<P> {
                 Request::Invalid { .. } => (None, None),
             };
             let class = match &shape {
-                Some(shape) => Some(shape.tool.class()),
+                Some(shape) => Some(shape.tool().class()),
                 None => None,
             };
             let ghost view = shape_view(shape);
@@ -1535,6 +2539,9 @@ impl<P: Payload> Core<P> {
         if matches!(open.intent, Intent::Cancel) {
             return self.refuse(Violation::Cancelling);
         }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
         let index = self.current_call(open, call)?;
         if !(matches!(self.calls[index].phase, Phase::Proposed)) {
             return self.refuse(Violation::WrongPhase);
@@ -1545,6 +2552,9 @@ impl<P: Payload> Core<P> {
         if !self.grant_fits(by, index) {
             return self.refuse(Violation::WrongGrant);
         }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::Approved { call, by });
+        };
         let ghost was = self.ledger@[index as int];
         self.calls[index].phase = Phase::Approved;
         self.ledger = Ghost(
@@ -1555,6 +2565,345 @@ impl<P: Payload> Core<P> {
         );
         self.seq = next;
         assert(call_ok(self.ledger@[index as int]));
+        Ok(())
+    }
+
+    /// `apply` of `Delivered { envelope }`.
+    fn apply_delivered(&mut self, envelope: &Envelope<P>) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::Delivered { envelope: *envelope }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let Some(born) = &self.born else {
+            return self.refuse(Violation::Unborn);
+        };
+        if !born.actor.same(envelope.to) || matches!(envelope.id, EnvelopeId::Task(_)) {
+            return self.refuse(Violation::Mismatch);
+        }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        if self.seen(envelope.id) {
+            return self.refuse(Violation::DuplicateEnvelope);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::Delivered { envelope: *envelope });
+        };
+        self.envelopes.push(envelope.id);
+        match &envelope.body {
+            Body::Text(text) => {
+                self.mailbox.push(
+                    Waiting { id: envelope.id, user: matches!(envelope.from, Address::User), bytes: text.bytes },
+                );
+            },
+            Body::Stop => {
+                self.stopped = true;
+            },
+        }
+        self.seq = next;
+        Ok(())
+    }
+
+    /// `apply` of `TurnStarted { turn }`.
+    fn apply_turn_started(&mut self, turn: TurnId) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::TurnStarted { turn }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        if matches!(self.turn, Turn::Open(_)) {
+            return self.refuse(Violation::TurnOpen);
+        }
+        if self.live().is_none() {
+            return self.refuse(if self.stopped { Violation::Stopped } else { Violation::Unborn });
+        }
+        if turn.0 != self.seq {
+            return self.refuse(Violation::WrongTurn);
+        }
+        if self.mailbox.len() == 0 {
+            return self.refuse(Violation::NoMail);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::TurnStarted { turn });
+        };
+        self.turns = bump(self.turns);
+        self.turn = Turn::Open(Open {
+            turn,
+            step: StepId { turn, index: 0 },
+            retries: 0,
+            stage: Stage::Starting,
+            intent: Intent::Proceed,
+            first_call: 0,
+        });
+        self.calls.clear();
+        self.ledger = Ghost(Seq::empty());
+        self.seq = next;
+        assert(self@.calls =~= spec_apply(old(self)@, Record::<P>::TurnStarted { turn })->0.calls);
+        Ok(())
+    }
+
+    /// `apply` of `StepStarted { step, carries }`.
+    fn apply_step_started(&mut self, step: StepId, carries: &Vec<EnvelopeId>) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::StepStarted { step, carries: *carries }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !step.turn.same(open.turn) {
+            return self.refuse(Violation::WrongTurn);
+        }
+        if matches!(open.intent, Intent::Cancel) {
+            return self.refuse(Violation::Cancelling);
+        }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        let count = carries.len();
+        let batch = mailbox::batch(self.mailbox.as_slice());
+        let fits = match open.stage {
+            Stage::Backoff { .. } => count == 0,
+            Stage::Starting => count > 0 && batch == count && mailbox::heads(carries.as_slice(), self.mailbox.as_slice()),
+            Stage::Tools => batch == count && mailbox::heads(carries.as_slice(), self.mailbox.as_slice()),
+            Stage::Model { .. } => false,
+        };
+        proof {
+            if is_batch(self@.mailbox, count as int) {
+                lemma_batch_unique(self@.mailbox, batch as int, count as int);
+            }
+        };
+        if !fits {
+            return self.refuse(Violation::WrongCarry);
+        }
+        let retries = match open.stage {
+            Stage::Starting => {
+                if step.index != 0 {
+                    return self.refuse(Violation::WrongStep);
+                }
+                0
+            },
+            Stage::Backoff { .. } => {
+                if step.index != open.step.index {
+                    return self.refuse(Violation::WrongStep);
+                }
+                open.retries
+            },
+            Stage::Tools => {
+                if open.step.index == u32::MAX || step.index != open.step.index + 1 {
+                    return self.refuse(Violation::WrongStep);
+                }
+                if !self.all_resolved(open.first_call) {
+                    return self.refuse(Violation::Unresolved);
+                }
+                0
+            },
+            Stage::Model { .. } => return self.refuse(Violation::WrongStage),
+        };
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::StepStarted { step, carries: *carries });
+        };
+        let (_, bytes) = mailbox::head(self.mailbox.as_slice(), count);
+        self.mailbox = skip_of(self.mailbox.as_slice(), count);
+        self.consumed = Ghost(self.consumed@ + carries@);
+        self.turn = Turn::Open(
+            Open { step, retries, stage: Stage::Model { since: self.seq }, ..open },
+        );
+        self.context = self.context.grow(bytes, self.limits.context_bytes());
+        self.step_base = self.context;
+        self.seq = next;
+        Ok(())
+    }
+
+    /// `apply` of `Dispatched { call }`.
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn apply_dispatched(&mut self, call: CallIx) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::Dispatched { call }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !(matches!(open.stage, Stage::Tools)) {
+            return self.refuse(Violation::WrongStage);
+        }
+        if matches!(open.intent, Intent::Cancel) {
+            return self.refuse(Violation::Cancelling);
+        }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        let index = self.current_call(open, call)?;
+        if !(matches!(self.calls[index].phase, Phase::Approved)) {
+            return self.refuse(Violation::WrongPhase);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::Dispatched { call });
+            assert(call_ok(self@.calls[index as int]));
+        };
+        let ghost was = self.ledger@[index as int];
+        if let Some(shape) = &self.calls[index].shape {
+            if shape.background() {
+                if let Some(args) = &self.calls[index].args {
+                    self.tasks.push(
+                        Task { seq: self.seq, class: shape.tool().class(), origin: Origin::Call, ended: false },
+                    );
+                    self.runs.push(Some(TaskRun { call, id: self.calls[index].id.clone(), args: args.clone() }));
+                }
+            }
+            if let Some(child) = shape.child() {
+                self.children.push(child);
+            }
+        }
+        self.calls[index].phase = Phase::Dispatched { seq: self.seq };
+        self.ledger = Ghost(
+            self.ledger@.update(
+                index as int,
+                CallView { phase: Phase::Dispatched { seq: self.seq }, dispatches: was.dispatches + 1, ..was },
+            ),
+        );
+        self.seq = next;
+        assert(call_ok(self.ledger@[index as int]));
+        Ok(())
+    }
+
+    /// `apply` of `ToolResult { call, exit, output }`.
+    #[expect(clippy::ref_option, reason = "the specification names the record's own field")]
+    fn apply_tool_result(&mut self, call: CallIx, exit: Exit, output: &Option<Measured<P::Output>>) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::ToolResult { call, exit, output: *output }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !(matches!(open.stage, Stage::Tools)) {
+            return self.refuse(Violation::WrongStage);
+        }
+        let index = self.current_call(open, call)?;
+        let (background, cancels) = match &self.calls[index].shape {
+            Some(shape) => (shape.background(), matches!(shape.tool(), Tool::Cancel)),
+            None => (false, false),
+        };
+        let fits = match self.calls[index].phase {
+            Phase::Proposed | Phase::Approved => output.is_none() && matches!(exit, Exit::NotStarted(_)),
+            Phase::Dispatched { .. } => output.is_some() || matches!(exit, Exit::Unknown) || (matches!(
+                exit,
+                Exit::Ok,
+            ) && background) || (matches!(exit, Exit::Ok | Exit::Failed) && cancels),
+            Phase::Resolved => return self.refuse(Violation::WrongPhase),
+        };
+        if !fits {
+            return self.refuse(Violation::WrongResult);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::ToolResult { call, exit, output: *output });
+        };
+        let ghost was = self.ledger@[index as int];
+        self.calls[index].phase = Phase::Resolved;
+        self.ledger = Ghost(self.ledger@.update(index as int, CallView { phase: Phase::Resolved, ..was }));
+        self.context = match output {
+            Some(output) => self.context.grow(output.bytes, self.limits.context_bytes()),
+            None => self.context,
+        };
+        self.seq = next;
+        assert(call_ok(self.ledger@[index as int]));
+        Ok(())
+    }
+
+    /// `apply` of `TaskEnded { task, exit, output }`.
+    #[expect(clippy::ref_option, reason = "the specification names the record's own field")]
+    fn apply_task_ended(&mut self, task: TaskId, exit: Exit, output: &Option<Measured<P::Output>>) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::TaskEnded { task, exit, output: *output }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let Some(at) = self.running_task(task.0) else {
+            return self.refuse(Violation::UnknownTask);
+        };
+        let ghost view = self@;
+        proof {
+            // Task seqs are distinct: `at` is the only task `task` names.
+            assert forall|other: int| 0 <= other < view.tasks.len() && (#[trigger] view.tasks[other]).seq
+                == task.0 implies other == at by {
+                if other < at {
+                    assert(view.tasks[other].seq < view.tasks[at as int].seq);
+                } else if other > at {
+                    assert(view.tasks[at as int].seq < view.tasks[other].seq);
+                }
+            }
+        };
+        let synthesized_fits = matches!(exit, Exit::Unknown) || (matches!(exit, Exit::NotStarted(_))
+            && matches!(self.tasks[at].class, Class::Safe));
+        if output.is_none() && !synthesized_fits {
+            return self.refuse(Violation::WrongResult);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::TaskEnded { task, exit, output: *output });
+        };
+        let ended = Task { ended: true, ..self.tasks[at] };
+        self.tasks.set(at, ended);
+        let bytes = match output {
+            Some(output) => output.bytes,
+            None => 0,
+        };
+        self.mailbox.push(Waiting { id: EnvelopeId::Task(task), user: false, bytes });
+        self.seq = next;
+        assert(self@.tasks =~= end_task(view.tasks, task.0));
+        Ok(())
+    }
+
+    /// `apply` of `StopSent { child }`.
+    fn apply_stop_sent(&mut self, child: ActorId) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::StopSent { child }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        if !self.stopped || !self.spawned(child) || self.stopping(child) {
+            return self.refuse(Violation::WrongStop);
+        }
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::StopSent { child });
+        };
+        self.tasks.push(Task { seq: self.seq, class: Class::Keyed, origin: Origin::Stop { child }, ended: false });
+        self.runs.push(None);
+        self.seq = next;
         Ok(())
     }
 
@@ -1578,12 +2927,17 @@ impl<P: Payload> Core<P> {
             applied is Ok ==> final(self)@.seq == old(self)@.seq + 1,
     {
         let next = bump(self.seq);
+        proof {
+            if spec_apply(self@, *record) is Some {
+                lemma_actor_keeps(self@, *record);
+            }
+        };
         match record {
             Record::Born { born } => {
-                if self.name.is_some() {
+                if self.born.is_some() {
                     return self.refuse(Violation::Reborn);
                 }
-                self.name = Some(born.name.copy());
+                self.born = Some(born.copy());
                 self.seq = next;
                 Ok(())
             },
@@ -1592,68 +2946,9 @@ impl<P: Payload> Core<P> {
                 self.seq = next;
                 Ok(())
             },
-            Record::TurnStarted { turn, message, text } => {
-                if matches!(self.turn, Turn::Open(_)) {
-                    return self.refuse(Violation::TurnOpen);
-                }
-                if self.seen(*message) {
-                    return self.refuse(Violation::DuplicateMessage);
-                }
-                self.messages.push(*message);
-                self.turn = Turn::Open(Open {
-                    turn: *turn,
-                    step: StepId { turn: *turn, index: 0 },
-                    retries: 0,
-                    stage: Stage::Starting,
-                    intent: Intent::Proceed,
-                    first_call: 0,
-                });
-                self.calls.clear();
-                self.ledger = Ghost(Seq::empty());
-                self.context = self.context.grow(text.bytes, self.limits.context_bytes());
-                self.seq = next;
-                assert(self@.calls =~= spec_apply(old(self)@, *record)->0.calls);
-                Ok(())
-            },
-            Record::StepStarted { step } => {
-                let open = self.open()?;
-                if !step.turn.same(open.turn) {
-                    return self.refuse(Violation::WrongTurn);
-                }
-                if matches!(open.intent, Intent::Cancel) {
-                    return self.refuse(Violation::Cancelling);
-                }
-                let retries = match open.stage {
-                    Stage::Starting => {
-                        if step.index != 0 {
-                            return self.refuse(Violation::WrongStep);
-                        }
-                        0
-                    },
-                    Stage::Backoff { .. } => {
-                        if step.index != open.step.index {
-                            return self.refuse(Violation::WrongStep);
-                        }
-                        open.retries
-                    },
-                    Stage::Tools => {
-                        if open.step.index == u32::MAX || step.index != open.step.index + 1 {
-                            return self.refuse(Violation::WrongStep);
-                        }
-                        if !self.all_resolved(open.first_call) {
-                            return self.refuse(Violation::Unresolved);
-                        }
-                        0
-                    },
-                    Stage::Model { .. } => return self.refuse(Violation::WrongStage),
-                };
-                self.turn = Turn::Open(
-                    Open { step: *step, retries, stage: Stage::Model { since: self.seq }, ..open },
-                );
-                self.step_base = self.context;
-                self.seq = next;
-                Ok(())
-            },
+            Record::Delivered { envelope } => self.apply_delivered(envelope),
+            Record::TurnStarted { turn } => self.apply_turn_started(*turn),
+            Record::StepStarted { step, carries } => self.apply_step_started(*step, carries),
             Record::ModelOutput { step, parts } => {
                 let open = self.open()?;
                 if !(matches!(open.stage, Stage::Model { .. })) {
@@ -1673,6 +2968,9 @@ impl<P: Payload> Core<P> {
                 }
                 if matches!(open.intent, Intent::Cancel) {
                     return self.refuse(Violation::Cancelling);
+                }
+                if self.stopped {
+                    return self.refuse(Violation::Stopped);
                 }
                 if !step.same(open.step) {
                     return self.refuse(Violation::WrongStep);
@@ -1695,61 +2993,10 @@ impl<P: Payload> Core<P> {
             },
             Record::StepFinished { step, calls } => self.apply_step_finished(*step, calls),
             Record::Approved { call, by } => self.apply_approved(*call, *by),
-            Record::Dispatched { call } => {
-                let open = self.open()?;
-                if !(matches!(open.stage, Stage::Tools)) {
-                    return self.refuse(Violation::WrongStage);
-                }
-                if matches!(open.intent, Intent::Cancel) {
-                    return self.refuse(Violation::Cancelling);
-                }
-                let index = self.current_call(open, *call)?;
-                if !(matches!(self.calls[index].phase, Phase::Approved)) {
-                    return self.refuse(Violation::WrongPhase);
-                }
-                let ghost was = self.ledger@[index as int];
-                self.calls[index].phase = Phase::Dispatched { seq: self.seq };
-                self.ledger = Ghost(
-                    self.ledger@.update(
-                        index as int,
-                        CallView {
-                            phase: Phase::Dispatched { seq: self.seq },
-                            dispatches: was.dispatches + 1,
-                            ..was
-                        },
-                    ),
-                );
-                self.seq = next;
-                assert(call_ok(self.ledger@[index as int]));
-                Ok(())
-            },
-            Record::ToolResult { call, exit, output } => {
-                let open = self.open()?;
-                if !(matches!(open.stage, Stage::Tools)) {
-                    return self.refuse(Violation::WrongStage);
-                }
-                let index = self.current_call(open, *call)?;
-                let fits = match self.calls[index].phase {
-                    Phase::Proposed | Phase::Approved => output.is_none() && matches!(exit, Exit::NotStarted(_)),
-                    Phase::Dispatched { .. } => output.is_some() || matches!(exit, Exit::Unknown),
-                    Phase::Resolved => return self.refuse(Violation::WrongPhase),
-                };
-                if !fits {
-                    return self.refuse(Violation::WrongResult);
-                }
-                let ghost was = self.ledger@[index as int];
-                self.calls[index].phase = Phase::Resolved;
-                self.ledger = Ghost(
-                    self.ledger@.update(index as int, CallView { phase: Phase::Resolved, ..was }),
-                );
-                self.context = match output {
-                    Some(output) => self.context.grow(output.bytes, self.limits.context_bytes()),
-                    None => self.context,
-                };
-                self.seq = next;
-                assert(call_ok(self.ledger@[index as int]));
-                Ok(())
-            },
+            Record::Dispatched { call } => self.apply_dispatched(*call),
+            Record::ToolResult { call, exit, output } => self.apply_tool_result(*call, *exit, output),
+            Record::TaskEnded { task, exit, output } => self.apply_task_ended(*task, *exit, output),
+            Record::StopSent { child } => self.apply_stop_sent(*child),
             Record::CancelRequested { turn } => {
                 let open = self.open()?;
                 if !turn.same(open.turn) {
@@ -1859,30 +3106,10 @@ impl<P: Payload> Core<P> {
         plan
     }
 
-    /// Whether `message` already started a turn.
-    fn seen(&self, message: MessageId) -> (seen: bool)
-        ensures
-            seen == seen_message(self@.messages, message),
-    {
-        let mut index: usize = 0;
-        while index < self.messages.len()
-            invariant
-                index <= self.messages@.len(),
-                forall|at: int| 0 <= at < index ==> #[trigger] self.messages@[at] != message,
-            decreases self.messages@.len() - index,
-        {
-            if self.messages[index].same(message) {
-                assert(self.messages@[index as int] == message);
-                return true;
-            }
-            index += 1;
-        }
-        false
-    }
-
-    /// Starts model call `index` of `turn`, unless a bound says the turn is
-    /// over. The index is widened, so the step after the last `u32` is past
-    /// the bound too.
+    /// Starts model call `index` of `turn`, carrying the batch at the head
+    /// of the mailbox (nothing, for a retry), unless a bound says the turn
+    /// is over. The index is widened, so the step after the last `u32` is
+    /// past the bound too.
     fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64)
         requires
             old(plan).inv(),
@@ -1892,24 +3119,64 @@ impl<P: Payload> Core<P> {
             final(plan).start == old(plan).start,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
     {
+        let Some(open) = plan.open() else {
+            return;
+        };
+        let count = match open.stage {
+            Stage::Backoff { .. } => 0,
+            Stage::Starting | Stage::Model { .. } | Stage::Tools => mailbox::batch(plan.scratch.mailbox.as_slice()),
+        };
+        proof {
+            if !(open.stage is Backoff) {
+                assert(count <= plan.scratch@.mailbox.len());
+            }
+        };
+        let (carries, bytes) = mailbox::head(plan.scratch.mailbox.as_slice(), count);
         if index >= u64::from(self.limits.steps_per_turn()) {
             plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
-        } else if matches!(plan.scratch.context, Context::Exceeded) {
+        } else if matches!(plan.scratch.context.grow(bytes, self.limits.context_bytes()), Context::Exceeded) {
             plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
         } else {
             #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "Verus proves the index is below steps_per_turn, a u32")]
             let step = StepId { turn, index: index as u32 };
-            let seq = plan.emit(Record::StepStarted { step });
+            let seq = plan.emit(Record::StepStarted { step, carries });
             let id = plan.id(seq);
             plan.effect(Effect::CallModel { id, step });
         }
     }
 
-    /// Moves the current step's calls forward: interrupts, calls past a
-    /// bound, invalid requests, rule grants, dispatch of every approved
-    /// call, and once every call is resolved, the next step or the end of
-    /// the turn.
+    /// Starts a turn when the actor is idle, live and has mail, within
+    /// `Limits::turns_per_actor`. Runs once per decision, so a turn the
+    /// context bound fails at once cannot loop.
+    fn begin(&self, plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+    {
+        if plan.open().is_some() || plan.scratch.live().is_none() || plan.scratch.mailbox.len() == 0 {
+            return;
+        }
+        #[expect(clippy::as_conversions, reason = "a usize fits in a u64 on every target")]
+        let limit = self.limits.turns_per_actor() as u64;
+        if plan.scratch.turns >= limit {
+            return;
+        }
+        let turn = TurnId(plan.scratch.seq);
+        plan.emit(Record::TurnStarted { turn });
+        assert(resolved(plan.scratch@.calls, 0, plan.scratch@.calls.len() as int));
+        self.start_step(plan, turn, 0);
+    }
+
+    /// Moves the current step's calls forward: cancels and stops, calls
+    /// past a bound, invalid requests, rule grants, dispatch of every
+    /// approved call, and once every call is resolved, the next step or
+    /// the end of the turn.
     #[verifier::loop_isolation(false)]
     fn settle(&self, plan: &mut Plan<P>)
         requires
@@ -1921,12 +3188,25 @@ impl<P: Payload> Core<P> {
             final(plan).start == old(plan).start,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
     {
         let Some(open) = plan.open() else {
             return;
         };
         let count = plan.scratch.calls.len();
-        // Interrupts, calls past a bound, invalid requests and policy.
+        let stopped = plan.scratch.stopped;
+        // A turn being cancelled, or an actor stopped, starts nothing more:
+        // the gate closes (A3).
+        let closing = stopped || matches!(open.intent, Intent::Cancel);
+        let gate = if stopped {
+            Unstarted::Stopped
+        } else {
+            Unstarted::Cancelled
+        };
+        let depth = match &plan.scratch.born {
+            Some(born) => born.depth,
+            None => 0,
+        };
         let mut index = open.first_call;
         while index < count
             invariant
@@ -1934,6 +3214,7 @@ impl<P: Payload> Core<P> {
                 plan.start == old(plan).start,
                 plan.from == old(plan).from,
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.stopped == stopped,
                 plan.scratch@.turn == Turn::Open(open),
                 plan.scratch@.calls.len() == count,
                 open.first_call <= index,
@@ -1941,26 +3222,27 @@ impl<P: Payload> Core<P> {
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             match plan.scratch.calls[index].phase {
-                Phase::Proposed => match open.intent {
-                    Intent::Cancel => plan.resolve(index, Exit::NotStarted(Unstarted::Cancelled)),
-                    Intent::Proceed => {
-                        if index - open.first_call >= self.limits.calls_per_step() || index
-                            >= self.limits.calls_per_turn() {
-                            plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
-                        } else {
-                            match plan.scratch.rule_for(index) {
-                                Granted::Invalid => plan.resolve(index, Exit::NotStarted(Unstarted::Invalid)),
-                                Granted::Rule(by) => {
-                                    plan.emit(Record::Approved { call: CallIx(index), by });
-                                },
-                                Granted::Ask => {},
-                            }
+                Phase::Proposed => {
+                    if closing {
+                        plan.resolve(index, Exit::NotStarted(gate));
+                    } else if index - open.first_call >= self.limits.calls_per_step() || index
+                        >= self.limits.calls_per_turn() || (plan.scratch.calls[index].spawns() && depth
+                        >= self.limits.depth()) {
+                        plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
+                    } else {
+                        match plan.scratch.rule_for(index) {
+                            Granted::Invalid => plan.resolve(index, Exit::NotStarted(Unstarted::Invalid)),
+                            Granted::Rule(by) => {
+                                plan.emit(Record::Approved { call: CallIx(index), by });
+                            },
+                            Granted::Ask => {},
                         }
-                    },
+                    }
                 },
-                Phase::Approved => match open.intent {
-                    Intent::Cancel => plan.resolve(index, Exit::NotStarted(Unstarted::Cancelled)),
-                    Intent::Proceed => {},
+                Phase::Approved => {
+                    if closing {
+                        plan.resolve(index, Exit::NotStarted(gate));
+                    }
                 },
                 Phase::Dispatched { .. } | Phase::Resolved => {},
             }
@@ -1968,7 +3250,7 @@ impl<P: Payload> Core<P> {
         }
         // Dispatch every approved call, in proposal order. The core has no
         // concurrency rules: what runs together is the tools' business.
-        if matches!(open.intent, Intent::Proceed) {
+        if !closing {
             let mut index = open.first_call;
             while index < count
                 invariant
@@ -1976,6 +3258,8 @@ impl<P: Payload> Core<P> {
                     plan.start == old(plan).start,
                     plan.from == old(plan).from,
                     plan.scratch@.epoch == old(plan).scratch@.epoch,
+                    plan.scratch@.stopped == stopped,
+                    !stopped,
                     plan.scratch@.turn == Turn::Open(open),
                     plan.scratch@.calls.len() == count,
                     open.first_call <= index,
@@ -1984,7 +3268,7 @@ impl<P: Payload> Core<P> {
             {
                 assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
                 if matches!(plan.scratch.calls[index].phase, Phase::Approved) {
-                    plan.emit(Record::Dispatched { call: CallIx(index) });
+                    self.dispatch(plan, index);
                 }
                 index += 1;
             }
@@ -2004,7 +3288,10 @@ impl<P: Payload> Core<P> {
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
                 },
                 Intent::Proceed => {
-                    if count == open.first_call {
+                    if stopped {
+                        // A torn stop: `resume` cancels the turn first, so
+                        // no decision reaches here.
+                    } else if count == open.first_call {
                         plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Completed });
                     } else {
                         self.start_step(plan, open.turn, u64::from(open.step.index) + 1);
@@ -2014,9 +3301,277 @@ impl<P: Payload> Core<P> {
         }
     }
 
+    /// Dispatches approved call `index`. A background call past
+    /// `Limits::tasks_per_actor` does not start. Once dispatched, a
+    /// background call resolves `Ok` (its task runs on: no turn waits for
+    /// it, B1), and a `cancel` is done at once by the core.
+    fn dispatch(&self, plan: &mut Plan<P>, index: usize)
+        requires
+            old(plan).inv(),
+            !old(plan).scratch@.stopped,
+            old(plan).scratch@.turn is Open,
+            old(plan).scratch@.turn->Open_0.stage is Tools,
+            old(plan).scratch@.turn->Open_0.intent is Proceed,
+            old(plan).scratch@.turn->Open_0.first_call <= index < old(plan).scratch@.calls.len(),
+            old(plan).scratch@.calls[index as int].phase is Approved,
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+            final(plan).scratch@.turn == old(plan).scratch@.turn,
+            final(plan).scratch@.calls.len() == old(plan).scratch@.calls.len(),
+    {
+        assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
+        assert(call_ok(plan.scratch@.calls[index as int]));
+        let (background, cancel) = match &plan.scratch.calls[index].shape {
+            Some(shape) => (shape.background(), shape.task()),
+            None => (false, None),
+        };
+        if background && plan.scratch.tasks.len() >= self.limits.tasks_per_actor() {
+            plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
+            return;
+        }
+        plan.emit(Record::Dispatched { call: CallIx(index) });
+        if background {
+            plan.resolve(index, Exit::Ok);
+        } else if let Some(task) = cancel {
+            let hit = Self::cancel_task(plan, task);
+            plan.resolve(index, if hit { Exit::Ok } else { Exit::Failed });
+        }
+    }
+
+    /// The cancel primitive on task `task`: a running `Safe` one (a timer
+    /// that has not fired) ends `NotStarted`; a running `Unsafe` one is
+    /// signalled once, and records what comes back. A stop is not
+    /// cancelled. Whether anything was cancelled.
+    fn cancel_task(plan: &mut Plan<P>, task: TaskId) -> (hit: bool)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+            final(plan).scratch@.turn == old(plan).scratch@.turn,
+            final(plan).scratch@.calls == old(plan).scratch@.calls,
+    {
+        let Some(at) = plan.scratch.running_task(task.0) else {
+            return false;
+        };
+        match plan.scratch.tasks[at].class {
+            Class::Safe => {
+                plan.end_task(at, Exit::NotStarted(Unstarted::Cancelled));
+                true
+            },
+            Class::Unsafe => {
+                let id = plan.id(task.0);
+                plan.effect(Effect::CancelTool { id });
+                true
+            },
+            Class::Keyed => false,
+        }
+    }
+
+    /// Steering: a user message arrived while the step waits for approvals.
+    /// Each call still awaiting the user is denied ("the user steered"),
+    /// and the message lands at the step's boundary, once every call has
+    /// resolved.
+    #[verifier::loop_isolation(false)]
+    fn steer(&self, plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+    {
+        let Some(open) = plan.open() else {
+            return;
+        };
+        if !matches!(open.stage, Stage::Tools) || matches!(open.intent, Intent::Cancel) || plan.scratch.stopped {
+            return;
+        }
+        let count = plan.scratch.calls.len();
+        let mut index = open.first_call;
+        while index < count
+            invariant
+                plan.inv(),
+                plan.start == old(plan).start,
+                plan.from == old(plan).from,
+                plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.turn == Turn::Open(open),
+                plan.scratch@.calls.len() == count,
+                open.first_call <= index,
+            decreases count - index,
+        {
+            assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
+            if matches!(plan.scratch.calls[index].phase, Phase::Proposed) {
+                plan.resolve(index, Exit::NotStarted(Unstarted::Steered));
+            }
+            index += 1;
+        }
+        self.settle(plan);
+    }
+
+    /// Revokes the running turn `turn`, whose cancel was just recorded:
+    /// nothing more starts, the model call in flight is stopped, each
+    /// dispatched call is signalled once, and the turn ends once every call
+    /// has resolved.
+    #[verifier::loop_isolation(false)]
+    fn revoke(&self, plan: &mut Plan<P>, turn: TurnId)
+        requires
+            old(plan).inv(),
+            cancelled(old(plan).scratch@, turn),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+    {
+        let Some(open) = plan.open() else {
+            return;
+        };
+        match open.stage {
+            Stage::Starting | Stage::Backoff { .. } => {
+                plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Cancelled });
+            },
+            Stage::Model { since } => {
+                let id = plan.id(since);
+                plan.effect(Effect::CancelModel { id });
+            },
+            Stage::Tools => {
+                let count = plan.scratch.calls.len();
+                let mut index = open.first_call;
+                while index < count
+                    invariant
+                        plan.inv(),
+                        plan.start == old(plan).start,
+                        plan.from == old(plan).from,
+                        plan.scratch@ == old(plan).scratch@,
+                        plan.scratch@.turn == Turn::Open(open),
+                        plan.scratch@.calls.len() == count,
+                    decreases count - index,
+                {
+                    if let Phase::Dispatched { seq } = plan.scratch.calls[index].phase {
+                        let id = plan.id(seq);
+                        plan.effect(Effect::CancelTool { id });
+                    }
+                    index += 1;
+                }
+                self.settle(plan);
+            },
+        }
+    }
+
+    /// A stop's part for the actor's tasks: a running `Safe` one (a timer)
+    /// ends `NotStarted`, a running `Unsafe` one is signalled once, and a
+    /// stop already on its way is left to arrive.
+    #[verifier::loop_isolation(false)]
+    fn stop_tasks(plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+    {
+        let count = plan.scratch.tasks.len();
+        let mut at: usize = 0;
+        while at < count
+            invariant
+                plan.inv(),
+                plan.start == old(plan).start,
+                plan.from == old(plan).from,
+                plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.stopped == old(plan).scratch@.stopped,
+                plan.scratch@.tasks.len() == count,
+            decreases count - at,
+        {
+            let task = plan.scratch.tasks[at];
+            if !task.ended {
+                match task.class {
+                    Class::Safe => plan.end_task(at, Exit::NotStarted(Unstarted::Stopped)),
+                    Class::Unsafe => {
+                        let id = plan.id(task.seq);
+                        plan.effect(Effect::CancelTool { id });
+                    },
+                    Class::Keyed => {},
+                }
+            }
+            at += 1;
+        }
+    }
+
+    /// The stop cascade: a stop for every actor this stopped one spawned
+    /// that has none yet. Each is a `Keyed` task, started by its
+    /// `StopSent`.
+    #[verifier::loop_isolation(false)]
+    fn stop_children(plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+            old(plan).scratch@.stopped,
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped,
+    {
+        let count = plan.scratch.children.len();
+        let mut at: usize = 0;
+        while at < count
+            invariant
+                plan.inv(),
+                plan.start == old(plan).start,
+                plan.from == old(plan).from,
+                plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.stopped,
+                plan.scratch@.children == old(plan).scratch@.children,
+                count == plan.scratch@.children.len(),
+            decreases count - at,
+        {
+            let child = plan.scratch.children[at];
+            if !plan.scratch.stopping(child) {
+                assert(plan.scratch@.children[at as int] == child);
+                plan.emit(Record::StopSent { child });
+            }
+            at += 1;
+        }
+    }
+
+    /// A stop was just delivered: revoke the running turn, the tasks, and
+    /// stop every child (A3).
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn cascade(&self, plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+            old(plan).scratch@.stopped,
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+    {
+        if let Some(open) = plan.open() {
+            if matches!(open.intent, Intent::Proceed) {
+                plan.emit(Record::CancelRequested { turn: open.turn });
+                self.revoke(plan, open.turn);
+            }
+        }
+        Self::stop_tasks(plan);
+        Self::stop_children(plan);
+    }
+
     /// Decides what an event means: records to persist and effects to start
     /// once they are durable. Mutates nothing. The records apply to this
-    /// state one after another, and every tool run is licensed by them.
+    /// state one after another, and every effect is licensed by them.
     pub fn decide(&self, event: Event<P>) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -2024,7 +3579,9 @@ impl<P: Payload> Core<P> {
             decided(self@, decision),
     {
         match event {
-            Event::Message { message, turn, text } => self.on_message(message, turn, text),
+            Event::Born { born } => self.on_born(born),
+            Event::Rules { rules, file } => self.on_rules(rules, file),
+            Event::Deliver { envelope } => self.on_deliver(envelope),
             Event::Approve { call, verdict } => self.on_approve(&call, verdict),
             Event::Interrupt { turn } => self.on_interrupt(turn),
             Event::ModelParts { id, parts } => self.on_parts(id, parts),
@@ -2035,24 +3592,76 @@ impl<P: Payload> Core<P> {
         }
     }
 
-    fn on_message(&self, message: MessageId, turn: TurnId, text: Measured<P::Text>) -> (decision: Decision<P>)
+    fn on_born(&self, born: Born) -> (decision: Decision<P>)
         requires
             self.wf(),
         ensures
             decided(self@, decision),
     {
-        if self.seen(message) {
-            return quiet(Outcome::Exists);
+        if let Some(already) = &self.born {
+            return quiet(
+                if already.actor.same(born.actor) {
+                    Outcome::Exists
+                } else {
+                    Outcome::Rejected(Rejection::Mismatch)
+                },
+            );
         }
-        if matches!(self.turn, Turn::Open(_)) {
-            return quiet(Outcome::Rejected(Rejection::Busy));
-        }
-        if self.messages.len() >= self.limits.turns_per_session() {
-            return quiet(Outcome::Rejected(Rejection::SessionFull));
+        if born.depth > self.limits.depth() {
+            return quiet(Outcome::Rejected(Rejection::Limit));
         }
         let mut plan = self.plan();
-        plan.emit(Record::TurnStarted { turn, message, text });
-        self.start_step(&mut plan, turn, 0);
+        plan.emit(Record::Born { born });
+        plan.finish(Outcome::Accepted, Runs::New)
+    }
+
+    fn on_rules(&self, rules: Rules, file: Option<Measured<P::Text>>) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+    {
+        let mut plan = self.plan();
+        plan.emit(Record::RulesLoaded { rules, file });
+        plan.finish(Outcome::Accepted, Runs::New)
+    }
+
+    /// An envelope arrives. A repeat is `Exists` and records nothing (O2).
+    /// It lands in the mailbox, and a model call consumes it at the next
+    /// step boundary (L4, L5): it starts a turn if the actor is idle, and
+    /// a user's message steers a step waiting for approvals. A stop revokes
+    /// everything (A3).
+    fn on_deliver(&self, envelope: Envelope<P>) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+    {
+        let Some(born) = &self.born else {
+            return quiet(Outcome::Rejected(Rejection::Unborn));
+        };
+        if !born.actor.same(envelope.to) || matches!(envelope.id, EnvelopeId::Task(_)) {
+            return quiet(Outcome::Rejected(Rejection::Mismatch));
+        }
+        if self.seen(envelope.id) {
+            return quiet(Outcome::Exists);
+        }
+        if self.stopped {
+            return quiet(Outcome::Rejected(Rejection::Stopped));
+        }
+        if self.envelopes.len() >= self.limits.messages_per_actor() {
+            return quiet(Outcome::Rejected(Rejection::Limit));
+        }
+        let stop = matches!(envelope.body, Body::Stop);
+        let user = matches!(envelope.from, Address::User);
+        let mut plan = self.plan();
+        plan.emit(Record::Delivered { envelope });
+        if stop {
+            self.cascade(&mut plan);
+        } else if user {
+            self.steer(&mut plan);
+        }
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -2066,7 +3675,7 @@ impl<P: Payload> Core<P> {
         let Some(open) = plan.open() else {
             return quiet(Outcome::Rejected(Rejection::UnknownCall));
         };
-        if !(matches!(open.stage, Stage::Tools)) {
+        if !(matches!(open.stage, Stage::Tools)) || plan.scratch.stopped {
             return quiet(Outcome::Rejected(Rejection::UnknownCall));
         }
         let count = plan.scratch.calls.len();
@@ -2105,9 +3714,11 @@ impl<P: Payload> Core<P> {
             Verdict::Deny => plan.resolve(index, Exit::NotStarted(Unstarted::Denied)),
         }
         self.settle(&mut plan);
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
+    /// Esc: cancel the running turn. Its tasks and children are left alone.
     fn on_interrupt(&self, turn: TurnId) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -2125,34 +3736,8 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Exists);
         }
         plan.emit(Record::CancelRequested { turn });
-        match open.stage {
-            Stage::Starting | Stage::Backoff { .. } => {
-                plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Cancelled });
-            },
-            Stage::Model { since } => {
-                let id = plan.id(since);
-                plan.effect(Effect::CancelModel { id });
-            },
-            Stage::Tools => {
-                let count = plan.scratch.calls.len();
-                let mut index = open.first_call;
-                while index < count
-                    invariant
-                        plan.inv(),
-                        plan.start@ == self@,
-                        plan.scratch@.turn == Turn::Open(Open { intent: Intent::Cancel, ..open }),
-                        plan.scratch@.calls.len() == count,
-                    decreases count - index,
-                {
-                    if let Phase::Dispatched { seq } = plan.scratch.calls[index].phase {
-                        let id = plan.id(seq);
-                        plan.effect(Effect::CancelTool { id });
-                    }
-                    index += 1;
-                }
-                self.settle(&mut plan);
-            },
-        }
+        self.revoke(&mut plan, turn);
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -2247,7 +3832,7 @@ impl<P: Payload> Core<P> {
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
                 },
                 Intent::Proceed => {
-                    let retry = if retryable(fault) {
+                    let retry = if retryable(fault) && !plan.scratch.stopped {
                         match self.limits.retry_delay(open.retries) {
                             Some(delay) => Some(Reset::Retry { fault, delay }),
                             None => None,
@@ -2273,6 +3858,7 @@ impl<P: Payload> Core<P> {
                 },
             },
         }
+        self.begin(&mut plan);
         plan.ask();
         plan.finish(Outcome::Accepted, Runs::New)
     }
@@ -2324,9 +3910,27 @@ impl<P: Payload> Core<P> {
         found
     }
 
-    /// A run reported. Whichever of this report and the run's deadline
-    /// reaches the core first resolves the call; the other finds it
-    /// resolved and is stale (H1).
+    /// The running task that effect `id` runs, if `id` is the live one.
+    fn task_of(plan: &Plan<P>, id: EffectId) -> (found: Option<usize>)
+        requires
+            plan.inv(),
+        ensures
+            match found {
+                Some(at) => at < plan.scratch@.tasks.len() && plan.scratch@.tasks[at as int].seq == id.seq
+                    && !plan.scratch@.tasks[at as int].ended,
+                None => true,
+            },
+    {
+        if id.epoch.0 != plan.scratch.epoch.0 {
+            return None;
+        }
+        plan.scratch.running_task(id.seq)
+    }
+
+    /// A run reported: a call's, a task's or a delivery's. Whichever of
+    /// this report and the run's deadline reaches the core first resolves
+    /// it; the other finds it resolved and is stale (H1). A task's end is
+    /// its notification, and may start a turn.
     fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -2334,11 +3938,18 @@ impl<P: Payload> Core<P> {
             decided(self@, decision),
     {
         let mut plan = self.plan();
-        let Some(index) = Self::running_call(&plan, id) else {
+        if let Some(index) = Self::running_call(&plan, id) {
+            plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
+            self.settle(&mut plan);
+        } else if Self::task_of(&plan, id).is_some() {
+            proof {
+                assert(running(plan.scratch@.tasks, id.seq));
+            };
+            plan.emit(Record::TaskEnded { task: TaskId(id.seq), exit, output: Some(output) });
+        } else {
             return quiet(Outcome::Stale);
-        };
-        plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
-        self.settle(&mut plan);
+        }
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -2352,12 +3963,17 @@ impl<P: Payload> Core<P> {
             decided(self@, decision),
     {
         let mut plan = self.plan();
-        let Some(index) = Self::running_call(&plan, id) else {
+        if let Some(index) = Self::running_call(&plan, id) {
+            plan.resolve(index, Exit::Unknown);
+            plan.effect(Effect::CancelTool { id });
+            self.settle(&mut plan);
+        } else if let Some(at) = Self::task_of(&plan, id) {
+            plan.end_task(at, Exit::Unknown);
+            plan.effect(Effect::CancelTool { id });
+        } else {
             return quiet(Outcome::Stale);
-        };
-        plan.resolve(index, Exit::Unknown);
-        plan.effect(Effect::CancelTool { id });
-        self.settle(&mut plan);
+        }
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -2378,12 +3994,12 @@ impl<P: Payload> Core<P> {
         if !id.same(EffectId { epoch: self.epoch, seq: since }) {
             return quiet(Outcome::Stale);
         }
-        match open.intent {
-            Intent::Proceed => self.start_step(&mut plan, open.turn, u64::from(open.step.index)),
-            Intent::Cancel => {
-                plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
-            },
+        if matches!(open.intent, Intent::Proceed) && !plan.scratch.stopped {
+            self.start_step(&mut plan, open.turn, u64::from(open.step.index));
+        } else if matches!(open.intent, Intent::Cancel) {
+            plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
         }
+        self.begin(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -2392,13 +4008,17 @@ impl<P: Payload> Core<P> {
     // -----------------------------------------------------------------------
 
     /// What to do after `recover`: bump the epoch so replies to effects from
-    /// before the crash are stale, record the rules file if the shell read
-    /// rules other than those in force (`load`), then pick up where the log
-    /// stops. A dispatched call with no result is rerun if it is `Safe` or
-    /// `Keyed` and becomes `Unknown` if it is `Unsafe`; a model call in
+    /// before the crash are stale, record who the actor is if it is not yet
+    /// born (`born`, from the shell that made it) and the rules file if the
+    /// shell read rules other than those in force (`load`), then pick up
+    /// where the log stops. A stop the crash tore is finished first. A dispatched call
+    /// with no result is rerun if it is `Safe` or `Keyed` and becomes
+    /// `Unknown` if it is `Unsafe`; so is a running task. A model call in
     /// flight restarts its step; a backoff sleeps again. Like `decide`, the
-    /// records apply and every tool run is licensed by them.
-    pub fn resume(&self, load: Option<Loaded<P>>) -> (decision: Decision<P>)
+    /// records apply and every effect is licensed by them.
+    #[verifier::spinoff_prover]
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    pub fn resume(&self, born: Option<Born>, load: Option<Loaded<P>>) -> (decision: Decision<P>)
         requires
             self.wf(),
         ensures
@@ -2407,8 +4027,18 @@ impl<P: Payload> Core<P> {
         let mut plan = self.plan();
         let epoch = Epoch(bump(self.epoch.0));
         plan.emit(Record::EpochBumped { epoch });
+        if let Some(born) = born {
+            if plan.scratch.born.is_none() && born.depth <= self.limits.depth() {
+                plan.emit(Record::Born { born });
+            }
+        }
         if let Some(Loaded { rules, file }) = load {
             plan.emit(Record::RulesLoaded { rules, file });
+        }
+        if let Some(open) = plan.open() {
+            if plan.scratch.stopped && matches!(open.intent, Intent::Proceed) {
+                plan.emit(Record::CancelRequested { turn: open.turn });
+            }
         }
         if let Some(open) = plan.open() {
             match (open.stage, open.intent) {
@@ -2432,13 +4062,20 @@ impl<P: Payload> Core<P> {
                 },
             }
         }
+        Self::resume_tasks(&mut plan);
+        if plan.scratch.stopped {
+            Self::stop_children(&mut plan);
+        }
+        self.begin(&mut plan);
         plan.ask();
         plan.finish(Outcome::Accepted, Runs::All)
     }
 
-    /// Resolves each dispatched call with no result that cannot be rerun
-    /// `Unknown`: every `Unsafe` one, and when the turn is being cancelled,
-    /// the `Safe` and `Keyed` ones too.
+    /// Resolves each dispatched call with no result that is not rerun: a
+    /// background call's start (`Ok`: its task is running) and a `cancel`
+    /// are the core's own and are done again; every `Unsafe` one is
+    /// `Unknown`, and when the turn is being cancelled, the `Safe` and
+    /// `Keyed` ones too.
     #[verifier::loop_isolation(false)]
     fn resume_tools(plan: &mut Plan<P>)
         requires
@@ -2451,10 +4088,7 @@ impl<P: Payload> Core<P> {
             final(plan).from == old(plan).from,
             final(plan).scratch@.turn == old(plan).scratch@.turn,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
-            forall|index: int|
-                0 <= index < final(plan).scratch@.calls.len() && (
-                #[trigger] final(plan).scratch@.calls[index]).phase is Dispatched
-                    ==> final(plan).scratch@.calls[index].class is Some && final(plan).scratch@.calls[index].class != Some(Class::Unsafe),
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
     {
         let Some(open) = plan.open() else {
             return;
@@ -2468,29 +4102,82 @@ impl<P: Payload> Core<P> {
                 plan.from == old(plan).from,
                 plan.scratch@.turn == Turn::Open(open),
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.stopped == old(plan).scratch@.stopped,
                 plan.scratch@.calls.len() == count,
-                open.first_call <= index <= count,
-                forall|at: int|
-                    0 <= at < index && (#[trigger] plan.scratch@.calls[at]).phase is Dispatched
-                        ==> plan.scratch@.calls[at].class is Some && plan.scratch@.calls[at].class != Some(Class::Unsafe),
+                open.first_call <= index,
             decreases count - index,
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
-                // It was dispatched, so it may have acted: `NotStarted` would
-                // claim more than v knows (H2). A `Safe` or `Keyed` call is
-                // rerun only while the turn proceeds: rerunning it under a
-                // cancel would start something after the cancel is durable
-                // (A3).
-                match (plan.scratch.calls[index].class, open.intent) {
-                    (None | Some(Class::Unsafe), Intent::Proceed | Intent::Cancel)
-                    | (Some(Class::Safe | Class::Keyed), Intent::Cancel) => {
-                        plan.resolve(index, Exit::Unknown);
-                    },
-                    (Some(Class::Safe | Class::Keyed), Intent::Proceed) => {},
+                let (background, cancel) = match &plan.scratch.calls[index].shape {
+                    Some(shape) => (shape.background(), shape.task()),
+                    None => (false, None),
+                };
+                if background {
+                    plan.resolve(index, Exit::Ok);
+                } else if let Some(task) = cancel {
+                    let hit = Self::cancel_task(plan, task);
+                    plan.resolve(index, if hit { Exit::Ok } else { Exit::Failed });
+                } else {
+                    // It was dispatched, so it may have acted: `NotStarted`
+                    // would claim more than v knows (H2). A `Safe` or
+                    // `Keyed` call is rerun only while the turn proceeds:
+                    // rerunning it under a cancel would start something
+                    // after the cancel is durable (A3).
+                    match (plan.scratch.calls[index].class, open.intent) {
+                        (None | Some(Class::Unsafe), Intent::Proceed | Intent::Cancel)
+                        | (Some(Class::Safe | Class::Keyed), Intent::Cancel) => {
+                            plan.resolve(index, Exit::Unknown);
+                        },
+                        (Some(Class::Safe | Class::Keyed), Intent::Proceed) => {},
+                    }
                 }
             }
             index += 1;
+        }
+    }
+
+    /// Ends each running task that is not rerun: an `Unsafe` one is
+    /// `Unknown` (it may have acted, and never starts again, O1), and a
+    /// `Safe` one of a stopped actor never acts again. The others run again
+    /// (`finish` under `Runs::All`).
+    #[verifier::loop_isolation(false)]
+    fn resume_tasks(plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+            final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+    {
+        let stopped = plan.scratch.stopped;
+        let count = plan.scratch.tasks.len();
+        let mut at: usize = 0;
+        while at < count
+            invariant
+                plan.inv(),
+                plan.start == old(plan).start,
+                plan.from == old(plan).from,
+                plan.scratch@.epoch == old(plan).scratch@.epoch,
+                plan.scratch@.stopped == stopped,
+                plan.scratch@.tasks.len() == count,
+            decreases count - at,
+        {
+            let task = plan.scratch.tasks[at];
+            if !task.ended {
+                match task.class {
+                    Class::Unsafe => plan.end_task(at, Exit::Unknown),
+                    Class::Safe => {
+                        if stopped {
+                            plan.end_task(at, Exit::NotStarted(Unstarted::Stopped));
+                        }
+                    },
+                    Class::Keyed => {},
+                }
+            }
+            at += 1;
         }
     }
 }
@@ -2502,6 +4189,7 @@ pub open spec fn may_start(view: CoreView, turn: TurnId, index: int) -> bool {
     match view.turn {
         Turn::Open(open) => {
             &&& open.intent is Proceed
+            &&& !view.stopped
             &&& turn == open.turn
             &&& resolved(view.calls, 0, view.calls.len() as int)
             &&& match open.stage {
@@ -2539,19 +4227,41 @@ impl<P: Payload> PartialEq for Call<P> {
     }
 }
 
+impl<P: Payload> fmt::Debug for TaskRun<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskRun")
+            .field("call", &self.call)
+            .field("id", &self.id)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+impl<P: Payload> PartialEq for TaskRun<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.call == other.call && self.id == other.id && self.args == other.args
+    }
+}
+
 impl<P: Payload> fmt::Debug for Core<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Core")
             .field("limits", &self.limits)
             .field("epoch", &self.epoch)
             .field("seq", &self.seq)
-            .field("messages", &self.messages)
-            .field("name", &self.name)
+            .field("born", &self.born)
+            .field("stopped", &self.stopped)
+            .field("envelopes", &self.envelopes)
+            .field("mailbox", &self.mailbox)
+            .field("turns", &self.turns)
             .field("rules", &self.rules)
             .field("turn", &self.turn)
             .field("calls", &self.calls)
             .field("context", &self.context)
             .field("step_base", &self.step_base)
+            .field("tasks", &self.tasks)
+            .field("runs", &self.runs)
+            .field("children", &self.children)
             .finish_non_exhaustive()
     }
 }
@@ -2562,13 +4272,19 @@ impl<P: Payload> PartialEq for Core<P> {
         self.limits == other.limits
             && self.epoch == other.epoch
             && self.seq == other.seq
-            && self.messages == other.messages
-            && self.name == other.name
+            && self.born == other.born
+            && self.stopped == other.stopped
+            && self.envelopes == other.envelopes
+            && self.mailbox == other.mailbox
+            && self.turns == other.turns
             && self.rules == other.rules
             && self.turn == other.turn
             && self.calls == other.calls
             && self.context == other.context
             && self.step_base == other.step_base
+            && self.tasks == other.tasks
+            && self.runs == other.runs
+            && self.children == other.children
     }
 }
 
@@ -2589,9 +4305,16 @@ impl fmt::Display for Violation {
             Self::Epoch => "the epoch does not follow the current one",
             Self::WrongEnding => "the turn's ending does not match whether it was cancelled",
             Self::Overflow => "a counter would overflow",
-            Self::DuplicateMessage => "the message already started a turn",
+            Self::DuplicateEnvelope => "the envelope was already delivered",
             Self::WrongGrant => "the grant names no rule in force that fits the call",
             Self::Reborn => "the actor is already born",
+            Self::Unborn => "the actor is not born",
+            Self::Stopped => "the actor is stopped",
+            Self::Mismatch => "the envelope is not one this actor may be delivered",
+            Self::NoMail => "a turn starts with an empty mailbox",
+            Self::WrongCarry => "the step carries other than the batch at the head of the mailbox",
+            Self::UnknownTask => "no running task has that id",
+            Self::WrongStop => "the stop is not one this actor may send",
             Self::WrongResult => "the result claims more than v knows of the call",
         })
     }

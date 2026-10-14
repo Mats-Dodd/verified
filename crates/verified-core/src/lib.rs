@@ -20,8 +20,10 @@
 pub mod effect;
 pub mod event;
 pub mod machine;
+pub mod mailbox;
 pub mod rules;
 
 pub use effect::{Approved, Decision, Effect, Outcome, Pending, Rejection, ToolCall};
 pub use event::{Event, Loaded, ModelExit, Verdict};
-pub use machine::{Core, Corrupt, Violation};
+pub use machine::{Core, Corrupt, Origin, Task, Violation};
+pub use mailbox::Waiting;

@@ -21,12 +21,12 @@ pub use limits::{Limits, Schedule};
 
 pub use tea::run;
 
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 
 use crate::seam::{Clock, Entropy, id_entropy};
 
 /// A fresh session id, minted from the seams.
 #[must_use]
-pub fn new_session(clock: &dyn Clock, entropy: &dyn Entropy) -> SessionId {
-    SessionId::from_parts(clock.now(), &id_entropy(entropy))
+pub fn new_session(clock: &dyn Clock, entropy: &dyn Entropy) -> ActorId {
+    ActorId::from_parts(clock.now(), &id_entropy(entropy))
 }

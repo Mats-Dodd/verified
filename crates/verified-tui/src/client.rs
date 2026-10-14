@@ -38,7 +38,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::Millis;
-use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
+use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
     Approve, ApproveReply, Cancel, CancelReply, CreateSession, CreateSessionReply, DecodeError,
@@ -136,17 +136,17 @@ impl ClientError {
 pub enum Command {
     CreateSession(CreateSession),
     SendMessage {
-        session: SessionId,
+        session: ActorId,
         body: SendMessage,
     },
     Approve {
-        session: SessionId,
+        session: ActorId,
         body: Approve,
     },
     /// Cancels `turn`. Always names the turn: a cancel meant for one turn
     /// must never stop the next.
     Cancel {
-        session: SessionId,
+        session: ActorId,
         turn: TurnId,
     },
 }
@@ -155,7 +155,7 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Answer {
     SessionCreated {
-        session: SessionId,
+        session: ActorId,
         result: Result<CreateSessionReply, ClientError>,
     },
     MessageSent {
@@ -358,7 +358,7 @@ impl Client {
     /// wrapped by `wrap` and delivered to `inbox`, waiting while it is full.
     pub async fn follow<T, W>(
         &self,
-        session: SessionId,
+        session: ActorId,
         from: Offset,
         inbox: &mpsc::Sender<T>,
         wrap: W,
@@ -409,7 +409,7 @@ impl Client {
     /// after them arrives, so a drop mid-read redelivers nothing twice.
     async fn read_live<T, W>(
         &self,
-        session: SessionId,
+        session: ActorId,
         offset: &mut Offset,
         progress: &mut Progress,
         inbox: &mpsc::Sender<T>,

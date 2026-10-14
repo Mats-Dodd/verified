@@ -21,7 +21,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use verified_domain::Millis;
-use verified_domain::id::{MessageId, SessionId, UnixMillis};
+use verified_domain::id::{ActorId, MessageId, UnixMillis};
 use verified_server::daemon;
 use verified_server::limits::ServerLimits;
 use verified_server::log::{MemDisk, MemLogStore};
@@ -118,7 +118,7 @@ async fn commands_and_streams_over_http() {
         "the daemon's build"
     );
 
-    let session = SessionId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[3; 10]);
+    let session = ActorId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[3; 10]);
     let create = CreateSession {
         session_id: session,
     }
@@ -231,7 +231,7 @@ async fn commands_and_streams_over_http() {
         "the real client parsed the fake's SSE"
     );
 
-    let unknown = SessionId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[9; 10]);
+    let unknown = ActorId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[9; 10]);
     let (status, _) = call(
         &client,
         Method::GET,
@@ -244,8 +244,8 @@ async fn commands_and_streams_over_http() {
     tasks.shutdown().cancel();
 }
 
-fn session_at(byte: u8) -> SessionId {
-    SessionId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[byte; 10])
+fn session_at(byte: u8) -> ActorId {
+    ActorId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[byte; 10])
 }
 
 fn rejected(status: StatusCode, body: &[u8]) -> (StatusCode, Rejection) {
@@ -256,7 +256,7 @@ fn rejected(status: StatusCode, body: &[u8]) -> (StatusCode, Rejection) {
 async fn follow(
     client: &HttpClient,
     base: &str,
-    session: SessionId,
+    session: ActorId,
 ) -> hyper::Response<hyper::body::Incoming> {
     let live = Request::builder()
         .method(Method::GET)
@@ -270,7 +270,7 @@ async fn follow(
 
 /// Every chunk of `session`'s stream, followed live until a control event
 /// says it is up to date; `None` when the follow is refused.
-async fn caught_up(client: &HttpClient, base: &str, session: SessionId) -> Option<Vec<UiChunk>> {
+async fn caught_up(client: &HttpClient, base: &str, session: ActorId) -> Option<Vec<UiChunk>> {
     let response = follow(client, base, session).await;
     if response.status() != StatusCode::OK {
         return None;

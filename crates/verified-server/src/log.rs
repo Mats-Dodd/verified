@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use verified_domain::Record;
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 
 use crate::payload::Parsed;
 use crate::shim::fs;
@@ -478,7 +478,7 @@ pub struct MemDisk {
         clippy::disallowed_types,
         reason = "test disk: the one MemLog using it writes; readers are tests between restarts; dropped with the test"
     )]
-    files: Arc<std::sync::Mutex<std::collections::BTreeMap<SessionId, Vec<u8>>>>,
+    files: Arc<std::sync::Mutex<std::collections::BTreeMap<ActorId, Vec<u8>>>>,
 }
 
 impl MemDisk {
@@ -492,7 +492,7 @@ impl MemDisk {
     /// # Panics
     /// When a test panicked while holding the disk.
     #[must_use]
-    pub fn bytes(&self, session: SessionId) -> Option<Vec<u8>> {
+    pub fn bytes(&self, session: ActorId) -> Option<Vec<u8>> {
         self.files
             .lock()
             .expect("the disk lock is never poisoned")
@@ -504,14 +504,14 @@ impl MemDisk {
     ///
     /// # Panics
     /// When a test panicked while holding the disk.
-    pub fn set_bytes(&self, session: SessionId, bytes: Vec<u8>) {
+    pub fn set_bytes(&self, session: ActorId, bytes: Vec<u8>) {
         self.files
             .lock()
             .expect("the disk lock is never poisoned")
             .insert(session, bytes);
     }
 
-    fn sessions(&self) -> Vec<SessionId> {
+    fn sessions(&self) -> Vec<ActorId> {
         self.files
             .lock()
             .expect("the disk lock is never poisoned")
@@ -520,7 +520,7 @@ impl MemDisk {
             .collect()
     }
 
-    fn append(&self, session: SessionId, bytes: &[u8]) {
+    fn append(&self, session: ActorId, bytes: &[u8]) {
         self.files
             .lock()
             .expect("the disk lock is never poisoned")
@@ -534,7 +534,7 @@ impl MemDisk {
 #[derive(Debug)]
 pub struct MemLog {
     disk: MemDisk,
-    session: SessionId,
+    session: ActorId,
     next: u64,
     max_line: usize,
     max_file: u64,
@@ -573,22 +573,20 @@ pub trait LogStore: Send + Sync + fmt::Debug {
     /// # Errors
     /// IO errors, a log name that is not a session id, or more logs than
     /// the store's bound.
-    async fn list(&self) -> Result<Vec<SessionId>, LogError>;
+    async fn list(&self) -> Result<Vec<ActorId>, LogError>;
 
     /// Creates `session`'s empty log durably.
     ///
     /// # Errors
     /// It exists, or IO errors.
-    async fn create(&self, session: SessionId) -> Result<Box<dyn Log>, LogError>;
+    async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError>;
 
     /// Opens `session`'s log, cutting a torn tail, with its records.
     ///
     /// # Errors
     /// IO errors, corruption, or a record that does not parse.
-    async fn open(
-        &self,
-        session: SessionId,
-    ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError>;
+    async fn open(&self, session: ActorId)
+    -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError>;
 }
 
 /// `<dir>/<session id>.log`, through the fs shim.
@@ -611,14 +609,14 @@ impl FileLogStore {
         }
     }
 
-    fn path(&self, session: SessionId) -> PathBuf {
+    fn path(&self, session: ActorId) -> PathBuf {
         self.dir.join(format!("{session}.log"))
     }
 }
 
 #[async_trait]
 impl LogStore for FileLogStore {
-    async fn list(&self) -> Result<Vec<SessionId>, LogError> {
+    async fn list(&self) -> Result<Vec<ActorId>, LogError> {
         let entries = fs::list(&self.dir, self.max_sessions.saturating_mul(2))
             .await
             .map_err(io_error(&self.dir))?;
@@ -628,7 +626,7 @@ impl LogStore for FileLogStore {
             let Some(stem) = name.strip_suffix(".log") else {
                 continue;
             };
-            let session = SessionId::parse(stem).map_err(|_bad| LogError::BadName {
+            let session = ActorId::parse(stem).map_err(|_bad| LogError::BadName {
                 path: self.dir.display().to_string(),
                 name: name.clone(),
             })?;
@@ -646,14 +644,14 @@ impl LogStore for FileLogStore {
         Ok(sessions)
     }
 
-    async fn create(&self, session: SessionId) -> Result<Box<dyn Log>, LogError> {
+    async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
         let log = FileLog::create(&self.path(session), self.max_line, self.max_file).await?;
         Ok(Box::new(log))
     }
 
     async fn open(
         &self,
-        session: SessionId,
+        session: ActorId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
         let (log, records) =
             FileLog::open(&self.path(session), self.max_line, self.max_file).await?;
@@ -682,11 +680,11 @@ impl MemLogStore {
 
 #[async_trait]
 impl LogStore for MemLogStore {
-    async fn list(&self) -> Result<Vec<SessionId>, LogError> {
+    async fn list(&self) -> Result<Vec<ActorId>, LogError> {
         Ok(self.disk.sessions())
     }
 
-    async fn create(&self, session: SessionId) -> Result<Box<dyn Log>, LogError> {
+    async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
         self.disk.append(session, &[]);
         Ok(Box::new(MemLog {
             disk: self.disk.clone(),
@@ -699,7 +697,7 @@ impl LogStore for MemLogStore {
 
     async fn open(
         &self,
-        session: SessionId,
+        session: ActorId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
         let bytes = self.disk.bytes(session).unwrap_or_default();
         let scan =
@@ -728,7 +726,7 @@ impl LogStore for MemLogStore {
 )]
 mod tests {
     use proptest::prelude::*;
-    use verified_domain::id::{SessionId, UnixMillis};
+    use verified_domain::id::{ActorId, UnixMillis};
     use verified_domain::{Epoch, Record};
 
     use super::{
@@ -765,21 +763,22 @@ mod tests {
 
     /// A record whose line is about `size` bytes.
     fn sized(size: usize) -> Record<Parsed> {
-        Record::TurnStarted {
-            turn: verified_domain::TurnId::from_parts(
-                UnixMillis::new(1_700_000_000_000).expect("a time"),
-                &[1; 10],
-            ),
-            message: verified_domain::MessageId::from_parts(
-                UnixMillis::new(1_700_000_000_000).expect("a time"),
-                &[u8::try_from(size % 251).expect("small"); 10],
-            ),
-            text: measure("x".repeat(size)),
+        Record::Delivered {
+            envelope: verified_domain::Envelope {
+                id: verified_domain::EnvelopeId::User(verified_domain::MessageId::from_parts(
+                    UnixMillis::new(1_700_000_000_000).expect("a time"),
+                    &[u8::try_from(size % 251).expect("small"); 10],
+                )),
+                from: verified_domain::Address::User,
+                to: session(),
+                reply_to: None,
+                body: verified_domain::Body::Text(measure("x".repeat(size))),
+            },
         }
     }
 
-    fn session() -> SessionId {
-        SessionId::from_parts(
+    fn session() -> ActorId {
+        ActorId::from_parts(
             UnixMillis::new(1_700_000_000_000).expect("a time"),
             &[3; 10],
         )

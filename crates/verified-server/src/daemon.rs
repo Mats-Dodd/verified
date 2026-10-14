@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 use verified_wire::command::Outcome as WireOutcome;
 
 use crate::limits::ServerLimits;
@@ -56,7 +56,7 @@ pub enum DaemonError {
     Log(#[from] LogError),
     #[error("session {session}: {source}")]
     Shell {
-        session: SessionId,
+        session: ActorId,
         #[source]
         source: ShellError,
     },
@@ -86,11 +86,11 @@ pub enum CreateError {
 
 enum RegistryInput {
     Create {
-        session: SessionId,
+        session: ActorId,
         reply: oneshot::Sender<Result<(WireOutcome, SessionHandle), CreateError>>,
     },
     Lookup {
-        session: SessionId,
+        session: ActorId,
         reply: oneshot::Sender<Option<SessionHandle>>,
     },
 }
@@ -114,7 +114,7 @@ impl Registry {
     /// Too many sessions, a log that could not be created, or shutdown.
     pub async fn create(
         &self,
-        session: SessionId,
+        session: ActorId,
     ) -> Result<(WireOutcome, SessionHandle), CreateError> {
         let (reply, answer) = oneshot::channel();
         self.inbox
@@ -125,7 +125,7 @@ impl Registry {
     }
 
     /// The session, if the daemon hosts it.
-    pub async fn lookup(&self, session: SessionId) -> Option<SessionHandle> {
+    pub async fn lookup(&self, session: ActorId) -> Option<SessionHandle> {
         let (reply, answer) = oneshot::channel();
         self.inbox
             .send(RegistryInput::Lookup { session, reply })
@@ -136,7 +136,7 @@ impl Registry {
 }
 
 struct RegistryTask {
-    sessions: BTreeMap<SessionId, SessionHandle>,
+    sessions: BTreeMap<ActorId, SessionHandle>,
     store: Arc<dyn LogStore>,
     seams: Seams,
     config: Arc<ShellConfig>,
@@ -146,7 +146,7 @@ struct RegistryTask {
 impl RegistryTask {
     fn spawn_session(
         &mut self,
-        session: SessionId,
+        session: ActorId,
         log: Box<dyn crate::log::Log>,
         records: Vec<verified_domain::Record<crate::payload::Parsed>>,
     ) -> Result<SessionHandle, DaemonError> {
@@ -170,7 +170,7 @@ impl RegistryTask {
 
     async fn create(
         &mut self,
-        session: SessionId,
+        session: ActorId,
     ) -> Result<(WireOutcome, SessionHandle), CreateError> {
         if let Some(handle) = self.sessions.get(&session) {
             return Ok((WireOutcome::Exists, handle.clone()));

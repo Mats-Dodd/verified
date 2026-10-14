@@ -104,6 +104,9 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                     Record::Approved { .. }
                     | Record::Born { .. }
                     | Record::RulesLoaded { .. }
+                    | Record::Delivered { .. }
+                    | Record::TaskEnded { .. }
+                    | Record::StopSent { .. }
                     | Record::TurnStarted { .. }
                     | Record::StepStarted { .. }
                     | Record::ModelOutput { .. }
@@ -116,6 +119,9 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
             }
             Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }

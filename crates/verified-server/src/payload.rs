@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use verified_domain::id::{CallId, SessionId, ToolName};
+use verified_domain::id::{ActorId, CallId, ToolName};
 use verified_domain::{Measured, Payload, Proposal, Request, Shape, Tool};
 use verified_wire::chunk::FinishReason;
 
@@ -163,7 +163,7 @@ impl Sibling {
     /// of `session`: `verified-<session>-<seq>`, unique to that call. A
     /// session id's text is lowercase hex and `-`, a seq is decimal digits.
     #[must_use]
-    pub fn staged(session: SessionId, seq: u64) -> Self {
+    pub fn staged(session: ActorId, seq: u64) -> Self {
         Self(format!("verified-{session}-{seq}"))
     }
 
@@ -339,13 +339,17 @@ impl ToolArgs {
     /// `edit`, the command of a `bash`.
     #[must_use]
     pub fn shape(&self) -> Shape {
-        let subject = match self {
-            Self::Read { path } | Self::Edit { path, .. } => path.as_str(),
-            Self::Bash { command } => command.as_str(),
-        };
-        Shape {
-            tool: self.tool(),
-            subject: subject.as_bytes().to_vec(),
+        match self {
+            Self::Read { path } => Shape::Read {
+                subject: path.as_str().as_bytes().to_vec(),
+            },
+            Self::Edit { path, .. } => Shape::Edit {
+                subject: path.as_str().as_bytes().to_vec(),
+            },
+            Self::Bash { command } => Shape::Bash {
+                subject: command.as_str().as_bytes().to_vec(),
+                background: false,
+            },
         }
     }
 
@@ -458,7 +462,7 @@ pub fn proposal(id: &CallId, name: &ToolName, input: &ToolInput) -> Proposal<Par
 mod tests {
     use super::{ModelPart, Parsed, PathError, ProjectPath, Sibling, ToolArgs, ToolInput, measure};
     use verified_domain::Record;
-    use verified_domain::id::{CallId, SessionId, ToolName};
+    use verified_domain::id::{ActorId, CallId, ToolName};
 
     #[test]
     fn project_paths_stay_inside() {
@@ -498,7 +502,7 @@ mod tests {
     /// reserved marker.
     #[test]
     fn staged_names_are_reserved() {
-        let session = SessionId::parse("01900000-0000-7000-8000-000000000001").expect("a v7");
+        let session = ActorId::parse("01900000-0000-7000-8000-000000000001").expect("a v7");
         let staged = Sibling::staged(session, u64::MAX);
         let name = format!("src/.lib.rs.{}", staged.as_str());
         assert_eq!(ProjectPath::parse(&name), Err(PathError::Reserved));
@@ -552,8 +556,7 @@ mod tests {
     fn records_round_trip_in_the_log_shape() {
         let record: Record<Parsed> = Record::ModelOutput {
             step: verified_domain::StepId {
-                turn: verified_domain::TurnId::parse("01900000-0000-7000-8000-000000000001")
-                    .expect("a v7"),
+                turn: verified_domain::TurnId(7),
                 index: 0,
             },
             parts: measure(vec![ModelPart::ToolCall {
@@ -565,7 +568,7 @@ mod tests {
         let json = serde_json::to_string(&record).expect("serializes");
         assert_eq!(
             json,
-            r#"{"type":"ModelOutput","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"parts":{"body":[{"type":"tool-call","toolCallId":"toolu_1","toolName":"read","input":{"path":"a"}}],"bytes":84}}"#,
+            r#"{"type":"ModelOutput","step":{"turn":"7","index":0},"parts":{"body":[{"type":"tool-call","toolCallId":"toolu_1","toolName":"read","input":{"path":"a"}}],"bytes":84}}"#,
             "the log's payload shape"
         );
         assert_eq!(
@@ -573,7 +576,7 @@ mod tests {
             Some(record),
             "round trip"
         );
-        let wrong_slot = r#"{"type":"ModelOutput","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"parts":{"body":"hi","bytes":4}}"#;
+        let wrong_slot = r#"{"type":"ModelOutput","step":{"turn":"7","index":0},"parts":{"body":"hi","bytes":4}}"#;
         assert!(
             serde_json::from_str::<Record<Parsed>>(wrong_slot).is_err(),
             "text in the parts slot does not parse"

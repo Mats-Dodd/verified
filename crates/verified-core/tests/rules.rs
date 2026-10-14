@@ -7,9 +7,9 @@ use proptest::prelude::*;
 use verified_core::rules::grant;
 use verified_core::{Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Violation};
 use verified_domain::{
-    ActorName, Born, CallId, CallIx, Grant, Limits, LimitsConfig, Measured, MessageId, Millis,
-    Pattern, Payload, Proposal, Record, Request, Rule, Rules, Shape, StepId, Tool, TurnId, Unit,
-    UnixMillis,
+    ActorId, ActorName, Address, Body, Born, CallId, CallIx, Envelope, EnvelopeId, Grant, Limits,
+    LimitsConfig, Measured, MessageId, Millis, Pattern, Payload, Proposal, Record, Request, Rule,
+    Rules, Shape, StepId, Tool, TurnId, Unit, UnixMillis,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,12 +22,13 @@ fn reference(rules: &Rules, name: Option<&ActorName>, shape: &Shape) -> Option<u
         .rules
         .iter()
         .position(|rule| {
-            rule.tool == shape.tool
+            let subject = shape.subject().map_or(&[][..], Vec::as_slice);
+            rule.tool == shape.tool()
                 && rule.actor.as_ref().is_none_or(|actor| Some(actor) == name)
                 && match &rule.subject {
                     Pattern::Any => true,
-                    Pattern::Exact(bytes) => *bytes == shape.subject,
-                    Pattern::Prefix(bytes) => shape.subject.starts_with(bytes),
+                    Pattern::Exact(bytes) => bytes.as_slice() == subject,
+                    Pattern::Prefix(bytes) => subject.starts_with(bytes),
                 }
         })
         .and_then(|index| u64::try_from(index).ok())
@@ -38,8 +39,23 @@ fn tool() -> impl Strategy<Value = Tool> {
         Just(Tool::Read),
         Just(Tool::Edit),
         Just(Tool::Bash),
-        Just(Tool::Send)
+        Just(Tool::Send),
+        Just(Tool::Wake)
     ]
+}
+
+/// A call of `tool` on `subject` (a tool without a subject ignores it).
+fn shape(tool: Tool, subject: Vec<u8>) -> Shape {
+    match tool {
+        Tool::Read => Shape::Read { subject },
+        Tool::Edit => Shape::Edit { subject },
+        Tool::Bash => Shape::Bash {
+            subject,
+            background: false,
+        },
+        Tool::Send => Shape::Send { subject },
+        Tool::Spawn | Tool::Wake | Tool::Tasks | Tool::Cancel => Shape::Wake,
+    }
 }
 
 /// Short subjects over a small alphabet, so patterns often fit.
@@ -82,7 +98,7 @@ proptest! {
         subject in bytes(),
     ) {
         let rules = Rules { rules };
-        let shape = Shape { tool, subject };
+        let shape = shape(tool, subject);
         prop_assert_eq!(
             grant(&rules, name.as_ref(), &shape),
             reference(&rules, name.as_ref(), &shape)
@@ -111,14 +127,17 @@ impl Payload for Shaped {
     }
 
     fn tool(args: &Shape) -> Tool {
-        args.tool
+        args.tool()
     }
 }
 
 fn limits() -> Limits {
     let count = |value: usize| NonZeroUsize::new(value).expect("non-zero");
     Limits::new(LimitsConfig {
-        turns_per_session: count(4),
+        turns_per_actor: count(4),
+        messages_per_actor: count(4),
+        tasks_per_actor: count(4),
+        depth: 1,
         steps_per_turn: NonZeroU32::new(4).expect("non-zero"),
         calls_per_step: count(4),
         calls_per_turn: count(8),
@@ -133,18 +152,40 @@ fn at(number: u64) -> UnixMillis {
     UnixMillis::new(1_700_000_000_000u64.saturating_add(number)).expect("a 48-bit time")
 }
 
-fn turn(number: u64) -> TurnId {
-    TurnId::from_parts(at(number), &[1; 10])
+fn actor() -> ActorId {
+    ActorId::from_parts(at(0), &[4; 10])
+}
+
+/// The actor named `name`, born.
+fn born(name: &str) -> Record<Shaped> {
+    Record::Born {
+        born: Born::root(
+            actor(),
+            named(name),
+            vec![Tool::Read, Tool::Edit, Tool::Bash],
+        ),
+    }
+}
+
+/// The user's message `number`.
+fn envelope(number: u64) -> Envelope<Shaped> {
+    Envelope {
+        id: EnvelopeId::User(MessageId::from_parts(at(number), &[2; 10])),
+        from: Address::User,
+        to: actor(),
+        reply_to: None,
+        body: Body::Text(Measured {
+            body: Unit,
+            bytes: 1,
+        }),
+    }
 }
 
 fn call(name: &str, tool: Tool, subject: &str) -> Proposal<Shaped> {
     Proposal {
         id: CallId::parse(name).expect("a protocol id"),
         request: Request::Run {
-            args: Shape {
-                tool,
-                subject: subject.as_bytes().to_vec(),
-            },
+            args: shape(tool, subject.as_bytes().to_vec()),
         },
     }
 }
@@ -200,13 +241,8 @@ impl Driver {
 
     /// Starts a turn whose model proposes `calls`; the records of the step.
     fn propose(&mut self, number: u64, calls: Vec<Proposal<Shaped>>) -> Vec<Record<Shaped>> {
-        let (_, effects) = self.send(Event::Message {
-            message: MessageId::from_parts(at(number), &[2; 10]),
-            turn: turn(number),
-            text: Measured {
-                body: Unit,
-                bytes: 1,
-            },
+        let (_, effects) = self.send(Event::Deliver {
+            envelope: envelope(number),
         });
         let id = effects
             .iter()
@@ -216,7 +252,8 @@ impl Driver {
                 | Effect::AskApproval { .. }
                 | Effect::RunTool { .. }
                 | Effect::CancelTool { .. }
-                | Effect::Sleep { .. } => None,
+                | Effect::Sleep { .. }
+                | Effect::Stop { .. } => None,
             })
             .expect("a model call");
         let from = self.log.len();
@@ -235,6 +272,9 @@ fn grants(records: &[Record<Shaped>]) -> Vec<(CallIx, Grant)> {
             Record::Approved { call, by } => Some((*call, *by)),
             Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
@@ -263,20 +303,7 @@ fn a_rule_grants_only_what_it_fits() {
         call("edit", Tool::Edit, "src/lib.rs"),
         call("read", Tool::Read, "README.md"),
     ];
-    let mut unnamed = Driver::with(vec![loaded.clone()]);
-    assert_eq!(
-        grants(&unnamed.propose(1, calls.clone())),
-        vec![(CallIx(0), Grant::Rule { rule: 0, rules: 0 })],
-        "an actor with no name: only `cargo test…` is granted"
-    );
-    let mut main = Driver::with(vec![
-        Record::Born {
-            born: Born {
-                name: named("main"),
-            },
-        },
-        loaded.clone(),
-    ]);
+    let mut main = Driver::with(vec![born("main"), loaded.clone()]);
     assert_eq!(
         grants(&main.propose(1, calls.clone())),
         vec![
@@ -285,14 +312,7 @@ fn a_rule_grants_only_what_it_fits() {
         ],
         "`main` may also edit; `rm` and the read ask (no rule allows reads)"
     );
-    let mut helper = Driver::with(vec![
-        Record::Born {
-            born: Born {
-                name: named("helper"),
-            },
-        },
-        loaded,
-    ]);
+    let mut helper = Driver::with(vec![born("helper"), loaded]);
     assert_eq!(
         grants(&helper.propose(1, calls)),
         vec![(CallIx(0), Grant::Rule { rule: 0, rules: 1 })],
@@ -304,47 +324,37 @@ fn a_rule_grants_only_what_it_fits() {
 /// load, a grant naming the old ones does not apply.
 #[test]
 fn rules_pin_the_version_in_force() {
-    let mut driver = Driver::with(vec![Record::RulesLoaded {
+    let loaded = Record::RulesLoaded {
         rules: rules(),
         file: None,
-    }]);
+    };
+    let mut driver = Driver::with(vec![loaded.clone(), born("main")]);
     let step = driver.propose(1, vec![call("tests", Tool::Bash, "cargo test")]);
     assert_eq!(
         grants(&step),
         vec![(CallIx(0), Grant::Rule { rule: 0, rules: 0 })],
         "granted by the rules at seq 0"
     );
-    let reloaded = Record::RulesLoaded {
-        rules: rules(),
-        file: None,
+    let first = StepId {
+        turn: TurnId(3),
+        index: 0,
     };
     let mut log = vec![
-        Record::RulesLoaded {
-            rules: rules(),
-            file: None,
+        loaded.clone(),
+        born("main"),
+        Record::Delivered {
+            envelope: envelope(1),
         },
-        Record::TurnStarted {
-            turn: turn(1),
-            message: MessageId::from_parts(at(1), &[2; 10]),
-            text: Measured {
-                body: Unit,
-                bytes: 1,
-            },
-        },
+        Record::TurnStarted { turn: TurnId(3) },
         Record::StepStarted {
-            step: StepId {
-                turn: turn(1),
-                index: 0,
-            },
+            step: first,
+            carries: vec![envelope(1).id],
         },
         Record::StepFinished {
-            step: StepId {
-                turn: turn(1),
-                index: 0,
-            },
+            step: first,
             calls: vec![call("tests", Tool::Bash, "cargo test")],
         },
-        reloaded,
+        loaded,
     ];
     let mut stale = log.clone();
     stale.push(Record::Approved {
@@ -354,17 +364,17 @@ fn rules_pin_the_version_in_force() {
     assert_eq!(
         Core::recover(limits(), &stale),
         Err(Corrupt {
-            seq: 5,
+            seq: 7,
             violation: Violation::WrongGrant
         }),
         "the rules at seq 0 are no longer in force"
     );
     log.push(Record::Approved {
         call: CallIx(0),
-        by: Grant::Rule { rule: 0, rules: 4 },
+        by: Grant::Rule { rule: 0, rules: 6 },
     });
     assert!(
         Core::recover(limits(), &log).is_ok(),
-        "the rules at seq 4 are"
+        "the rules at seq 6 are"
     );
 }

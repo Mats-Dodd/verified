@@ -90,8 +90,41 @@ pub fn replay(limits: Limits, trace: &[Observed]) -> Result<Replayed, Mismatch> 
 }
 
 /// The model in trace mode under the daemon's core `limits`, its
-/// deliveries carrying the values `trace`'s do.
+/// deliveries carrying the values `trace`'s do, for the actor the daemon's
+/// first resume recorded.
 #[must_use]
 pub fn harness(limits: Limits, trace: &[Observed]) -> Harness {
-    Harness::trace(limits, trace.iter().filter_map(Observed::event).cloned())
+    let harness = Harness::trace(limits, trace.iter().filter_map(Observed::event).cloned());
+    let born = trace.iter().find_map(|observed| match observed {
+        Observed::Resumed(records) => records.iter().find_map(|record| match record {
+            Record::Born { born } => Some(born.clone()),
+            Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => None,
+        }),
+        Observed::Booted(_)
+        | Observed::Decided(..)
+        | Observed::Refused
+        | Observed::Acked { .. }
+        | Observed::Dispatched(_)
+        | Observed::Mutated(_)
+        | Observed::Ran { .. }
+        | Observed::Read(_) => None,
+    });
+    match born {
+        Some(born) => harness.with_born(born),
+        None => harness,
+    }
 }

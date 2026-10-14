@@ -441,7 +441,7 @@ fn a_small_log() -> ServerLimits {
 /// Seeds whose turns fill [`a_small_log`] while a turn runs, and the
 /// simulated millisecond of a crash added as it fills (seed 28's leaves
 /// a resume the full log refuses).
-const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_424))];
+const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_585))];
 
 /// A full log ends the running turn within its reserve, refuses what
 /// follows, and the run is still a path of the model: the refused

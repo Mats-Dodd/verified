@@ -15,6 +15,7 @@
     clippy::arithmetic_side_effects,
     reason = "Verus proves no arithmetic in this module overflows"
 )]
+#![expect(clippy::len_zero, reason = "vstd specifies `len`, not `is_empty`")]
 
 use vstd::prelude::*;
 
@@ -127,7 +128,7 @@ pub const fn rule_fits(rule: &Rule, name: Option<&ActorName>, shape: &Shape) -> 
     ensures
         fit == fits(rule@, name_view(name), shape@),
 {
-    if !rule.tool.same(shape.tool) {
+    if !rule.tool.same(shape.tool()) {
         return false;
     }
     let actor_fits = match (&rule.actor, name) {
@@ -138,10 +139,20 @@ pub const fn rule_fits(rule: &Rule, name: Option<&ActorName>, shape: &Shape) -> 
     if !actor_fits {
         return false;
     }
-    match &rule.subject {
-        Pattern::Any => true,
-        Pattern::Exact(bytes) => same_bytes(bytes.as_slice(), shape.subject.as_slice()),
-        Pattern::Prefix(bytes) => starts_with(shape.subject.as_slice(), bytes.as_slice()),
+    match (&rule.subject, shape.subject()) {
+        (Pattern::Any, _) => true,
+        (Pattern::Exact(bytes), Some(subject)) => same_bytes(bytes.as_slice(), subject.as_slice()),
+        (Pattern::Prefix(bytes), Some(subject)) => starts_with(subject.as_slice(), bytes.as_slice()),
+        // No subject: only an empty pattern fits it.
+        (Pattern::Exact(bytes) | Pattern::Prefix(bytes), None) => {
+            proof {
+                if bytes@.len() == 0 {
+                    assert(bytes@ =~= shape@.subject);
+                    assert(shape@.subject.take(0) =~= bytes@);
+                }
+            };
+            bytes.len() == 0
+        },
     }
 }
 

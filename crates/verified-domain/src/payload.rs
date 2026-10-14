@@ -5,7 +5,7 @@
 //! call's arguments are for. Production fills the slots with parsed types
 //! (the user's text, raw model parts, `ToolArgs`, a reason, a tool's output);
 //! the model checker fills them with [`Unit`] and lets a call's arguments be
-//! just its [`Tool`]. Because every slot has its own type, a record with the
+//! just its [`Shape`]. Because every slot has its own type, a record with the
 //! wrong kind of payload in a slot does not type-check or deserialize.
 
 use core::fmt;
@@ -68,7 +68,7 @@ pub struct Measured<T> {
 pub struct Unit;
 
 /// The payload the model checker runs: every slot empty, and a call's
-/// arguments only its tool (its subject is empty).
+/// arguments only its shape (the model drops its subject).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[verifier::external_derive]
 pub struct Abstract;
@@ -76,22 +76,20 @@ pub struct Abstract;
 impl Payload for Abstract {
     type Text = Unit;
     type Parts = Unit;
-    type Args = Tool;
+    type Args = Shape;
     type Reason = Unit;
     type Output = Unit;
 
-    open spec fn spec_shape(args: &Tool) -> ShapeView {
-        ShapeView { tool: *args, subject: Seq::empty() }
+    open spec fn spec_shape(args: &Shape) -> ShapeView {
+        args@
     }
 
-    fn shape(args: &Tool) -> (shape: Shape) {
-        let shape = Shape { tool: *args, subject: Vec::new() };
-        assert(shape@ =~= Self::spec_shape(args));
-        shape
+    fn shape(args: &Shape) -> (shape: Shape) {
+        args.copy()
     }
 
-    fn tool(args: &Tool) -> (tool: Tool) {
-        *args
+    fn tool(args: &Shape) -> (tool: Tool) {
+        args.tool()
     }
 }
 

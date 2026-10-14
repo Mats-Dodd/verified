@@ -1,18 +1,18 @@
-{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000001","data":{"text":"slow please"}}
-{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000001","data":{"model":"claude-haiku-4-5"}}
-{"type":"start","messageId":"01a10400-0000-7000-8000-000000000001"}
+{"type":"data-user-message","id":"1","data":{"text":"slow please"}}
+{"type":"data-turn-start","id":"1","data":{"model":"claude-haiku-4-5"}}
+{"type":"start","messageId":"1"}
 {"type":"start-step"}
 {"type":"text-start","id":"t0"}
 {"type":"text-delta","id":"t0","delta":"..."}
 {"type":"abort","reason":"cancelled"}
-{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000001","data":{"reason":"cancelled"}}
-{"type":"data-user-message","id":"01a10400-0000-7000-8000-000000000002","data":{"text":"again"}}
-{"type":"data-turn-start","id":"01a10400-0000-7000-8000-000000000002","data":{"model":"claude-haiku-4-5"}}
-{"type":"start","messageId":"01a10400-0000-7000-8000-000000000002"}
+{"type":"data-turn-end","id":"1","data":{"reason":"cancelled"}}
+{"type":"data-user-message","id":"2","data":{"text":"again"}}
+{"type":"data-turn-start","id":"2","data":{"model":"claude-haiku-4-5"}}
+{"type":"start","messageId":"2"}
 {"type":"start-step"}
 {"type":"text-start","id":"t0"}
 {"type":"text-delta","id":"t0","delta":"Echo: again"}
 {"type":"text-end","id":"t0"}
 {"type":"finish-step"}
 {"type":"finish","finishReason":"stop"}
-{"type":"data-turn-end","id":"01a10400-0000-7000-8000-000000000002","data":{"reason":"completed"}}
+{"type":"data-turn-end","id":"2","data":{"reason":"completed"}}

@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use verified_domain::id::{CallId, IdEntropy, MessageId, SessionId, TurnId, UnixMillis};
+use verified_domain::id::{ActorId, CallId, IdEntropy, MessageId, TurnId, UnixMillis};
 use verified_domain::{Exit, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
@@ -214,8 +214,8 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
     }
 }
 
-fn session_id() -> SessionId {
-    SessionId::from_parts(
+fn session_id() -> ActorId {
+    ActorId::from_parts(
         UnixMillis::new(1_700_000_000_000).expect("a time"),
         &[7; 10],
     )
@@ -595,10 +595,7 @@ async fn cancel_stops_a_streaming_turn() {
         Some(TurnEndReason::Cancelled),
         "ended cancelled"
     );
-    let other = TurnId::from_parts(
-        UnixMillis::new(1_700_000_000_000).expect("a time"),
-        &[9; 10],
-    );
+    let other = TurnId(999_999);
     let nothing = handle.cancel(Cancel { turn_id: other }).await;
     assert!(
         matches!(
@@ -1017,6 +1014,9 @@ fn still_running(log: &[Record<Parsed>]) -> Vec<TurnId> {
             Record::StepStarted { .. }
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
             | Record::StepFinished { .. }
@@ -1128,7 +1128,7 @@ async fn shutdown_wins_over_a_queued_command() {
     let daemon = boot(&disk, Arc::new(MemEnv::default())).await;
     let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
     let before = disk.bytes(session_id()).expect("the log");
-    let other = SessionId::from_parts(
+    let other = ActorId::from_parts(
         UnixMillis::new(1_700_000_000_000).expect("a time"),
         &[8; 10],
     );

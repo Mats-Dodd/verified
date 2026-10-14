@@ -1,15 +1,20 @@
 //! Durable records: the facts appended to the log before anything acts.
 //!
-//! A turn is `TurnStarted`, then steps (`StepStarted`, the model's raw
-//! output batched into `ModelOutput`s, then either `StepReset` before a
-//! retry or `StepFinished` with the calls it proposed), each call's
-//! `Approved`, `Dispatched` and `ToolResult`, and finally exactly one
-//! `TurnEnded`. Records are never changed once written. JSON shape: one
+//! An actor is `Born` once. Envelopes land in its mailbox as `Delivered`
+//! records; a turn is `TurnStarted` (while the mailbox holds mail), then
+//! steps (`StepStarted`, which carries the envelopes the model call
+//! consumes, the model's raw output batched into `ModelOutput`s, then
+//! either `StepReset` before a retry or `StepFinished` with the calls it
+//! proposed), each call's `Approved`, `Dispatched` and `ToolResult`, and
+//! finally exactly one `TurnEnded`. A background call's `Dispatched` starts
+//! a task, as a `StopSent` does; `TaskEnded` ends it and is its
+//! notification. Records are never changed once written. JSON shape: one
 //! object per line, internally tagged by `"type"`.
 
 use vstd::prelude::*;
 
-use crate::id::{CallId, CallIx, Epoch, MessageId, StepId, TurnId};
+use crate::envelope::{Envelope, EnvelopeId};
+use crate::id::{ActorId, CallId, CallIx, Epoch, StepId, TaskId, TurnId};
 use crate::limits::Millis;
 use crate::payload::{Measured, Payload};
 use crate::rules::{Born, Grant, Rules};
@@ -18,9 +23,8 @@ verus! {
 
 /// Every kind of effect a call may ask for.
 ///
-/// The shell offers the model `read`, `edit` and `bash`; the others
-/// (actors and tasks) are named here so that rules and grants already cover
-/// every kind (A1), and are offered once the runtime runs them.
+/// Every kind passes the one gate: a grant, then a durable `Dispatched`
+/// (A1). The shell offers the model the tools its `Born` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Tool {
@@ -138,13 +142,20 @@ pub enum ModelFault {
 pub enum Unstarted {
     /// The user refused it.
     Denied,
+    /// It awaited approval when a user message arrived: the user steered.
+    Steered,
     /// Cancelled before it acted: the turn was interrupted before dispatch,
     /// or its run saw the cancel before any side effect.
     Cancelled,
-    /// Past `calls_per_step` or `calls_per_turn`.
+    /// Its actor was stopped before it acted.
+    Stopped,
+    /// Past a bound: calls per step or turn, tasks, spawn depth, or the
+    /// recipient's messages.
     Limit,
     /// The request did not parse into a known tool's arguments.
     Invalid,
+    /// The recipient is unknown, unborn or stopped.
+    Refused,
 }
 
 /// How an effect ended, claiming no more than v knows (H2).
@@ -209,11 +220,16 @@ pub enum Record<P: Payload> {
     /// file they were read from (`None`: there is none, so the default
     /// rules). Recorded whenever they are loaded or change.
     RulesLoaded { rules: Rules, file: Option<Measured<P::Text>> },
-    /// The user's message starts a turn.
-    TurnStarted { turn: TurnId, message: MessageId, text: Measured<P::Text> },
-    /// A model call begins. A second `StepStarted` for the same step is a
-    /// retry after a `StepReset`.
-    StepStarted { step: StepId },
+    /// An envelope landed in this actor's mailbox. At most once per id.
+    Delivered { envelope: Envelope<P> },
+    /// A turn starts, while the mailbox holds mail. Its id is this
+    /// record's seq.
+    TurnStarted { turn: TurnId },
+    /// A model call begins, carrying `carries`: the envelopes at the head
+    /// of the mailbox it consumes (a user message alone, or the run of
+    /// other envelopes before the next one). A second `StepStarted` for the
+    /// same step is a retry after a `StepReset` and carries nothing.
+    StepStarted { step: StepId, carries: Vec<EnvelopeId> },
     /// A batch of what the model streamed, exactly as delivered.
     ModelOutput { step: StepId, parts: Measured<P::Parts> },
     /// The output of the current attempt is discarded before a retry.
@@ -233,6 +249,14 @@ pub enum Record<P: Payload> {
     /// never dispatched (denied, cancelled, invalid, past a limit), and
     /// `Unknown` for a dispatched one (a crash, a deadline).
     ToolResult { call: CallIx, exit: Exit, output: Option<Measured<P::Output>> },
+    /// Task `task` ended, at most once; this record is also its
+    /// notification, an envelope from `v` in this actor's own mailbox.
+    /// `output` is absent when the core synthesized the end: `Unknown`
+    /// (a crash or a deadline), or `NotStarted` for a `Safe` task.
+    TaskEnded { task: TaskId, exit: Exit, output: Option<Measured<P::Output>> },
+    /// This stopped actor stops `child`, one it spawned: a `Keyed` task
+    /// that delivers the stop.
+    StopSent { child: ActorId },
     /// The user asked to stop the turn.
     CancelRequested { turn: TurnId },
     /// The turn is over. At most one per `TurnStarted`. A turn the user
@@ -276,6 +300,9 @@ where
                 .and_then(|number| Some((number, *proposals.get(number)?))),
             Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }

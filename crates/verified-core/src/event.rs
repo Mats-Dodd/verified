@@ -5,7 +5,7 @@
 use vstd::prelude::*;
 
 use verified_domain::{
-    CallId, EffectId, Exit, Measured, MessageId, ModelFault, Payload, Proposal, Rules, TurnId,
+    Born, CallId, EffectId, Envelope, Exit, Measured, ModelFault, Payload, Proposal, Rules, TurnId,
 };
 
 verus! {
@@ -41,9 +41,13 @@ pub struct Loaded<P: Payload> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 pub enum Event<P: Payload> {
-    /// The user sent a message: the client made `message`; the shell minted
-    /// `turn`; a repeat is recognised by `message` alone.
-    Message { message: MessageId, turn: TurnId, text: Measured<P::Text> },
+    /// Who this actor is: on an unborn core, recorded once.
+    Born { born: Born },
+    /// The rules file was read and differs from the rules in force.
+    Rules { rules: Rules, file: Option<Measured<P::Text>> },
+    /// An envelope for this actor's mailbox: a user's message or stop, an
+    /// agent's message, a parent's stop. A repeat is recognised by its id.
+    Deliver { envelope: Envelope<P> },
     /// The user answered an approval request.
     Approve { call: CallId, verdict: Verdict },
     /// The user asked to stop a turn.
@@ -53,13 +57,15 @@ pub enum Event<P: Payload> {
     /// A `CallModel` effect ended. The shell delivers every batch of parts
     /// before this.
     ModelDone { id: EffectId, result: ModelExit<P> },
-    /// A `RunTool` effect ended.
+    /// A `RunTool` or `Stop` effect ended: a call's run, a task's, or a
+    /// delivery's.
     ToolDone { id: EffectId, exit: Exit, output: Measured<P::Output> },
     /// A `Sleep` effect ended.
     Woke { id: EffectId },
-    /// The deadline of tool run `id` passed: v stops waiting. A timeout is
-    /// v cancelling at a deadline, so a run still unresolved is `Unknown`
-    /// and asked to stop; one that already reported keeps its outcome.
+    /// The deadline of run `id` (a call's or a task's) passed: v stops
+    /// waiting. A timeout is v cancelling at a deadline, so a run still
+    /// unresolved is `Unknown` and asked to stop; one that already reported
+    /// keeps its outcome.
     Expired { id: EffectId },
 }
 

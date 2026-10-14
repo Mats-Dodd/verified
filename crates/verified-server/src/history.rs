@@ -1,6 +1,9 @@
 //! The conversation the model is sent, rebuilt from the log.
 //!
-//! Only what the log says happened is sent: the output of attempts that
+//! What the user and others said enters at the step that carried it (its
+//! `StepStarted`), after the previous step's results: never between a
+//! `tool_use` and its result. Only what the log says happened is sent: the
+//! output of attempts that
 //! ended in `StepReset` is dropped, `tool_use` blocks without a result (a
 //! turn failed by a model failure) are dropped, and results the core
 //! synthesized (denied, interrupted, unknown, invalid, past a limit) are
@@ -8,8 +11,10 @@
 //! role merge. Every payload is already its parsed type: nothing here
 //! guesses or substitutes.
 
+use std::collections::BTreeMap;
+
 use verified_domain::id::{CallId, ToolName};
-use verified_domain::{Exit, Record, Request, Unstarted};
+use verified_domain::{Address, Body, EnvelopeId, Exit, Record, Request, Unstarted};
 
 use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
 use crate::payload::{ModelPart, Parsed, ToolInput};
@@ -33,6 +38,9 @@ struct Builder {
     messages: Vec<Message>,
     calls: Vec<Call>,
     step: Option<Step>,
+    /// What each envelope delivered or notified says, until a step carries
+    /// it.
+    mail: BTreeMap<EnvelopeId, String>,
 }
 
 /// The model-facing text of a result the core synthesized.
@@ -44,8 +52,17 @@ pub fn synthesized_text(exit: Exit, reason: Option<&str>) -> String {
         Exit::NotStarted(Unstarted::Denied) => {
             "Not started: the user denied this tool call.".to_owned()
         }
+        Exit::NotStarted(Unstarted::Steered) => {
+            "Not started: the user sent a message instead of answering.".to_owned()
+        }
         Exit::NotStarted(Unstarted::Cancelled) => {
             "Not started: the user stopped the turn before this call ran.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Stopped) => {
+            "Not started: the user stopped this actor before this call ran.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Refused) => {
+            "Not started: the recipient is unknown or stopped.".to_owned()
         }
         Exit::NotStarted(Unstarted::Limit) => {
             "Not started: the response proposed more tool calls than one step or turn may make."
@@ -122,23 +139,50 @@ impl Builder {
 
     fn record(&mut self, record: &Record<Parsed>) {
         match record {
-            Record::TurnStarted { text, .. } => {
-                self.close_step();
-                self.calls.clear();
-                self.push(
-                    Role::User,
-                    vec![Content::Text {
-                        text: text.body.clone(),
-                    }],
+            Record::Delivered { envelope } => {
+                if let Body::Text(text) = &envelope.body {
+                    let said = match envelope.from {
+                        Address::User => text.body.clone(),
+                        Address::Runtime | Address::Actor(_) => {
+                            format!("[from {}] {}", envelope.from, text.body)
+                        }
+                    };
+                    self.mail.insert(envelope.id, said);
+                }
+            }
+            Record::TaskEnded { task, exit, output } => {
+                let output = output
+                    .as_ref()
+                    .map(|output| output.body.text.clone())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| synthesized_text(*exit, None));
+                self.mail.insert(
+                    EnvelopeId::Task(*task),
+                    format!("[v] task {task} ended: {output}"),
                 );
             }
-            Record::StepStarted { .. } => match &mut self.step {
-                Some(step) if step.calls.is_empty() && step.parts.is_empty() => {}
-                Some(_) | None => {
+            Record::TurnStarted { .. } => {
+                self.close_step();
+                self.calls.clear();
+            }
+            Record::StepStarted { carries, .. } => {
+                if !carries.is_empty() {
                     self.close_step();
-                    self.step = Some(Step::default());
+                    let said = carries
+                        .iter()
+                        .filter_map(|id| self.mail.remove(id))
+                        .map(|text| Content::Text { text })
+                        .collect();
+                    self.push(Role::User, said);
                 }
-            },
+                match &mut self.step {
+                    Some(step) if step.calls.is_empty() && step.parts.is_empty() => {}
+                    Some(_) | None => {
+                        self.close_step();
+                        self.step = Some(Step::default());
+                    }
+                }
+            }
             Record::ModelOutput { parts, .. } => {
                 if let Some(step) = &mut self.step {
                     step.parts.extend_from_slice(&parts.body);
@@ -175,6 +219,7 @@ impl Builder {
             Record::Approved { .. }
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::StopSent { .. }
             | Record::Dispatched { .. }
             | Record::CancelRequested { .. }
             | Record::EpochBumped { .. } => {}
@@ -222,6 +267,7 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
         messages: Vec::new(),
         calls: Vec::new(),
         step: None,
+        mail: BTreeMap::new(),
     };
     for record in records {
         builder.record(record);

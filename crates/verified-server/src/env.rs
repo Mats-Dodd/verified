@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt as _;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
-use verified_domain::id::{CallId, SessionId};
+use verified_domain::id::{ActorId, CallId};
 use verified_domain::{EffectId, Millis};
 
 use crate::payload::{Command, Parsed, ProjectPath, Sibling, ToolArgs};
@@ -203,7 +203,7 @@ impl<'call> Grant<'call> {
     /// What `call`, of `session`, may do. The only way to make an
     /// [`EditGrant`] or a [`BashGrant`].
     #[must_use]
-    pub fn of(call: &'call ToolCall<Approved, Parsed>, session: SessionId) -> Self {
+    pub fn of(call: &'call ToolCall<Approved, Parsed>, session: ActorId) -> Self {
         let effect = call.effect();
         match call.args() {
             ToolArgs::Read { path } => Self::Read(path),

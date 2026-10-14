@@ -11,9 +11,10 @@ use verified_core::{
     Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Verdict, Violation,
 };
 use verified_domain::{
-    Abstract, CallId, CallIx, EffectId, Epoch, Exit, Failure, Grant, Limit, Limits, LimitsConfig,
-    Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules,
-    Shape, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Abstract, ActorId, ActorName, Address, Body, Born, CallId, CallIx, EffectId, Envelope,
+    EnvelopeId, Epoch, Exit, Failure, Grant, Limit, Limits, LimitsConfig, Measured, MessageId,
+    Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules, Shape, StepId, TaskId,
+    Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 // ---------------------------------------------------------------------------
@@ -23,7 +24,10 @@ use verified_domain::{
 /// Bounds small enough to reach every limit in a test.
 fn small_config() -> LimitsConfig {
     LimitsConfig {
-        turns_per_session: count(4),
+        turns_per_actor: count(4),
+        messages_per_actor: count(4),
+        tasks_per_actor: count(2),
+        depth: 1,
         steps_per_turn: NonZeroU32::new(4).expect("non-zero"),
         calls_per_step: count(4),
         calls_per_turn: count(8),
@@ -51,19 +55,84 @@ fn at(number: u64) -> UnixMillis {
     UnixMillis::new(1_700_000_000_000u64.saturating_add(number)).expect("a 48-bit time")
 }
 
-fn turn(number: u64) -> TurnId {
-    TurnId::from_parts(at(number), &[1; 10])
+/// The turn whose `TurnStarted` is record `seq`.
+const fn turn(seq: u64) -> TurnId {
+    TurnId(seq)
 }
+
+/// The first turn of a driver's log: its rules (0), birth (1), the first
+/// message (2), then the turn (3).
+const FIRST: TurnId = turn(3);
 
 fn message(number: u64) -> MessageId {
     MessageId::from_parts(at(number), &[2; 10])
 }
 
-fn step(index: u32) -> StepId {
-    StepId {
-        turn: turn(1),
-        index,
+/// The actor every test drives.
+fn actor() -> ActorId {
+    ActorId::from_parts(at(0), &[4; 10])
+}
+
+fn born() -> Born {
+    Born::root(
+        actor(),
+        ActorName::parse("main").expect("a name"),
+        vec![Tool::Read, Tool::Edit, Tool::Bash],
+    )
+}
+
+/// The user's message `number`, of `bytes`.
+fn envelope(number: u64, bytes: u64) -> Envelope<Abstract> {
+    Envelope {
+        id: EnvelopeId::User(message(number)),
+        from: Address::User,
+        to: actor(),
+        reply_to: None,
+        body: Body::Text(payload(bytes)),
     }
+}
+
+fn deliver(number: u64, bytes: u64) -> Event<Abstract> {
+    Event::Deliver {
+        envelope: envelope(number, bytes),
+    }
+}
+
+fn delivered(number: u64, bytes: u64) -> Record<Abstract> {
+    Record::Delivered {
+        envelope: envelope(number, bytes),
+    }
+}
+
+const fn step(index: u32) -> StepId {
+    StepId { turn: FIRST, index }
+}
+
+/// Step `index` of the first turn starts, carrying nothing.
+const fn started(index: u32) -> Record<Abstract> {
+    Record::StepStarted {
+        step: step(index),
+        carries: Vec::new(),
+    }
+}
+
+/// The first turn's first step, carrying message 1.
+fn first_step() -> Record<Abstract> {
+    Record::StepStarted {
+        step: step(0),
+        carries: vec![EnvelopeId::User(message(1))],
+    }
+}
+
+/// What a log starts with: the default rules, then the actor's birth.
+fn boot() -> Vec<Record<Abstract>> {
+    vec![
+        Record::RulesLoaded {
+            rules: Rules::default(),
+            file: None,
+        },
+        Record::Born { born: born() },
+    ]
 }
 
 fn call_id(name: &str) -> CallId {
@@ -73,7 +142,9 @@ fn call_id(name: &str) -> CallId {
 fn propose(name: &str, tool: Tool) -> Proposal<Abstract> {
     Proposal {
         id: call_id(name),
-        request: Request::Run { args: tool },
+        request: Request::Run {
+            args: Shape::plain(tool, actor(), TaskId(0)),
+        },
     }
 }
 
@@ -86,23 +157,19 @@ struct Driver {
 }
 
 impl Driver {
-    /// A core whose log holds the default rules (`read: allow`), as the
-    /// shell's first boot records them.
+    /// A core whose log holds the default rules (`read: allow`) and the
+    /// actor's birth, as the shell's first boot records them.
     fn new(limits: Limits) -> Self {
         let mut driver = Self {
             core: Core::new(limits.clone()),
             limits,
             log: Vec::new(),
         };
-        driver.load(Rules::default());
+        for record in boot() {
+            driver.core.apply(&record).expect("the boot applies");
+            driver.log.push(record);
+        }
         driver
-    }
-
-    /// Records `rules` as the rules in force.
-    fn load(&mut self, rules: Rules) {
-        let record = Record::RulesLoaded { rules, file: None };
-        self.core.apply(&record).expect("rules always load");
-        self.log.push(record);
     }
 
     fn commit(&mut self, decision: Decision<Abstract>) -> (Outcome, Vec<Effect<Abstract>>) {
@@ -123,7 +190,7 @@ impl Driver {
     /// Crash and recover from the durable log, then resume.
     fn crash(&mut self) -> Vec<Effect<Abstract>> {
         self.core = Core::recover(self.limits.clone(), &self.log).expect("the log recovers");
-        let decision = self.core.resume(None);
+        let decision = self.core.resume(Some(born()), None);
         self.commit(decision).1
     }
 
@@ -131,13 +198,10 @@ impl Driver {
         self.log.get(from..).unwrap_or_default().to_vec()
     }
 
-    /// Starts turn 1 and returns the first model call's id.
+    /// Starts the first turn with message 1 and returns the first model
+    /// call's id.
     fn start(&mut self) -> EffectId {
-        let (outcome, effects) = self.send(Event::Message {
-            message: message(1),
-            turn: turn(1),
-            text: payload(10),
-        });
+        let (outcome, effects) = self.send(deliver(1, 10));
         assert_eq!(
             outcome,
             Outcome::Accepted,
@@ -183,7 +247,8 @@ fn model_call(effects: &[Effect<Abstract>]) -> EffectId {
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
-            | Effect::Sleep { .. } => None,
+            | Effect::Sleep { .. }
+            | Effect::Stop { .. } => None,
         })
         .expect("a CallModel effect")
 }
@@ -198,7 +263,8 @@ fn tool_runs(effects: &[Effect<Abstract>]) -> Vec<(EffectId, CallId)> {
             | Effect::CancelModel { .. }
             | Effect::AskApproval { .. }
             | Effect::CancelTool { .. }
-            | Effect::Sleep { .. } => None,
+            | Effect::Sleep { .. }
+            | Effect::Stop { .. } => None,
         })
         .collect()
 }
@@ -221,14 +287,15 @@ fn asked(effects: &[Effect<Abstract>]) -> Vec<CallId> {
             | Effect::CancelModel { .. }
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
-            | Effect::Sleep { .. } => None,
+            | Effect::Sleep { .. }
+            | Effect::Stop { .. } => None,
         })
         .collect()
 }
 
-fn ended(outcome: TurnOutcome) -> Record<Abstract> {
+const fn ended(outcome: TurnOutcome) -> Record<Abstract> {
     Record::TurnEnded {
-        turn: turn(1),
+        turn: FIRST,
         outcome,
     }
 }
@@ -253,7 +320,7 @@ fn text_turn_completes() {
         call,
         EffectId {
             epoch: Epoch(0),
-            seq: 2
+            seq: 4
         },
         "the model call is named by its StepStarted record"
     );
@@ -266,14 +333,11 @@ fn text_turn_completes() {
     assert_eq!(outcome, Outcome::Accepted, "the model finished");
     assert!(effects.is_empty(), "nothing runs after the turn ends");
     assert_eq!(
-        driver.since(1),
+        driver.since(2),
         vec![
-            Record::TurnStarted {
-                turn: turn(1),
-                message: message(1),
-                text: payload(10)
-            },
-            Record::StepStarted { step: step(0) },
+            delivered(1, 10),
+            Record::TurnStarted { turn: FIRST },
+            first_step(),
             Record::ModelOutput {
                 step: step(0),
                 parts: payload(5)
@@ -289,52 +353,64 @@ fn text_turn_completes() {
     assert_eq!(driver.core.running(), None, "no turn is running");
 }
 
+/// L4: a repeat is `Exists` and records nothing; a second message to a
+/// busy actor waits in its mailbox, and the turn's end starts the next
+/// turn, whose first model call carries it.
 #[test]
-fn repeated_message_exists_and_second_is_busy() {
+fn repeated_message_exists_and_second_waits_its_turn() {
     let mut driver = Driver::new(small_limits());
-    driver.start();
+    let call = driver.start();
     let length = driver.log.len();
-    let (outcome, _) = driver.send(Event::Message {
-        message: message(1),
-        turn: turn(1),
-        text: payload(10),
-    });
+    let (outcome, _) = driver.send(deliver(1, 10));
     assert_eq!(outcome, Outcome::Exists, "a repeat is answered with exists");
-    let (outcome, _) = driver.send(Event::Message {
-        message: message(2),
-        turn: turn(2),
-        text: payload(10),
-    });
+    assert_eq!(driver.log.len(), length, "a repeat writes nothing");
+    let (outcome, effects) = driver.send(deliver(2, 10));
+    assert_eq!(outcome, Outcome::Accepted, "the mailbox takes it");
+    assert!(effects.is_empty(), "the model call in flight goes on");
+    assert_eq!(driver.since(length), vec![delivered(2, 10)], "it waits");
+    assert_eq!(driver.core.unread(), 1, "unread");
+    let from = driver.log.len();
+    let (_, effects) = driver.finish(call, Vec::new());
+    let next = turn(u64::try_from(from).expect("a seq") + 2);
     assert_eq!(
-        outcome,
-        Outcome::Rejected(Rejection::Busy),
-        "one turn at a time"
+        driver.since(from),
+        vec![
+            Record::StepFinished {
+                step: step(0),
+                calls: Vec::new()
+            },
+            ended(TurnOutcome::Completed),
+            Record::TurnStarted { turn: next },
+            Record::StepStarted {
+                step: StepId {
+                    turn: next,
+                    index: 0
+                },
+                carries: vec![EnvelopeId::User(message(2))],
+            },
+        ],
+        "the turn's end starts the next, carrying the waiting message"
     );
-    assert_eq!(driver.log.len(), length, "neither wrote anything");
+    model_call(&effects);
+    assert_eq!(driver.core.unread(), 0, "consumed");
 }
 
 #[test]
-fn session_is_bounded() {
+fn the_mailbox_is_bounded() {
     let mut driver = Driver::new(small_limits());
     for number in 1..=4 {
-        let (outcome, effects) = driver.send(Event::Message {
-            message: message(number),
-            turn: turn(number),
-            text: payload(1),
-        });
+        let (outcome, effects) = driver.send(deliver(number, 1));
         assert_eq!(outcome, Outcome::Accepted, "message {number} fits");
         driver.finish(model_call(&effects), Vec::new());
     }
-    let (outcome, _) = driver.send(Event::Message {
-        message: message(5),
-        turn: turn(5),
-        text: payload(1),
-    });
+    let length = driver.log.len();
+    let (outcome, _) = driver.send(deliver(5, 1));
     assert_eq!(
         outcome,
-        Outcome::Rejected(Rejection::SessionFull),
-        "turns_per_session is a hard bound"
+        Outcome::Rejected(Rejection::Limit),
+        "messages_per_actor is a hard bound"
     );
+    assert_eq!(driver.log.len(), length, "and records nothing");
 }
 
 // ---------------------------------------------------------------------------
@@ -367,10 +443,7 @@ fn safe_tool_is_auto_approved_and_logged() {
     let (_, effects) = driver.tool_done(run, Exit::Ok);
     assert_eq!(
         driver.since(from),
-        vec![
-            result(0, Exit::Ok, Some(payload(3))),
-            Record::StepStarted { step: step(1) }
-        ],
+        vec![result(0, Exit::Ok, Some(payload(3))), started(1)],
         "the result feeds the next step"
     );
     let (_, effects) = driver.finish(model_call(&effects), Vec::new());
@@ -433,7 +506,7 @@ fn denied_call_resolves_without_running() {
         driver.since(from),
         vec![
             result(0, Exit::NotStarted(Unstarted::Denied), None),
-            Record::StepStarted { step: step(1) }
+            started(1)
         ],
         "the model hears about the denial"
     );
@@ -457,7 +530,7 @@ fn invalid_request_fails_without_running() {
                 calls: vec![invalid]
             },
             result(0, Exit::NotStarted(Unstarted::Invalid), None),
-            Record::StepStarted { step: step(1) },
+            started(1),
         ],
         "an invalid call fails and the next step starts"
     );
@@ -523,14 +596,14 @@ fn safe_tools_run_together() {
 fn interrupt_during_model_call() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
-    let (outcome, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    let (outcome, effects) = driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(outcome, Outcome::Accepted, "interrupt accepted");
     assert_eq!(
         effects,
         vec![Effect::CancelModel { id: call }],
         "the stream is cancelled"
     );
-    let (outcome, _) = driver.send(Event::Interrupt { turn: turn(1) });
+    let (outcome, _) = driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(outcome, Outcome::Exists, "a second interrupt is a repeat");
     let (outcome, _) = driver.send(Event::ModelDone {
         id: call,
@@ -559,7 +632,7 @@ fn interrupt_during_model_call() {
 fn interrupt_wins_over_a_model_that_finished_anyway() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
-    driver.send(Event::Interrupt { turn: turn(1) });
+    driver.send(Event::Interrupt { turn: FIRST });
     let from = driver.log.len();
     let (_, effects) = driver.finish(call, Vec::new());
     assert!(effects.is_empty(), "nothing more runs");
@@ -580,7 +653,7 @@ fn interrupt_wins_over_a_model_that_finished_anyway() {
 fn interrupt_wins_over_proposed_calls_that_arrive_late() {
     let mut driver = Driver::new(small_limits());
     let call = driver.start();
-    driver.send(Event::Interrupt { turn: turn(1) });
+    driver.send(Event::Interrupt { turn: FIRST });
     let from = driver.log.len();
     let (_, effects) = driver.finish(
         call,
@@ -613,7 +686,7 @@ fn interrupt_during_tools() {
     );
     let read = single_run(&effects, "read");
     let from = driver.log.len();
-    let (_, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    let (_, effects) = driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(
         effects,
         vec![Effect::CancelTool { id: read }],
@@ -622,7 +695,7 @@ fn interrupt_during_tools() {
     assert_eq!(
         driver.since(from),
         vec![
-            Record::CancelRequested { turn: turn(1) },
+            Record::CancelRequested { turn: FIRST },
             result(1, Exit::NotStarted(Unstarted::Cancelled), None)
         ],
         "the unapproved call never runs"
@@ -653,14 +726,14 @@ fn a_second_interrupt_signals_nothing() {
     let call = driver.start();
     let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
     let read = single_run(&effects, "read");
-    let (_, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    let (_, effects) = driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(
         effects,
         vec![Effect::CancelTool { id: read }],
         "signalled once"
     );
     let from = driver.log.len();
-    let (outcome, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    let (outcome, effects) = driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(outcome, Outcome::Exists, "a repeat");
     assert!(effects.is_empty(), "no second signal");
     assert_eq!(driver.since(from), Vec::new(), "nothing recorded");
@@ -684,10 +757,7 @@ fn a_deadline_before_the_report_resolves_unknown() {
     );
     assert_eq!(
         driver.since(from),
-        vec![
-            result(0, Exit::Unknown, None),
-            Record::StepStarted { step: step(1) },
-        ],
+        vec![result(0, Exit::Unknown, None), started(1),],
         "it may have acted: Unknown"
     );
     let (outcome, _) = driver.tool_done(bash, Exit::Ok);
@@ -720,7 +790,7 @@ fn a_deadline_under_a_cancel_starts_nothing() {
     let call = driver.start();
     let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
     let read = single_run(&effects, "read");
-    driver.send(Event::Interrupt { turn: turn(1) });
+    driver.send(Event::Interrupt { turn: FIRST });
     let from = driver.log.len();
     let (_, effects) = driver.send(Event::Expired { id: read });
     assert!(tool_runs(&effects).is_empty(), "nothing runs");
@@ -750,10 +820,11 @@ fn interrupt_during_backoff_ends_at_once() {
             | Effect::CancelModel { .. }
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
-            | Effect::CancelTool { .. } => None,
+            | Effect::CancelTool { .. }
+            | Effect::Stop { .. } => None,
         })
         .expect("a backoff");
-    driver.send(Event::Interrupt { turn: turn(1) });
+    driver.send(Event::Interrupt { turn: FIRST });
     assert_eq!(
         driver.log.last(),
         Some(&ended(TurnOutcome::Cancelled)),
@@ -793,15 +864,16 @@ fn transient_model_failures_retry_on_schedule() {
                 | Effect::CancelModel { .. }
                 | Effect::AskApproval { .. }
                 | Effect::RunTool { .. }
-                | Effect::CancelTool { .. } => None,
+                | Effect::CancelTool { .. }
+                | Effect::Stop { .. } => None,
             })
             .expect("a backoff");
         assert_eq!(wait, Millis::new(delay), "the schedule is data");
         let (_, effects) = driver.send(Event::Woke { id });
         assert_eq!(
             driver.log.last(),
-            Some(&Record::StepStarted { step: step(0) }),
-            "the same step again"
+            Some(&started(0)),
+            "the same step again, carrying nothing more"
         );
         let next = model_call(&effects);
         assert_ne!(next, call, "a fresh effect id per attempt");
@@ -866,11 +938,7 @@ fn steps_per_turn_is_a_bound() {
 #[test]
 fn context_is_checked_before_sending() {
     let mut driver = Driver::new(small_limits());
-    let (_, effects) = driver.send(Event::Message {
-        message: message(1),
-        turn: turn(1),
-        text: payload(5_000),
-    });
+    let (_, effects) = driver.send(deliver(1, 5_000));
     assert!(effects.is_empty(), "the model is never called");
     assert_eq!(
         driver.log.last(),
@@ -899,7 +967,8 @@ fn a_discarded_attempt_does_not_count_against_context() {
             | Effect::CancelModel { .. }
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
-            | Effect::CancelTool { .. } => None,
+            | Effect::CancelTool { .. }
+            | Effect::Stop { .. } => None,
         })
         .expect("a backoff");
     let (_, effects) = driver.send(Event::Woke { id: sleep });
@@ -1041,7 +1110,7 @@ fn crash_makes_dispatched_bash_unknown() {
         vec![
             Record::EpochBumped { epoch: Epoch(1) },
             result(0, Exit::Unknown, None),
-            Record::StepStarted { step: step(1) },
+            started(1),
         ],
         "its outcome is unknown and the model is told"
     );
@@ -1064,7 +1133,7 @@ fn crash_makes_dispatched_edit_unknown() {
         vec![
             Record::EpochBumped { epoch: Epoch(1) },
             result(0, Exit::Unknown, None),
-            Record::StepStarted { step: step(1) },
+            started(1),
         ],
         "its outcome is unknown and the model is told"
     );
@@ -1133,7 +1202,7 @@ fn crash_restarts_model_step() {
                 step: step(0),
                 reason: Reset::Restart
             },
-            Record::StepStarted { step: step(0) },
+            started(0),
         ],
         "partial output is reset and the step runs again"
     );
@@ -1148,7 +1217,7 @@ fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
     let call = driver.start();
     let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
     single_run(&effects, "read");
-    driver.send(Event::Interrupt { turn: turn(1) });
+    driver.send(Event::Interrupt { turn: FIRST });
     let from = driver.log.len();
     let effects = driver.crash();
     assert!(
@@ -1169,29 +1238,18 @@ fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
 /// H2: the log refuses a result that claims more than v knows.
 #[test]
 fn a_log_claiming_more_than_v_knows_is_corrupt() {
-    let dispatched = vec![
-        Record::TurnStarted {
-            turn: turn(1),
-            message: message(1),
-            text: payload(1),
-        },
-        Record::StepStarted { step: step(0) },
-        Record::StepFinished {
-            step: step(0),
-            calls: vec![propose("bash", Tool::Bash)],
-        },
-        Record::Approved {
-            call: CallIx(0),
-            by: Grant::User,
-        },
-        Record::Dispatched { call: CallIx(0) },
-    ];
+    let mut dispatched = proposed(vec![propose("bash", Tool::Bash)]);
+    dispatched.push(Record::Approved {
+        call: CallIx(0),
+        by: Grant::User,
+    });
+    dispatched.push(Record::Dispatched { call: CallIx(0) });
     let mut never_started = dispatched.clone();
     never_started.push(result(0, Exit::NotStarted(Unstarted::Cancelled), None));
     assert_eq!(
         Core::recover(small_limits(), &never_started),
         Err(Corrupt {
-            seq: 5,
+            seq: 8,
             violation: Violation::WrongResult
         }),
         "v cannot know a dispatched call never acted"
@@ -1207,12 +1265,12 @@ fn a_log_claiming_more_than_v_knows_is_corrupt() {
         "its run may report that it never began"
     );
     let mut unknown_before_dispatch = dispatched;
-    unknown_before_dispatch.truncate(4);
+    unknown_before_dispatch.truncate(7);
     unknown_before_dispatch.push(result(0, Exit::Unknown, None));
     assert_eq!(
         Core::recover(small_limits(), &unknown_before_dispatch),
         Err(Corrupt {
-            seq: 4,
+            seq: 7,
             violation: Violation::WrongResult
         }),
         "an undispatched call provably never acted"
@@ -1264,89 +1322,70 @@ fn every_prefix_of_a_decision_recovers() {
 
 #[test]
 fn corrupt_log_stops_recovery() {
-    let log = vec![
-        Record::TurnStarted {
-            turn: turn(1),
-            message: message(1),
-            text: payload(1),
-        },
-        Record::StepStarted { step: step(0) },
-        Record::StepFinished {
-            step: step(0),
-            calls: vec![propose("bash", Tool::Bash)],
-        },
-        Record::Dispatched { call: CallIx(0) },
-    ];
+    let mut log = proposed(vec![propose("bash", Tool::Bash)]);
+    log.push(Record::Dispatched { call: CallIx(0) });
     assert_eq!(
         Core::recover(small_limits(), &log),
         Err(Corrupt {
-            seq: 3,
+            seq: 6,
             violation: Violation::WrongPhase
         }),
         "dispatch without approval is refused"
     );
-    let cancelled_then_completed = vec![
-        Record::TurnStarted {
-            turn: turn(1),
-            message: message(1),
-            text: payload(1),
-        },
-        Record::CancelRequested { turn: turn(1) },
+    let mut cancelled_then_completed = boot();
+    cancelled_then_completed.extend([
+        delivered(1, 1),
+        Record::TurnStarted { turn: FIRST },
+        Record::CancelRequested { turn: FIRST },
         ended(TurnOutcome::Completed),
-    ];
+    ]);
     assert_eq!(
         Core::recover(small_limits(), &cancelled_then_completed),
         Err(Corrupt {
-            seq: 2,
+            seq: 5,
             violation: Violation::WrongEnding
         }),
         "a turn the user stopped cannot end completed"
     );
 }
 
-/// The start of a log whose step proposed `calls`.
+/// The start of a log whose first step proposed `calls`: the boot (rules
+/// at 0), message 1, its turn and step.
 fn proposed(calls: Vec<Proposal<Abstract>>) -> Vec<Record<Abstract>> {
-    vec![
-        Record::TurnStarted {
-            turn: turn(1),
-            message: message(1),
-            text: payload(1),
-        },
-        Record::StepStarted { step: step(0) },
+    let mut log = boot();
+    log.extend([
+        delivered(1, 1),
+        Record::TurnStarted { turn: FIRST },
+        first_step(),
         Record::StepFinished {
             step: step(0),
             calls,
         },
-    ]
+    ]);
+    log
 }
 
+/// L4 (a command accepted once): a log delivering one envelope twice is
+/// refused.
 #[test]
 fn a_log_repeating_a_message_is_corrupt() {
     let mut log = proposed(Vec::new());
     log.push(ended(TurnOutcome::Completed));
-    log.push(Record::TurnStarted {
-        turn: turn(2),
-        message: message(1),
-        text: payload(1),
-    });
+    log.push(delivered(1, 1));
     assert_eq!(
         Core::recover(small_limits(), &log),
         Err(Corrupt {
-            seq: 4,
-            violation: Violation::DuplicateMessage
+            seq: 7,
+            violation: Violation::DuplicateEnvelope
         }),
-        "one message starts one turn"
+        "one message is delivered once"
     );
 }
 
 /// A2, on the log: a grant names a rule in force that fits the call.
 #[test]
 fn a_grant_names_a_rule_in_force_that_fits() {
-    let mut log = vec![Record::RulesLoaded {
-        rules: Rules::default(),
-        file: None,
-    }];
-    log.extend(proposed(vec![propose("edit", Tool::Edit)]));
+    let mut log = proposed(vec![propose("edit", Tool::Edit)]);
     log.push(Record::Approved {
         call: CallIx(0),
         by: Grant::Rule { rule: 0, rules: 0 },
@@ -1354,16 +1393,12 @@ fn a_grant_names_a_rule_in_force_that_fits() {
     assert_eq!(
         Core::recover(small_limits(), &log),
         Err(Corrupt {
-            seq: 4,
+            seq: 6,
             violation: Violation::WrongGrant
         }),
         "`read: allow` does not grant an edit"
     );
-    let mut read = vec![Record::RulesLoaded {
-        rules: Rules::default(),
-        file: None,
-    }];
-    read.extend(proposed(vec![propose("read", Tool::Read)]));
+    let read = proposed(vec![propose("read", Tool::Read)]);
     let mut granted = read.clone();
     granted.push(Record::Approved {
         call: CallIx(0),
@@ -1385,21 +1420,37 @@ fn a_grant_names_a_rule_in_force_that_fits() {
         assert_eq!(
             Core::recover(small_limits(), &wrong),
             Err(Corrupt {
-                seq: 4,
+                seq: 6,
                 violation: Violation::WrongGrant
             }),
             "{by:?} names no rule in force"
         );
     }
-    let mut unruled = proposed(vec![propose("read", Tool::Read)]);
-    unruled.push(Record::Approved {
-        call: CallIx(0),
-        by: Grant::Rule { rule: 0, rules: 0 },
-    });
+    let second = StepId {
+        turn: turn(2),
+        index: 0,
+    };
+    let unruled = vec![
+        Record::Born { born: born() },
+        delivered(1, 1),
+        Record::TurnStarted { turn: turn(2) },
+        Record::StepStarted {
+            step: second,
+            carries: vec![EnvelopeId::User(message(1))],
+        },
+        Record::StepFinished {
+            step: second,
+            calls: vec![propose("read", Tool::Read)],
+        },
+        Record::Approved {
+            call: CallIx(0),
+            by: Grant::Rule { rule: 0, rules: 0 },
+        },
+    ];
     assert_eq!(
         Core::recover(small_limits(), &unruled),
         Err(Corrupt {
-            seq: 3,
+            seq: 5,
             violation: Violation::WrongGrant
         }),
         "with no rules in force, only the user grants"
@@ -1441,36 +1492,51 @@ struct Text;
 impl Payload for Text {
     type Text = String;
     type Parts = String;
-    type Args = Tool;
+    type Args = Shape;
     type Reason = String;
     type Output = String;
 
-    fn shape(args: &Tool) -> Shape {
+    fn shape(args: &Shape) -> Shape {
         Abstract::shape(args)
     }
 
-    fn tool(args: &Tool) -> Tool {
-        *args
+    fn tool(args: &Shape) -> Tool {
+        args.tool()
     }
 }
 
 #[test]
 fn record_json_shape() {
-    let turn = TurnId::parse("01900000-0000-7000-8000-000000000001").expect("a v7");
+    let turn = TurnId(3);
+    let message = MessageId::parse("0190a8e2-7c3b-7d4e-8f00-0123456789ab").expect("a v7");
+    let actor = ActorId::parse("0190a8e2-7c3b-7d4e-8f00-0123456789ac").expect("a v7");
     let records: Vec<Record<Text>> = vec![
-        Record::TurnStarted {
-            turn,
-            message: MessageId::parse("0190a8e2-7c3b-7d4e-8f00-0123456789ab").expect("a v7"),
-            text: Measured {
-                body: "hi".to_owned(),
-                bytes: 2,
+        Record::Delivered {
+            envelope: Envelope {
+                id: EnvelopeId::User(message),
+                from: Address::User,
+                to: actor,
+                reply_to: None,
+                body: Body::Text(Measured {
+                    body: "hi".to_owned(),
+                    bytes: 2,
+                }),
             },
+        },
+        Record::TurnStarted { turn },
+        Record::StepStarted {
+            step: StepId { turn, index: 0 },
+            carries: vec![EnvelopeId::User(message)],
         },
         Record::StepFinished {
             step: StepId { turn, index: 0 },
             calls: vec![Proposal {
                 id: call_id("toolu_01"),
-                request: Request::Run { args: Tool::Edit },
+                request: Request::Run {
+                    args: Shape::Edit {
+                        subject: b"a.txt".to_vec(),
+                    },
+                },
             }],
         },
         Record::Approved {
@@ -1502,12 +1568,14 @@ fn record_json_shape() {
     assert_eq!(
         lines,
         vec![
-            r#"{"type":"TurnStarted","turn":"01900000-0000-7000-8000-000000000001","message":"0190a8e2-7c3b-7d4e-8f00-0123456789ab","text":{"body":"hi","bytes":2}}"#,
-            r#"{"type":"StepFinished","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"calls":[{"id":"toolu_01","request":{"Run":{"args":"Edit"}}}]}"#,
+            r#"{"type":"Delivered","envelope":{"id":{"user":"0190a8e2-7c3b-7d4e-8f00-0123456789ab"},"from":"user","to":"0190a8e2-7c3b-7d4e-8f00-0123456789ac","replyTo":null,"body":{"text":{"body":"hi","bytes":2}}}}"#,
+            r#"{"type":"TurnStarted","turn":"3"}"#,
+            r#"{"type":"StepStarted","step":{"turn":"3","index":0},"carries":[{"user":"0190a8e2-7c3b-7d4e-8f00-0123456789ab"}]}"#,
+            r#"{"type":"StepFinished","step":{"turn":"3","index":0},"calls":[{"id":"toolu_01","request":{"Run":{"args":{"tool":"edit","subject":[97,46,116,120,116]}}}}]}"#,
             r#"{"type":"Approved","call":0,"by":"User"}"#,
             r#"{"type":"ToolResult","call":0,"exit":{"NotStarted":"Limit"},"output":null}"#,
-            r#"{"type":"StepReset","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"reason":{"Retry":{"fault":"Overloaded","delay":500}}}"#,
-            r#"{"type":"TurnEnded","turn":"01900000-0000-7000-8000-000000000001","outcome":{"Failed":{"Limit":"Context"}}}"#,
+            r#"{"type":"StepReset","step":{"turn":"3","index":0},"reason":{"Retry":{"fault":"Overloaded","delay":500}}}"#,
+            r#"{"type":"TurnEnded","turn":"3","outcome":{"Failed":{"Limit":"Context"}}}"#,
             r#"{"type":"EpochBumped","epoch":2}"#,
         ],
         "one JSON object per line, tagged by type"
@@ -1518,10 +1586,10 @@ fn record_json_shape() {
     }
     assert!(
         serde_json::from_str::<Record<Text>>(
-            r#"{"type":"TurnEnded","turn":"01900000-0000-4000-8000-000000000001","outcome":"Completed"}"#
+            r#"{"type":"TurnEnded","turn":"03","outcome":"Completed"}"#
         )
         .is_err(),
-        "a turn id that is not a UUIDv7 does not parse"
+        "a turn id that is not a seq in canonical decimal does not parse"
     );
 }
 
@@ -1602,7 +1670,7 @@ impl Seen {
                 Effect::RunTool { call } => self.tools.push(call.effect()),
                 Effect::Sleep { id, .. } => self.sleeps.push(*id),
                 Effect::AskApproval { request } => self.asks.push(request.id().clone()),
-                Effect::CancelModel { .. } | Effect::CancelTool { .. } => {}
+                Effect::CancelModel { .. } | Effect::CancelTool { .. } | Effect::Stop { .. } => {}
             }
         }
     }
@@ -1619,11 +1687,7 @@ const fn cause(number: u8) -> ModelFault {
 
 fn event_for(choice: &Choice, seen: &Seen, driver: &Driver) -> Option<Event<Abstract>> {
     Some(match choice {
-        Choice::Message(number) => Event::Message {
-            message: message(u64::from(*number)),
-            turn: turn(u64::from(*number)),
-            text: payload(u64::from(*number) * 100),
-        },
+        Choice::Message(number) => deliver(u64::from(*number), u64::from(*number) * 100),
         Choice::Approve(index, yes) => Event::Approve {
             call: pick(&seen.asks, *index)?,
             verdict: if *yes {

@@ -17,7 +17,10 @@ use crate::harness::{Bounded, Harness};
 pub fn config(steps: u32) -> LimitsConfig {
     let count = |value: usize| NonZeroUsize::new(value).expect("non-zero");
     LimitsConfig {
-        turns_per_session: count(4),
+        turns_per_actor: count(4),
+        messages_per_actor: count(4),
+        tasks_per_actor: count(4),
+        depth: 1,
         steps_per_turn: NonZeroU32::new(steps).expect("at least one step"),
         calls_per_step: count(4),
         calls_per_turn: count(8),

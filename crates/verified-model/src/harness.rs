@@ -4,8 +4,9 @@
 use stateright::{Model, Property};
 use verified_core::{Core, Decision, Event, Loaded, ModelExit, Outcome, Verdict};
 use verified_domain::{
-    Abstract, CallId, Class, EffectId, Epoch, Exit, Grant, Limits, Measured, MessageId, ModelFault,
-    Proposal, Record, Request, Reset, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Abstract, ActorId, ActorName, Address, Body, Born, CallId, Class, EffectId, Envelope,
+    EnvelopeId, Epoch, Exit, Grant, Limits, Measured, MessageId, ModelFault, Proposal, Record,
+    Request, Reset, Shape, TaskId, Tool, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 use crate::alpha::{self, Work};
@@ -40,6 +41,10 @@ pub enum Action {
 /// event's.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
+    /// The actor is born (at boot, never an action of BFS).
+    Born,
+    /// The rules file changed (never an action of BFS).
+    Rules,
     Send,
     Answer,
     Interrupt,
@@ -64,7 +69,9 @@ impl Action {
     #[must_use]
     pub const fn kind(&self) -> Kind {
         match self {
-            Self::Deliver(Event::Message { .. }) => Kind::Send,
+            Self::Deliver(Event::Born { .. }) => Kind::Born,
+            Self::Deliver(Event::Rules { .. }) => Kind::Rules,
+            Self::Deliver(Event::Deliver { .. }) => Kind::Send,
             Self::Deliver(Event::Approve { .. }) => Kind::Answer,
             Self::Deliver(Event::Interrupt { .. }) => Kind::Interrupt,
             Self::Deliver(Event::ModelParts { .. }) => Kind::Parts,
@@ -163,25 +170,53 @@ pub enum Bug {
 ///
 /// Its state is [`World`], and the core is always `recover(log)`: it has no
 /// other state. The world boots as the daemon does, by persisting `resume()`
-/// of the empty log.
+/// of the empty log, which records who the actor is (`born`).
 #[derive(Clone, Debug)]
 pub struct Harness {
     pub limits: Limits,
     pub domain: Domain,
     pub bug: Option<Bug>,
+    /// The one actor: who the shell says it is at every boot.
+    pub born: Born,
 }
 
-/// The ids of message `slot` of a bounded domain.
-fn message_ids(slot: usize) -> (MessageId, TurnId) {
-    let number = u64::try_from(slot).expect("few slots");
-    let at = UnixMillis::new(1_700_000_000_000u64.saturating_add(number)).expect("a 48-bit time");
-    (
-        MessageId::from_parts(at, &[1; 10]),
-        TurnId::from_parts(at, &[2; 10]),
+/// The actor a harness models unless a trace says otherwise.
+///
+/// # Panics
+/// Never: the name and the time are constants.
+#[must_use]
+pub fn born() -> Born {
+    let at = UnixMillis::new(1_700_000_000_000).expect("a 48-bit time");
+    Born::root(
+        ActorId::from_parts(at, &[3; 10]),
+        ActorName::parse("main").expect("a name"),
+        vec![Tool::Read, Tool::Edit, Tool::Bash],
     )
 }
 
-/// The calls of a bounded `script` for model call `id`.
+/// The id of message `slot` of a bounded domain.
+fn message_id(slot: usize) -> MessageId {
+    let number = u64::try_from(slot).expect("few slots");
+    let at = UnixMillis::new(1_700_000_000_000u64.saturating_add(number)).expect("a 48-bit time");
+    MessageId::from_parts(at, &[1; 10])
+}
+
+/// The user's message `message` to `actor`.
+#[must_use]
+pub const fn message(actor: ActorId, message: MessageId) -> Event<Abstract> {
+    Event::Deliver {
+        envelope: Envelope {
+            id: EnvelopeId::User(message),
+            from: Address::User,
+            to: actor,
+            reply_to: None,
+            body: Body::Text(size(1)),
+        },
+    }
+}
+
+/// The calls of a bounded `script` for model call `id`: each a foreground
+/// call of its tool, without a subject.
 fn proposals(id: EffectId, tools: &[Tool]) -> Vec<Proposal<Abstract>> {
     tools
         .iter()
@@ -189,7 +224,9 @@ fn proposals(id: EffectId, tools: &[Tool]) -> Vec<Proposal<Abstract>> {
         .map(|(position, tool)| Proposal {
             id: CallId::parse(&format!("c{}_{}_{position}", id.epoch.0, id.seq))
                 .expect("a protocol id"),
-            request: Request::Run { args: *tool },
+            request: Request::Run {
+                args: Shape::plain(*tool, born().actor, TaskId(0)),
+            },
         })
         .collect()
 }
@@ -218,6 +255,9 @@ fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
                 && (flight.cancelled
                     || !matches!(result, ModelExit::Failed(ModelFault::Cancelled))),
         ),
+        Event::ToolDone { id, exit, .. } if matches!(flight.job, Job::Stop { .. }) => {
+            (id, *exit == Exit::Ok)
+        }
         Event::ToolDone { id, exit, .. } => (
             id,
             matches!(flight.job, Job::Tool { .. })
@@ -229,7 +269,9 @@ fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
                 },
         ),
         Event::Woke { id } => (id, matches!(flight.job, Job::Sleep)),
-        Event::Message { .. }
+        Event::Born { .. }
+        | Event::Rules { .. }
+        | Event::Deliver { .. }
         | Event::Approve { .. }
         | Event::Interrupt { .. }
         | Event::Expired { .. } => return false,
@@ -275,22 +317,31 @@ fn replies(bounded: &Bounded, id: EffectId, job: &Job) -> Vec<Event<Abstract>> {
         })
         .to_vec(),
         Job::Sleep => vec![Event::Woke { id }],
+        Job::Stop { .. } => vec![Event::ToolDone {
+            id,
+            exit: Exit::Ok,
+            output: size(1),
+        }],
     }
 }
 
 impl Harness {
     /// A harness for BFS under `limits` over `bounded`.
     #[must_use]
-    pub const fn bounded(limits: Limits, bounded: Bounded) -> Self {
+    pub fn bounded(limits: Limits, bounded: Bounded) -> Self {
         Self {
             limits,
             domain: Domain::Bounded(bounded),
             bug: None,
+            born: born(),
         }
     }
 
     /// A harness for replaying traces run under `limits`: its deliveries
     /// carry the values `events` do.
+    ///
+    /// # Panics
+    /// Never: the default actor is made of constants.
     #[must_use]
     pub fn trace<E: IntoIterator<Item = Event<Abstract>>>(limits: Limits, events: E) -> Self {
         let mut distinct: Vec<Event<Abstract>> = Vec::new();
@@ -303,7 +354,14 @@ impl Harness {
             limits,
             domain: Domain::Trace(distinct),
             bug: None,
+            born: born(),
         }
+    }
+
+    /// This harness, for the actor `born` (the one a trace's daemon booted).
+    #[must_use]
+    pub fn with_born(self, born: Born) -> Self {
+        Self { born, ..self }
     }
 
     /// Whether the world may crash again.
@@ -349,6 +407,7 @@ impl Harness {
                     id, tool, effect, ..
                 } => Staged::Start(effect, Job::Tool { call: id, tool }),
                 Work::Sleep { id, .. } => Staged::Start(id, Job::Sleep),
+                Work::Stop { id, child } => Staged::Start(id, Job::Stop { child }),
                 Work::CancelModel { id } | Work::CancelTool { id } => Staged::Cancel(id),
                 Work::AskApproval { id, .. } => Staged::Ask(id),
             })
@@ -363,7 +422,8 @@ impl Harness {
     /// empty log.
     pub(crate) fn boot(&self) -> World {
         let mut world = World::default();
-        let boot = Core::<Abstract>::new(self.limits.clone()).resume(Some(Loaded::defaults()));
+        let boot = Core::<Abstract>::new(self.limits.clone())
+            .resume(Some(self.born.clone()), Some(Loaded::defaults()));
         self.stage(&mut world, &boot);
         world
     }
@@ -375,7 +435,10 @@ impl Harness {
         let mut next = world.clone();
         next.refused = false;
         let core = self.core(world)?;
-        self.stage(&mut next, &core.resume(load(&core)));
+        self.stage(
+            &mut next,
+            &core.resume(Some(self.born.clone()), load(&core)),
+        );
         Some(next)
     }
 
@@ -460,7 +523,7 @@ impl Harness {
                 id,
                 result: ModelExit::Finished(Vec::new()),
             },
-            Job::Tool { .. } => Event::ToolDone {
+            Job::Tool { .. } | Job::Stop { .. } => Event::ToolDone {
                 id,
                 exit: Exit::Ok,
                 output: size(1),
@@ -522,14 +585,16 @@ impl Harness {
     fn user_actions(&self, state: &World, actions: &mut Vec<Action>) {
         match &self.domain {
             Domain::Bounded(bounded) => {
-                if usize::from(state.sent) <= bounded.messages {
+                // The shell answers a new message to a running turn busy,
+                // without the core; a repeat it decides (`Exists`).
+                if usize::from(state.sent) <= bounded.messages
+                    && let Some(core) = self.core(state)
+                {
                     for slot in 0..bounded.messages {
-                        let (message, turn) = message_ids(slot);
-                        actions.push(Action::Deliver(Event::Message {
-                            message,
-                            turn,
-                            text: size(1),
-                        }));
+                        let id = message_id(slot);
+                        if core.running().is_none() || delivered(state, id) {
+                            actions.push(Action::Deliver(message(self.born.actor, id)));
+                        }
                     }
                 }
                 let answers = |call: &CallId, actions: &mut Vec<Action>| {
@@ -562,7 +627,7 @@ impl Harness {
                     .filter(|event| {
                         matches!(
                             event,
-                            Event::Message { .. } | Event::Approve { .. } | Event::Interrupt { .. }
+                            Event::Deliver { .. } | Event::Approve { .. } | Event::Interrupt { .. }
                         )
                     })
                     .cloned()
@@ -590,6 +655,16 @@ impl Harness {
             ),
         }
     }
+}
+
+/// Whether the durable log holds message `id`.
+fn delivered(world: &World, id: MessageId) -> bool {
+    world.log.iter().any(|record| {
+        matches!(
+            record,
+            Record::Delivered { envelope } if envelope.id == EnvelopeId::User(id)
+        )
+    })
 }
 
 impl Model for Harness {
@@ -659,7 +734,7 @@ impl Model for Harness {
                 let Some(core) = self.core(&world) else {
                     return Some(world);
                 };
-                let mut resumed = core.resume(load(&core));
+                let mut resumed = core.resume(Some(self.born.clone()), load(&core));
                 if self.bug == Some(Bug::LeaveDispatched)
                     && let Some(at) = resumed.records.iter().position(|record| {
                         matches!(
@@ -703,7 +778,7 @@ impl Model for Harness {
             }
             Action::Deliver(event) => {
                 match &event {
-                    Event::Message { .. } => world.sent = world.sent.saturating_add(1),
+                    Event::Deliver { .. } => world.sent = world.sent.saturating_add(1),
                     Event::Approve { call, .. } => {
                         if !world.asks.remove(call) {
                             world.stale_answers = world.stale_answers.saturating_add(1);
@@ -712,8 +787,9 @@ impl Model for Harness {
                     Event::Interrupt { .. } => {
                         world.interrupts = world.interrupts.saturating_add(1);
                     }
-                    // The run may still report: its flight stays.
-                    Event::Expired { .. } => {}
+                    // The run may still report: its flight stays. Births
+                    // and rules are the boot's, never a world's action.
+                    Event::Expired { .. } | Event::Born { .. } | Event::Rules { .. } => {}
                     Event::ModelParts { id, .. } => {
                         let Job::Model { batches } = &mut world.flights.get_mut(id)?.job else {
                             return None;
@@ -784,7 +860,7 @@ impl Model for Harness {
                     world
                         .starts
                         .values()
-                        .all(|(tool, count)| tool.class() == Class::Safe || *count <= 1)
+                        .all(|(tool, count)| tool.class() != Class::Unsafe || *count <= 1)
                 },
             ),
             // H2.

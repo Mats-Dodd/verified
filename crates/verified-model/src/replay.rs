@@ -161,6 +161,7 @@ pub fn summary(world: &World) -> String {
                 Job::Model { batches } => format!("model({batches} batches)"),
                 Job::Tool { call, tool } => format!("{tool:?} {}", call.as_str()),
                 Job::Sleep => "sleep".to_owned(),
+                Job::Stop { child } => format!("stop {child}"),
             };
             format!(
                 "{}.{} {job}{}{}",

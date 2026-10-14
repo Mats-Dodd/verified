@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use verified_domain::id::{MessageId, SessionId};
+use verified_domain::id::{ActorId, MessageId};
 use verified_domain::{Limits as CoreLimits, LimitsConfig};
 use verified_server::daemon::{self, Layout};
 use verified_server::env::LocalEnv;
@@ -85,8 +85,8 @@ fn client() -> Client {
     )
 }
 
-fn session() -> SessionId {
-    SessionId::from_parts(epoch(), &[5; 10])
+fn session() -> ActorId {
+    ActorId::from_parts(epoch(), &[5; 10])
 }
 
 fn create() -> Command {

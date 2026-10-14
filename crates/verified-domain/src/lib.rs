@@ -11,6 +11,7 @@
     )
 )]
 
+pub mod envelope;
 pub mod id;
 pub mod limits;
 pub mod payload;
@@ -18,9 +19,10 @@ pub mod record;
 pub mod rules;
 pub mod shape;
 
+pub use envelope::{Address, Body, Envelope, EnvelopeId};
 pub use id::{
-    ApprovalId, CallId, CallIx, EffectId, Epoch, IdEntropy, IdError, MessageId, PartId, SessionId,
-    StepId, ToolName, TurnId, UnixMillis,
+    ActorId, ApprovalId, CallId, CallIx, EffectId, Epoch, IdEntropy, IdError, MessageId, PartId,
+    StepId, TaskId, ToolName, TurnId, UnixMillis,
 };
 pub use limits::{Limits, LimitsConfig, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit};

@@ -17,7 +17,7 @@ use crossterm::event::Event;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
-use verified_domain::id::{IdEntropy, SessionId, UnixMillis};
+use verified_domain::id::{ActorId, IdEntropy, UnixMillis};
 use verified_wire::stream::Offset;
 
 use crate::Limits;
@@ -64,7 +64,7 @@ pub enum Cmd {
     /// Follow a session's stream, replacing any current follower.
     Follow {
         follow: FollowId,
-        session: SessionId,
+        session: ActorId,
         from: Offset,
     },
     /// Stop the current follower.

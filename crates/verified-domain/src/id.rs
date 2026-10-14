@@ -1,6 +1,6 @@
 //! Identifiers: one set of newtypes for every crate.
 //!
-//! Entity ids (sessions, messages, turns) are `UUIDv7`s built from Clock and
+//! Entity ids (actors, messages) are `UUIDv7`s built from Clock and
 //! Entropy seam data with [`uuid::Builder`], never from the convenience
 //! constructors that read the clock or the RNG themselves. As text they are
 //! canonical lowercase hyphenated `UUIDv7`s and only that: a non-v7, non-RFC
@@ -10,8 +10,9 @@
 //! Protocol ids (tool calls, approvals, stream part ids, tool names) are short
 //! ASCII tokens minted by the daemon or the model provider.
 //!
-//! The core's own ids (`StepId`, `CallIx`, `Epoch`, `EffectId`) are derived
-//! from the log. The ids the core's proofs mention live inside `verus!`, where
+//! The core's own ids (`TurnId`, `TaskId`, `StepId`, `CallIx`, `Epoch`,
+//! `EffectId`) are derived from the log: each is the seq of a record, or
+//! counts within one. The ids the core's proofs mention live inside `verus!`, where
 //! specifications compare them structurally (`==`); exec code compares them
 //! with `same`, whose result Verus knows, except `CallId::same`, which is
 //! trusted (`PRINCIPLES.md`, the trusted base).
@@ -32,11 +33,37 @@ verus! {
 #[verifier::external_derive]
 pub struct MessageId(u128);
 
-/// A turn: one user message and the steps it causes. Minted by the daemon
-/// (from seam data carried in the event) when a message starts one.
+/// An actor: one log, one core, one mailbox. Minted by the client that
+/// creates a root actor, or at the model boundary for a child (`spawn`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[verifier::external_derive]
-pub struct TurnId(u128);
+pub struct ActorId(u128);
+
+/// A turn: the seq of its `TurnStarted` record.
+///
+/// Turns start inside many decisions (a delivery, a task's end, the end of
+/// the turn before), so the log names them, as it names effects. As text
+/// (and JSON, where AI SDK chunk ids are strings) it is the seq in decimal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[verifier::external_derive]
+pub struct TurnId(pub u64);
+
+/// A task: the seq of the record that started it (the `Dispatched` of a
+/// background call, or a `StopSent`). Text and JSON as `TurnId`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[verifier::external_derive]
+pub struct TaskId(pub u64);
+
+impl ActorId {
+    /// Whether two ids name the same actor.
+    #[must_use]
+    pub const fn same(self, other: Self) -> (same: bool)
+        ensures
+            same == (self == other),
+    {
+        self.0 == other.0
+    }
+}
 
 impl MessageId {
     /// Whether two ids name the same message.
@@ -51,6 +78,17 @@ impl MessageId {
 
 impl TurnId {
     /// Whether two ids name the same turn.
+    #[must_use]
+    pub const fn same(self, other: Self) -> (same: bool)
+        ensures
+            same == (self == other),
+    {
+        self.0 == other.0
+    }
+}
+
+impl TaskId {
+    /// Whether two ids name the same task.
     #[must_use]
     pub const fn same(self, other: Self) -> (same: bool)
         ensures
@@ -125,11 +163,6 @@ impl EffectId {
 
 } // verus!
 
-/// One session (one conversation, one log), minted by the client that
-/// creates it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(u128);
-
 #[expect(
     clippy::multiple_inherent_impl,
     reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
@@ -169,6 +202,8 @@ pub enum IdError {
     },
     #[error("{kind} has a character outside [A-Za-z0-9_-]")]
     BadCharacter { kind: &'static str },
+    #[error("not a seq in canonical decimal")]
+    NotDecimal,
 }
 
 /// Milliseconds since the Unix epoch, within the 48 bits a `UUIDv7` holds.
@@ -299,9 +334,49 @@ macro_rules! uuid7_id {
     };
 }
 
-uuid7_id!(SessionId);
+uuid7_id!(ActorId);
 uuid7_id!(MessageId);
-uuid7_id!(TurnId);
+
+/// A log-derived id as text: its seq in decimal, and only that spelling.
+macro_rules! seq_id {
+    ($name:ident) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                let canonical = !text.is_empty()
+                    && text.bytes().all(|byte| byte.is_ascii_digit())
+                    && (text == "0" || !text.starts_with('0'));
+                match text.parse() {
+                    Ok(seq) if canonical => Ok(Self(seq)),
+                    Ok(_) | Err(_) => Err(IdError::NotDecimal),
+                }
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = String::deserialize(deserializer)?;
+                text.parse().map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+seq_id!(TurnId);
+seq_id!(TaskId);
 
 impl fmt::Display for EffectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -428,7 +503,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        ApprovalId, CallId, IdError, MAX_PROTOCOL_ID_BYTES, MessageId, PartId, SessionId, ToolName,
+        ActorId, ApprovalId, CallId, IdError, MAX_PROTOCOL_ID_BYTES, MessageId, PartId, ToolName,
         TurnId, UnixMillis,
     };
 
@@ -453,7 +528,7 @@ mod tests {
     fn parses_only_the_canonical_spelling_of_a_v7() {
         let text = "01a10400-0000-7000-8000-000000000001";
         assert_eq!(
-            TurnId::parse(text).map(|id| id.to_string()),
+            MessageId::parse(text).map(|id| id.to_string()),
             Ok(text.to_owned())
         );
         for bad in [
@@ -462,20 +537,33 @@ mod tests {
             "{01a10400-0000-7000-8000-000000000001}",
             "01a10400-0000-7000-8000-00000000000",
         ] {
-            assert_eq!(TurnId::parse(bad), Err(IdError::NotCanonical), "{bad}");
+            assert_eq!(MessageId::parse(bad), Err(IdError::NotCanonical), "{bad}");
         }
         assert_eq!(
-            TurnId::parse("01a10400-0000-4000-8000-000000000001"),
+            MessageId::parse("01a10400-0000-4000-8000-000000000001"),
             Err(IdError::NotVersion7 { version: 4 })
         );
         assert_eq!(
-            TurnId::parse("01a10400-0000-7000-c000-000000000001"),
+            MessageId::parse("01a10400-0000-7000-c000-000000000001"),
             Err(IdError::NotRfcVariant)
         );
         assert!(
-            serde_json::from_str::<TurnId>("\"01a10400-0000-4000-8000-000000000001\"").is_err(),
+            serde_json::from_str::<MessageId>("\"01a10400-0000-4000-8000-000000000001\"").is_err(),
             "deserializing checks the version too"
         );
+    }
+
+    #[test]
+    fn log_ids_are_decimal_seqs() {
+        assert_eq!(TurnId(42).to_string(), "42");
+        assert_eq!("42".parse::<TurnId>(), Ok(TurnId(42)));
+        assert_eq!(
+            serde_json::to_string(&TurnId(42)).ok().as_deref(),
+            Some("\"42\"")
+        );
+        for bad in ["", "042", "+4", "4a", "18446744073709551616"] {
+            assert_eq!(bad.parse::<TurnId>(), Err(IdError::NotDecimal), "{bad}");
+        }
     }
 
     #[test]
@@ -514,10 +602,10 @@ mod tests {
             entropy in any::<[u8; 10]>(),
         ) {
             let at = UnixMillis::new(millis).expect("in range");
-            let id = SessionId::from_parts(at, &entropy);
-            prop_assert_eq!(SessionId::parse(&id.to_string()), Ok(id));
+            let id = ActorId::from_parts(at, &entropy);
+            prop_assert_eq!(ActorId::parse(&id.to_string()), Ok(id));
             let json = serde_json::to_string(&id).expect("ids serialize");
-            prop_assert_eq!(serde_json::from_str::<SessionId>(&json).ok(), Some(id));
+            prop_assert_eq!(serde_json::from_str::<ActorId>(&json).ok(), Some(id));
         }
 
         #[test]
@@ -527,8 +615,8 @@ mod tests {
             entropy_b in any::<[u8; 10]>(),
         ) {
             let later = earlier.checked_add(1).expect("below MAX");
-            let first = TurnId::from_parts(UnixMillis::new(earlier).expect("in range"), &entropy_a);
-            let second = TurnId::from_parts(UnixMillis::new(later).expect("in range"), &entropy_b);
+            let first = MessageId::from_parts(UnixMillis::new(earlier).expect("in range"), &entropy_a);
+            let second = MessageId::from_parts(UnixMillis::new(later).expect("in range"), &entropy_b);
             prop_assert!(first < second);
         }
 

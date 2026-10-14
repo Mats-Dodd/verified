@@ -50,9 +50,10 @@ use verified_core::{
     Approved, Core, Corrupt, Decision, Effect, Event, Loaded, ModelExit, Outcome,
     Rejection as CoreRejection, ToolCall, Verdict,
 };
-use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
+use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_domain::{
-    EffectId, Exit, Grant, Measured, ModelFault, Proposal, Record, TurnOutcome, Unstarted, named,
+    ActorName, Address, Body, Born, EffectId, Envelope, EnvelopeId, Exit, Grant, Measured,
+    ModelFault, Proposal, Record, Tool, TurnOutcome, Unstarted, named,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -69,7 +70,7 @@ use crate::log::{Log, LogError};
 use crate::model::Model;
 use crate::payload::{ModelPart, Parsed, ToolOutput, Truncation, measure, proposal};
 use crate::projection::Projector;
-use crate::seam::{Clock, Entropy, Tasks, id_entropy};
+use crate::seam::{Clock, Entropy, Tasks};
 use crate::shim::{Barrier, barrier};
 use crate::tool;
 
@@ -290,7 +291,7 @@ impl Drop for CommittedWriter {
 /// How the rest of the daemon talks to one session.
 #[derive(Clone)]
 pub struct SessionHandle {
-    session: SessionId,
+    session: ActorId,
     inbox: mpsc::Sender<Input>,
     committed: Committed,
     /// One permit per live stream follower (`sse_followers_per_session`).
@@ -308,7 +309,7 @@ impl fmt::Debug for SessionHandle {
 
 impl SessionHandle {
     #[must_use]
-    pub const fn session(&self) -> SessionId {
+    pub const fn session(&self) -> ActorId {
         self.session
     }
 
@@ -381,7 +382,7 @@ impl SessionHandle {
 
 /// One session's shell: owns the core, the log and the projected stream.
 pub struct Session {
-    id: SessionId,
+    id: ActorId,
     core: Core<Parsed>,
     log: Box<dyn Log>,
     records: Vec<Record<Parsed>>,
@@ -429,7 +430,7 @@ impl Session {
     /// # Errors
     /// The records do not replay.
     pub fn start(
-        session: SessionId,
+        session: ActorId,
         log: Box<dyn Log>,
         records: Vec<Record<Parsed>>,
         seams: Seams,
@@ -500,9 +501,10 @@ impl Session {
 
     async fn resume(&mut self) -> Result<Persisted, ShellError> {
         // No rules file is read yet: the default rules (`read: allow`) are
-        // recorded once, at the first boot.
+        // recorded once, at the first boot, as is who the actor is: a root
+        // actor named `main`, offered the tools the shell runs.
         let load = self.core.rules().is_none().then(Loaded::defaults);
-        let resumed = self.core.resume(load);
+        let resumed = self.core.resume(Some(born(self.id)), load);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Resumed {
             records: resumed.records.clone(),
@@ -630,7 +632,9 @@ impl Session {
                     | Event::Expired { id } => {
                         self.cancels.remove(id);
                     }
-                    Event::Message { .. }
+                    Event::Born { .. }
+                    | Event::Rules { .. }
+                    | Event::Deliver { .. }
                     | Event::Approve { .. }
                     | Event::Interrupt { .. }
                     | Event::ModelParts { .. }
@@ -652,9 +656,8 @@ impl Session {
                 }
             }
             Input::Message { command, reply } => {
-                if self.held_bytes >= self.config.limits.session_bytes
-                    && self.turn_of(command.message_id).is_none()
-                {
+                let delivered = self.delivered(command.message_id).is_some();
+                if self.held_bytes >= self.config.limits.session_bytes && !delivered {
                     drop(reply.send(Err(Rejection::SessionFull {
                         session_id: self.id,
                         reason: format!(
@@ -664,19 +667,29 @@ impl Session {
                     })));
                     return Ok(());
                 }
-                let turn = TurnId::from_parts(
-                    self.seams.clock.now(),
-                    &id_entropy(self.seams.entropy.as_ref()),
-                );
+                // Until the shell steers, a new message to a running turn
+                // is answered busy, without the core; a repeat the core
+                // answers (`Exists`).
+                if let (Some(running), false) = (self.core.running(), delivered) {
+                    drop(reply.send(Err(Rejection::SessionBusy {
+                        session_id: self.id,
+                        turn_id: running,
+                    })));
+                    return Ok(());
+                }
                 let text = command.text.as_str().to_owned();
-                let event = Event::Message {
-                    message: command.message_id,
-                    turn,
-                    text: measure(text.clone()),
+                let event = Event::Deliver {
+                    envelope: Envelope {
+                        id: EnvelopeId::User(command.message_id),
+                        from: Address::User,
+                        to: self.id,
+                        reply_to: None,
+                        body: Body::Text(measure(text.clone())),
+                    },
                 };
                 match self.decide(event).await? {
                     Persisted::Done(outcome, effects) => {
-                        let answer = self.message_answer(outcome, &command, turn, &text);
+                        let answer = self.message_answer(outcome, &command, &text);
                         drop(reply.send(answer));
                         self.start_effects(effects);
                     }
@@ -727,73 +740,104 @@ impl Session {
         &self,
         outcome: Outcome,
         command: &SendMessage,
-        turn: TurnId,
         text: &str,
     ) -> Result<SendMessageReply, Rejection> {
-        match outcome {
-            Outcome::Accepted => Ok(SendMessageReply {
-                turn_id: turn,
-                outcome: WireOutcome::Created,
-            }),
-            Outcome::Exists => {
-                let Some((turn, original)) = self.turn_of(command.message_id) else {
-                    defect("the core saw a message the log does not hold");
-                };
-                if original.body == text {
-                    Ok(SendMessageReply {
-                        turn_id: turn,
-                        outcome: WireOutcome::Exists,
-                    })
-                } else {
-                    Err(Rejection::MessageExistsWithDifferentText {
-                        message_id: command.message_id,
-                    })
-                }
-            }
-            Outcome::Rejected(CoreRejection::Busy) => {
-                let running = self
-                    .core
-                    .running()
-                    .unwrap_or_else(|| defect("busy without a running turn"));
-                Err(Rejection::SessionBusy {
+        let created = match outcome {
+            Outcome::Accepted => WireOutcome::Created,
+            Outcome::Exists => WireOutcome::Exists,
+            Outcome::Rejected(CoreRejection::Limit) => {
+                return Err(Rejection::SessionFull {
                     session_id: self.id,
-                    turn_id: running,
-                })
+                    reason: format!(
+                        "it holds its limit of {} messages",
+                        self.config.limits.core.messages_per_actor()
+                    ),
+                });
             }
-            Outcome::Rejected(CoreRejection::SessionFull) => Err(Rejection::SessionFull {
+            Outcome::Rejected(
+                CoreRejection::Stopped
+                | CoreRejection::Unborn
+                | CoreRejection::Mismatch
+                | CoreRejection::UnknownCall
+                | CoreRejection::NotRunning,
+            )
+            | Outcome::Stale => defect("a message to a born actor is accepted, a repeat or full"),
+        };
+        let Some((at, original)) = self.delivered(command.message_id) else {
+            defect("the core took a message the log does not hold");
+        };
+        if original.body != text {
+            return Err(Rejection::MessageExistsWithDifferentText {
+                message_id: command.message_id,
+            });
+        }
+        // The turn the message started: the first after its delivery.
+        let turn = self.records.get(at..).and_then(|after| {
+            after.iter().find_map(|record| match record {
+                Record::TurnStarted { turn } => Some(*turn),
+                Record::Born { .. }
+                | Record::RulesLoaded { .. }
+                | Record::Delivered { .. }
+                | Record::StepStarted { .. }
+                | Record::ModelOutput { .. }
+                | Record::StepReset { .. }
+                | Record::StepFinished { .. }
+                | Record::Approved { .. }
+                | Record::Dispatched { .. }
+                | Record::ToolResult { .. }
+                | Record::TaskEnded { .. }
+                | Record::StopSent { .. }
+                | Record::CancelRequested { .. }
+                | Record::TurnEnded { .. }
+                | Record::EpochBumped { .. } => None,
+            })
+        });
+        match turn {
+            Some(turn) => Ok(SendMessageReply {
+                turn_id: turn,
+                outcome: created,
+            }),
+            None => Err(Rejection::SessionFull {
                 session_id: self.id,
                 reason: format!(
-                    "it holds its limit of {} turns",
-                    self.config.limits.core.turns_per_session()
+                    "it started its limit of {} turns",
+                    self.config.limits.core.turns_per_actor()
                 ),
             }),
-            Outcome::Rejected(CoreRejection::UnknownCall | CoreRejection::NotRunning)
-            | Outcome::Stale => defect("a message is accepted, a repeat, busy or full"),
         }
     }
 
-    /// The turn `message` started, and its text, if the log holds it.
-    fn turn_of(&self, message: MessageId) -> Option<(TurnId, &Measured<String>)> {
-        self.records.iter().find_map(|record| match record {
-            Record::TurnStarted {
-                turn,
-                message: seen,
-                text,
-            } if *seen == message => Some((*turn, text)),
-            Record::TurnStarted { .. }
-            | Record::Born { .. }
-            | Record::RulesLoaded { .. }
-            | Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::StepFinished { .. }
-            | Record::Approved { .. }
-            | Record::Dispatched { .. }
-            | Record::ToolResult { .. }
-            | Record::CancelRequested { .. }
-            | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
-        })
+    /// Where the log holds `message`'s delivery, and its text.
+    fn delivered(&self, message: MessageId) -> Option<(usize, &Measured<String>)> {
+        self.records
+            .iter()
+            .enumerate()
+            .find_map(|(at, record)| match record {
+                Record::Delivered {
+                    envelope:
+                        Envelope {
+                            id: EnvelopeId::User(seen),
+                            body: Body::Text(text),
+                            ..
+                        },
+                } if *seen == message => Some((at, text)),
+                Record::Born { .. }
+                | Record::RulesLoaded { .. }
+                | Record::Delivered { .. }
+                | Record::TurnStarted { .. }
+                | Record::StepStarted { .. }
+                | Record::ModelOutput { .. }
+                | Record::StepReset { .. }
+                | Record::StepFinished { .. }
+                | Record::Approved { .. }
+                | Record::Dispatched { .. }
+                | Record::ToolResult { .. }
+                | Record::TaskEnded { .. }
+                | Record::StopSent { .. }
+                | Record::CancelRequested { .. }
+                | Record::TurnEnded { .. }
+                | Record::EpochBumped { .. } => None,
+            })
     }
 
     /// The answer to `command`. A verdict for no call awaiting one is a
@@ -823,7 +867,11 @@ impl Session {
             }
             Outcome::Exists
             | Outcome::Rejected(
-                CoreRejection::Busy | CoreRejection::SessionFull | CoreRejection::NotRunning,
+                CoreRejection::Stopped
+                | CoreRejection::Limit
+                | CoreRejection::Unborn
+                | CoreRejection::Mismatch
+                | CoreRejection::NotRunning,
             )
             | Outcome::Stale => defect("a verdict is accepted or for no call awaiting one"),
         }
@@ -850,7 +898,11 @@ impl Session {
                 }
             }
             Outcome::Rejected(
-                CoreRejection::Busy | CoreRejection::SessionFull | CoreRejection::UnknownCall,
+                CoreRejection::Stopped
+                | CoreRejection::Limit
+                | CoreRejection::Unborn
+                | CoreRejection::Mismatch
+                | CoreRejection::UnknownCall,
             )
             | Outcome::Stale => defect("an interrupt is accepted, a repeat or not running"),
         }
@@ -948,8 +1000,28 @@ impl Session {
                     report(&inbox, Event::Woke { id }).await;
                 });
             }
+            Effect::Stop { id, .. } => {
+                // No actor spawns another yet, so there is no child to
+                // deliver to: the stop is refused, and says so.
+                let inbox = self.inbox.clone();
+                self.seams.tasks.spawn(async move {
+                    let output = measure(ToolOutput::complete("no such actor".to_owned()));
+                    let exit = Exit::NotStarted(Unstarted::Refused);
+                    report(&inbox, Event::ToolDone { id, exit, output }).await;
+                });
+            }
         }
     }
+}
+
+/// Who a session's actor is: a root actor the user made, named `main`,
+/// offered the tools the shell runs.
+fn born(actor: ActorId) -> Born {
+    Born::root(
+        actor,
+        ActorName::parse("main").unwrap_or_else(|_name| defect("`main` is an actor name")),
+        vec![Tool::Read, Tool::Edit, Tool::Bash],
+    )
 }
 
 /// A decision the log refused, as the simulation sees it too.
@@ -977,15 +1049,20 @@ fn closes(record: &Record<Parsed>) -> bool {
         Record::CancelRequested { .. } | Record::TurnEnded { .. } | Record::EpochBumped { .. } => {
             true
         }
+        Record::TaskEnded { output, .. } => output
+            .as_ref()
+            .is_none_or(|output| output.body.text.is_empty()),
         Record::Born { .. }
         | Record::RulesLoaded { .. }
+        | Record::Delivered { .. }
         | Record::TurnStarted { .. }
         | Record::StepStarted { .. }
         | Record::ModelOutput { .. }
         | Record::StepReset { .. }
         | Record::StepFinished { .. }
         | Record::Approved { .. }
-        | Record::Dispatched { .. } => false,
+        | Record::Dispatched { .. }
+        | Record::StopSent { .. } => false,
     }
 }
 
@@ -1020,7 +1097,9 @@ fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
             },
         }),
         Event::Expired { id } => Some(Event::Expired { id: *id }),
-        Event::Message { .. }
+        Event::Born { .. }
+        | Event::Rules { .. }
+        | Event::Deliver { .. }
         | Event::Approve { .. }
         | Event::Interrupt { .. }
         | Event::ModelParts { .. }
@@ -1054,7 +1133,7 @@ async fn report(inbox: &mpsc::Sender<Input>, event: Event<Parsed>) {
 
 async fn run_tool(
     env: Arc<dyn Env>,
-    session: SessionId,
+    session: ActorId,
     call: ToolCall<Approved, Parsed>,
     id: EffectId,
     inbox: mpsc::Sender<Input>,
@@ -1331,6 +1410,9 @@ fn verdict_of(records: &[Record<Parsed>], call: &CallId) -> Option<WireVerdict> 
             Record::Approved { .. }
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::ToolResult { .. }
             | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
@@ -1356,6 +1438,9 @@ fn was_cancelled(records: &[Record<Parsed>], turn: TurnId) -> bool {
         Record::TurnStarted { .. }
         | Record::Born { .. }
         | Record::RulesLoaded { .. }
+        | Record::Delivered { .. }
+        | Record::TaskEnded { .. }
+        | Record::StopSent { .. }
         | Record::StepStarted { .. }
         | Record::ModelOutput { .. }
         | Record::StepReset { .. }

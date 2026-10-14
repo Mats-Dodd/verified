@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::Value;
 use verified_domain::Millis;
-use verified_domain::id::{CallId, MessageId, SessionId, TurnId, UnixMillis};
+use verified_domain::id::{ActorId, CallId, MessageId, TurnId, UnixMillis};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{CreateSessionReply, Outcome, Rejection, SendMessageReply, Verdict};
 use verified_wire::stream::{Control, Freshness, Offset};
@@ -57,8 +57,8 @@ fn chunks(stream: &str) -> Vec<UiChunk> {
         .collect()
 }
 
-fn session() -> SessionId {
-    SessionId::parse("01a10400-0000-7000-8000-0000000000f1").expect("a session id")
+fn session() -> ActorId {
+    ActorId::parse("01a10400-0000-7000-8000-0000000000f1").expect("a session id")
 }
 
 fn stamp(byte: u8) -> Stamp {
@@ -131,8 +131,8 @@ fn key(app: &App, code: KeyCode, modifiers: KeyModifiers) -> Option<Msg> {
     app.on_event(Keyboard::key(code, modifiers), stamp(1))
 }
 
-fn turn_id(text: &str) -> TurnId {
-    TurnId::parse(text).expect("a turn id")
+const fn turn_id(seq: u64) -> TurnId {
+    TurnId(seq)
 }
 
 fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -239,7 +239,7 @@ fn sending_mints_the_message_id_from_the_stamp() {
         Answer::MessageSent {
             message_id: message_id(9),
             result: Ok(SendMessageReply {
-                turn_id: turn_id("01a10400-0000-7000-8000-000000000001"),
+                turn_id: turn_id(1),
                 outcome: Outcome::Created,
             }),
         },
@@ -283,7 +283,7 @@ fn a_rejected_message_goes_back_to_the_draft() {
     let _cmd = app.update(Msg::Submit(stamp(3)));
     let rejection = Rejection::SessionBusy {
         session_id: session(),
-        turn_id: turn_id("01a10400-0000-7000-8000-000000000001"),
+        turn_id: turn_id(1),
     };
     let _cmd = answer(
         &mut app,
@@ -407,7 +407,7 @@ fn only_the_answer_for_the_turn_being_cancelled_settles_it() {
         .map(TranscriptTurn::id)
         .expect("a running turn");
     let _cmd = app.update(Msg::CancelTurn);
-    let other = turn_id("01a10400-0000-7000-8000-0000000000ff");
+    let other = turn_id(255);
     let _cmd = answer(
         &mut app,
         Answer::Cancelled {

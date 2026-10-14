@@ -20,8 +20,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, Core, Effect, Event, ModelExit, ToolCall, Verdict};
 use verified_domain::{
-    CallId, Epoch, Exit, Limits, MessageId, Millis, Proposal, Record, Request, SessionId, TurnId,
-    UnixMillis,
+    ActorId, ActorName, Address, Body, Born, CallId, Envelope, EnvelopeId, Epoch, Exit, Limits,
+    MessageId, Millis, Proposal, Record, Request, Tool, UnixMillis,
 };
 use verified_server::daemon::{self, DaemonError, Layout};
 use verified_server::env::LocalEnv;
@@ -57,10 +57,23 @@ fn at() -> UnixMillis {
 /// Drives a core until it mints an approved call for `args`.
 fn approved(args: ToolArgs) -> ToolCall<Approved, Parsed> {
     let mut core: Core<Parsed> = Core::new(Limits::v0());
-    let started = core.decide(Event::Message {
-        message: MessageId::from_parts(at(), &[1; 10]),
-        turn: TurnId::from_parts(at(), &[2; 10]),
-        text: measure("go".to_owned()),
+    let actor = ActorId::from_parts(at(), &[3; 10]);
+    let born = Born::root(
+        actor,
+        ActorName::parse("main").expect("a name"),
+        vec![Tool::Read, Tool::Edit, Tool::Bash],
+    );
+    for record in &core.resume(Some(born), None).records {
+        core.apply(record).expect("resumed records apply");
+    }
+    let started = core.decide(Event::Deliver {
+        envelope: Envelope {
+            id: EnvelopeId::User(MessageId::from_parts(at(), &[1; 10])),
+            from: Address::User,
+            to: actor,
+            reply_to: None,
+            body: Body::Text(measure("go".to_owned())),
+        },
     });
     for record in &started.records {
         core.apply(record).expect("decided records apply");
@@ -119,8 +132,8 @@ fn bash(command: &str) -> ToolCall<Approved, Parsed> {
     })
 }
 
-fn session() -> SessionId {
-    SessionId::from_parts(at(), &[3; 10])
+fn session() -> ActorId {
+    ActorId::from_parts(at(), &[3; 10])
 }
 
 fn local(root: PathBuf) -> LocalEnv {
@@ -824,10 +837,14 @@ async fn file_log_refuses_what_replay_would_cut() {
     let path = dir.join("session.log");
     let mut log = FileLog::create(&path, 512, 1 << 20).await.expect("created");
     let small = Record::<Parsed>::EpochBumped { epoch: Epoch(1) };
-    let large = Record::<Parsed>::TurnStarted {
-        turn: TurnId::from_parts(at(), &[1; 10]),
-        message: MessageId::from_parts(at(), &[2; 10]),
-        text: measure("x".repeat(600)),
+    let large = Record::<Parsed>::Delivered {
+        envelope: Envelope {
+            id: EnvelopeId::User(MessageId::from_parts(at(), &[2; 10])),
+            from: Address::User,
+            to: ActorId::from_parts(at(), &[3; 10]),
+            reply_to: None,
+            body: Body::Text(measure("x".repeat(600))),
+        },
     };
     log.append(std::slice::from_ref(&small), 0)
         .await

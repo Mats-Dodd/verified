@@ -25,7 +25,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 use verified_wire::command::{
     Approve, Cancel, CreateSession, CreateSessionReply, Outcome as WireOutcome, Rejection,
     SendMessage, encode_reply,
@@ -158,7 +158,7 @@ async fn create_session(State(app): State<App>, body: Bytes) -> Response {
 }
 
 async fn session(app: &App, id: &str) -> Result<SessionHandle, Box<Response>> {
-    let session_id = SessionId::parse(id).map_err(|error| {
+    let session_id = ActorId::parse(id).map_err(|error| {
         Box::new(rejection(&Rejection::Malformed {
             reason: format!("session id: {error}"),
         }))
@@ -386,7 +386,7 @@ mod tests {
     use hyper_util::client::legacy::connect::HttpConnector;
     use tokio::sync::{Semaphore, mpsc};
     use verified_domain::Millis;
-    use verified_domain::id::{SessionId, UnixMillis};
+    use verified_domain::id::{ActorId, UnixMillis};
     use verified_wire::stream::Offset;
 
     use super::{Slots, follow};
@@ -446,7 +446,7 @@ mod tests {
         let registry = daemon::boot(store, seams, config, fatal)
             .await
             .expect("the daemon boots");
-        let session = SessionId::from_parts(
+        let session = ActorId::from_parts(
             UnixMillis::new(1_700_000_000_000).expect("a time"),
             &[7; 10],
         );

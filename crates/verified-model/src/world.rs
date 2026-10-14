@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use verified_core::Event;
-use verified_domain::{Abstract, CallId, EffectId, Record, Tool};
+use verified_domain::{Abstract, ActorId, CallId, EffectId, Record, Tool};
 
 /// A record as the model sees it.
 pub type Rec = Record<Abstract>;
@@ -22,6 +22,10 @@ pub enum Job {
         tool: Tool,
     },
     Sleep,
+    /// A stop on its way to a child.
+    Stop {
+        child: ActorId,
+    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]

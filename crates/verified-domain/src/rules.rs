@@ -27,6 +27,7 @@ use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::{self, Serialize, Serializer};
 use vstd::prelude::*;
 
+use crate::id::ActorId;
 use crate::record::Tool;
 
 verus! {
@@ -200,13 +201,42 @@ pub enum Grant {
     Rule { rule: u64, rules: u64 },
 }
 
-/// Who an actor is. The first record of its log after the boot's
-/// `EpochBumped`, at most once.
+/// Who an actor is: recorded once, before anything is delivered to it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub struct Born {
+    /// The actor's address: envelopes to it land in this log.
+    pub actor: ActorId,
     /// The name rules match on.
     pub name: ActorName,
+    /// Who spawned it (`None`: the user made it). Display only: no grant
+    /// reads it (A2).
+    pub parent: Option<ActorId>,
+    /// Spawn depth: a root is 0, a child its parent's plus one.
+    pub depth: u32,
+    /// The tools the model is offered.
+    pub tools: Vec<Tool>,
+}
+
+impl Born {
+    /// A copy with the same identity.
+    #[must_use]
+    pub fn copy(&self) -> (copy: Born)
+        ensures
+            copy.actor == self.actor,
+            copy.name@ == self.name@,
+            copy.depth == self.depth,
+    {
+        let mut tools: Vec<Tool> = Vec::with_capacity(self.tools.len());
+        let mut index: usize = 0;
+        while index < self.tools.len()
+            decreases self.tools@.len() - index,
+        {
+            tools.push(self.tools[index]);
+            index += 1;
+        }
+        Born { actor: self.actor, name: self.name.copy(), parent: self.parent, depth: self.depth, tools }
+    }
 }
 
 } // verus!
@@ -280,6 +310,24 @@ impl<'de> Deserialize<'de> for ActorName {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         Self::parse(&text).map_err(de::Error::custom)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
+)]
+impl Born {
+    /// An actor the user made: at depth 0, spawned by no one.
+    #[must_use]
+    pub const fn root(actor: ActorId, name: ActorName, tools: Vec<Tool>) -> Self {
+        Self {
+            actor,
+            name,
+            parent: None,
+            depth: 0,
+            tools,
+        }
     }
 }
 

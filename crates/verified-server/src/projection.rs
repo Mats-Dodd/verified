@@ -5,12 +5,14 @@
 //! the model name), so the same log always projects to the same stream.
 //! Stream offsets are record seqs; a record may project to no chunks.
 
+use std::collections::VecDeque;
+
 use serde_json::json;
 use verified_core::rules::grant;
-use verified_domain::id::{ApprovalId, CallId, PartId, TurnId};
+use verified_domain::id::{ApprovalId, CallId, MessageId, PartId, TurnId};
 use verified_domain::{
-    ActorName, Exit, Failure, Grant, Limit, ModelFault, Payload as _, Record, Request, Rules,
-    TurnOutcome, Unstarted,
+    ActorName, Address, Body, EnvelopeId, Exit, Failure, Grant, Limit, ModelFault, Payload as _,
+    Record, Request, Rules, TurnOutcome, Unstarted,
 };
 use verified_wire::chunk::{
     FinishReason, TurnEndReason, TurnEndedData, TurnStartedData, UiChunk, UserMessageData,
@@ -52,6 +54,9 @@ pub struct Projector {
     /// the user.
     name: Option<ActorName>,
     rules: Option<Rules>,
+    /// The mailbox: what each envelope delivered and not yet carried is,
+    /// in order (`Some` for a user's message: its id and text).
+    mailbox: VecDeque<(EnvelopeId, Option<(MessageId, String)>)>,
 }
 
 fn part_id(step: u32, block: u32) -> PartId {
@@ -89,6 +94,7 @@ impl Projector {
             turn: None,
             name: None,
             rules: None,
+            mailbox: VecDeque::new(),
         }
     }
 
@@ -97,11 +103,24 @@ impl Projector {
     pub fn project(&mut self, record: &Record<Parsed>) -> Vec<UiChunk> {
         let mut chunks = Vec::new();
         match record {
-            Record::TurnStarted {
-                turn,
-                message,
-                text,
-            } => {
+            Record::Delivered { envelope } => {
+                if let Body::Text(text) = &envelope.body {
+                    let user = match (envelope.id, envelope.from) {
+                        (EnvelopeId::User(message), Address::User) => {
+                            Some((message, text.body.clone()))
+                        }
+                        (
+                            EnvelopeId::User(_) | EnvelopeId::Minted { .. } | EnvelopeId::Task(_),
+                            _,
+                        ) => None,
+                    };
+                    self.mailbox.push_back((envelope.id, user));
+                }
+            }
+            Record::TaskEnded { task, .. } => {
+                self.mailbox.push_back((EnvelopeId::Task(*task), None));
+            }
+            Record::TurnStarted { turn } => {
                 let id = *turn;
                 self.turn = Some(Turn {
                     step: StepState::Closed,
@@ -110,13 +129,17 @@ impl Projector {
                     cancelling: false,
                     finish: FinishReason::Stop,
                 });
-                chunks.push(UiChunk::UserMessage {
-                    id,
-                    payload: UserMessageData {
-                        text: text.body.clone(),
-                        message_id: Some(*message),
-                    },
-                });
+                // The message the turn's first step will carry: the head
+                // of the mailbox.
+                if let Some((_, Some((message, text)))) = self.mailbox.front() {
+                    chunks.push(UiChunk::UserMessage {
+                        id,
+                        payload: UserMessageData {
+                            text: text.clone(),
+                            message_id: Some(*message),
+                        },
+                    });
+                }
                 chunks.push(UiChunk::TurnStarted {
                     id,
                     payload: TurnStartedData {
@@ -127,7 +150,10 @@ impl Projector {
                     message_id: Some(id.to_string()),
                 });
             }
-            Record::StepStarted { step } => {
+            Record::StepStarted { step, carries } => {
+                for _ in carries {
+                    self.mailbox.pop_front();
+                }
                 if let Some(turn) = &mut self.turn {
                     turn.step_index = step.index;
                     match turn.step {
@@ -224,7 +250,7 @@ impl Projector {
             }
             Record::Born { born } => self.name = Some(born.name.clone()),
             Record::RulesLoaded { rules, .. } => self.rules = Some(rules.clone()),
-            Record::Dispatched { .. } | Record::EpochBumped { .. } => {}
+            Record::Dispatched { .. } | Record::StopSent { .. } | Record::EpochBumped { .. } => {}
         }
         chunks
     }
@@ -298,7 +324,7 @@ fn result_chunks(call: &Call, exit: Exit, text: Option<String>, chunks: &mut Vec
             tool_call_id: id,
             output: json!({"text": text.unwrap_or_default()}),
         }),
-        Exit::NotStarted(Unstarted::Denied) => {
+        Exit::NotStarted(Unstarted::Denied | Unstarted::Steered) => {
             chunks.push(UiChunk::ToolApprovalResponse {
                 approval_id: approval_id(&id),
                 approved: false,
@@ -306,7 +332,13 @@ fn result_chunks(call: &Call, exit: Exit, text: Option<String>, chunks: &mut Vec
             chunks.push(UiChunk::ToolOutputDenied { tool_call_id: id });
         }
         Exit::Failed
-        | Exit::NotStarted(Unstarted::Cancelled | Unstarted::Limit | Unstarted::Invalid)
+        | Exit::NotStarted(
+            Unstarted::Cancelled
+            | Unstarted::Stopped
+            | Unstarted::Limit
+            | Unstarted::Invalid
+            | Unstarted::Refused,
+        )
         | Exit::Unknown => {
             let error_text = text
                 .filter(|text| !text.is_empty())

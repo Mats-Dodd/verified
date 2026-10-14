@@ -18,7 +18,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use verified_domain::Millis;
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 use verified_server::daemon::{self, DaemonError, Layout};
 use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
@@ -59,7 +59,7 @@ struct Args {
     command: Option<Command>,
     /// Opens this session instead of starting a new one.
     #[arg(long)]
-    session: Option<SessionId>,
+    session: Option<ActorId>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -247,7 +247,7 @@ async fn ensure_daemon(layout: &Layout) -> Result<SocketAddr, CliError> {
     Err(CliError::NoDaemon)
 }
 
-async fn run_tui(project: PathBuf, session: Option<SessionId>) -> Result<(), CliError> {
+async fn run_tui(project: PathBuf, session: Option<ActorId>) -> Result<(), CliError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(CliError::NotATerminal);
     }

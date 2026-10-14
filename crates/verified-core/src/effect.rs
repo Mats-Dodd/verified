@@ -11,7 +11,7 @@
 
 use vstd::prelude::*;
 
-use verified_domain::{CallId, CallIx, EffectId, Millis, Payload, Record, StepId, Tool};
+use verified_domain::{ActorId, CallId, CallIx, EffectId, Millis, Payload, Record, StepId, Tool};
 
 verus! {
 
@@ -89,6 +89,17 @@ impl<P: Payload> ToolCall<Approved, P> {
     {
         self.state.effect
     }
+
+    /// The key a `Keyed` call's target deduplicates on: the seq of the
+    /// `Dispatched` record that licensed it. A rerun after a crash keeps it
+    /// (only the epoch changes), so the target accepts the call once (O2).
+    #[must_use]
+    pub const fn key(&self) -> (key: u64)
+        ensures
+            key == self.spec_effect().seq,
+    {
+        self.state.effect.seq
+    }
 }
 
 /// Makes a call awaiting approval.
@@ -124,22 +135,31 @@ pub enum Effect<P: Payload> {
     CancelModel { id: EffectId },
     /// Tell the user `call` awaits approval; answered by an `Approve` event.
     AskApproval { request: ToolCall<Pending, P> },
-    /// Run an approved call; answered by `ToolDone` for `call.effect()`.
+    /// Run an approved call (a foreground run, a task's run, a `Keyed`
+    /// delivery, a timer); answered by `ToolDone` for `call.effect()`.
     RunTool { call: ToolCall<Approved, P> },
     /// Ask tool run `id` to stop at its next safe point; it still answers.
     CancelTool { id: EffectId },
     /// Wait `delay` on the Clock seam; answered by `Woke`.
     Sleep { id: EffectId, delay: Millis },
+    /// Deliver a stop to `child`, keyed by `id.seq` (its `StopSent`);
+    /// answered by `ToolDone` for `id`.
+    Stop { id: EffectId, child: ActorId },
 }
 
 /// Why a command was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 pub enum Rejection {
-    /// A turn is already running.
-    Busy,
-    /// `Limits::turns_per_session` reached.
-    SessionFull,
+    /// The actor is stopped: it takes no more envelopes.
+    Stopped,
+    /// A bound: `Limits::messages_per_actor`, or a spawn past
+    /// `Limits::depth`.
+    Limit,
+    /// The actor is not born yet.
+    Unborn,
+    /// The envelope is for another actor, or the actor was born otherwise.
+    Mismatch,
     /// No call with that id awaits approval in the running step.
     UnknownCall,
     /// No turn with that id is running.
@@ -151,8 +171,8 @@ pub enum Rejection {
 #[verifier::external_derive]
 pub enum Outcome {
     Accepted,
-    /// A repeat of something already done (same message, interrupt of a
-    /// turn already stopping).
+    /// A repeat of something already done (same envelope, interrupt of a
+    /// turn already stopping, the same birth).
     Exists,
     Rejected(Rejection),
     /// A completion that matches nothing in flight: an earlier epoch, a

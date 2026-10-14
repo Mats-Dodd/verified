@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::WireLimits;
-use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
+use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 
 /// Why a command body did not parse.
 #[derive(Debug, thiserror::Error)]
@@ -92,7 +92,7 @@ fn json_of<T: Serialize>(body: &T) -> Vec<u8> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateSession {
-    pub session_id: SessionId,
+    pub session_id: ActorId,
 }
 
 impl CreateSession {
@@ -271,12 +271,12 @@ pub enum Rejection {
     #[error("the body did not parse: {reason}")]
     Malformed { reason: String },
     #[error("no session {session_id}")]
-    SessionNotFound { session_id: SessionId },
+    SessionNotFound { session_id: ActorId },
     #[error("session {session_id} exists")]
-    SessionExists { session_id: SessionId },
+    SessionExists { session_id: ActorId },
     #[error("session {session_id} is running turn {turn_id}")]
     SessionBusy {
-        session_id: SessionId,
+        session_id: ActorId,
         turn_id: TurnId,
     },
     #[error("message {message_id} exists with different text")]
@@ -289,17 +289,14 @@ pub enum Rejection {
     TurnNotRunning { turn_id: TurnId },
     /// The session holds all it may (turns or bytes); it takes no new message.
     #[error("session {session_id} is full: {reason}")]
-    SessionFull {
-        session_id: SessionId,
-        reason: String,
-    },
+    SessionFull { session_id: ActorId, reason: String },
     /// The daemon hosts its limit of sessions.
     #[error("the daemon hosts its limit of {limit} sessions")]
     TooManySessions { limit: usize },
     /// The session, or the daemon, has its limit of live stream followers;
     /// retry later.
     #[error("too many live readers of session {session_id} (limit {limit})")]
-    TooManyFollowers { session_id: SessionId, limit: usize },
+    TooManyFollowers { session_id: ActorId, limit: usize },
 }
 
 impl Rejection {
@@ -383,14 +380,9 @@ mod tests {
             matches!(Cancel::decode(b"{}", &LIMITS), Err(DecodeError::Json(_))),
             "a cancel without a turn id does not parse"
         );
-        let cancel = Cancel {
-            turn_id: TurnId::parse("01a10400-0000-7000-8000-000000000001").expect("an id"),
-        };
+        let cancel = Cancel { turn_id: TurnId(7) };
         let body = cancel.encode();
-        assert_eq!(
-            body,
-            br#"{"turnId":"01a10400-0000-7000-8000-000000000001"}"#.to_vec()
-        );
+        assert_eq!(body, br#"{"turnId":"7"}"#.to_vec());
         assert_eq!(Cancel::decode(&body, &LIMITS).ok(), Some(cancel));
     }
 
@@ -437,14 +429,11 @@ mod tests {
     #[test]
     fn replies_say_exists_on_repeat() {
         let reply = SendMessageReply {
-            turn_id: TurnId::parse("01a10400-0000-7000-8000-000000000001").expect("an id"),
+            turn_id: TurnId(7),
             outcome: Outcome::Exists,
         };
         let body = encode_reply(&reply);
-        assert_eq!(
-            body,
-            br#"{"turnId":"01a10400-0000-7000-8000-000000000001","outcome":"exists"}"#.to_vec()
-        );
+        assert_eq!(body, br#"{"turnId":"7","outcome":"exists"}"#.to_vec());
         assert_eq!(decode_reply(&body, &LIMITS).ok(), Some(reply));
     }
 }

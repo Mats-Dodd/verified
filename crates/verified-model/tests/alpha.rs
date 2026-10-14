@@ -8,11 +8,11 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use proptest::prelude::*;
 use verified_core::{Core, Decision, Effect, Event, Loaded, ModelExit, Verdict};
 use verified_domain::{
-    CallId, EffectId, Epoch, Exit, Limits, LimitsConfig, MessageId, Millis, ModelFault, Record,
-    ToolName, TurnId, UnixMillis, Unstarted,
+    Address, Body, CallId, EffectId, Envelope, EnvelopeId, Epoch, Exit, Limits, LimitsConfig,
+    MessageId, Millis, ModelFault, Record, ToolName, TurnId, UnixMillis, Unstarted,
 };
-use verified_model::alpha;
 use verified_model::alpha::record;
+use verified_model::{alpha, born};
 use verified_server::payload::{ModelPart, Parsed, ToolInput, ToolOutput, measure, proposal};
 
 /// Small bounds, so that sizes reach the context limit and calls reach
@@ -20,7 +20,10 @@ use verified_server::payload::{ModelPart, Parsed, ToolInput, ToolOutput, measure
 fn limits() -> Limits {
     let count = |value: usize| NonZeroUsize::new(value).expect("non-zero");
     Limits::new(LimitsConfig {
-        turns_per_session: count(3),
+        turns_per_actor: count(3),
+        messages_per_actor: count(3),
+        tasks_per_actor: count(3),
+        depth: 1,
         steps_per_turn: NonZeroU32::new(3).expect("non-zero"),
         calls_per_step: count(2),
         calls_per_turn: count(3),
@@ -102,12 +105,9 @@ fn pick<T: Clone>(pool: &[T], index: u8) -> Option<T> {
     }
 }
 
-fn ids(slot: u8) -> (MessageId, TurnId) {
+fn message(slot: u8) -> MessageId {
     let at = UnixMillis::new(1_760_000_000_000 + u64::from(slot)).expect("a 48-bit time");
-    (
-        MessageId::from_parts(at, &[slot; 10]),
-        TurnId::from_parts(at, &[slot.wrapping_add(1); 10]),
-    )
+    MessageId::from_parts(at, &[slot; 10])
 }
 
 fn text(size: u16) -> String {
@@ -142,7 +142,7 @@ impl Seen {
                 Effect::RunTool { call } => self.tools.push(call.effect()),
                 Effect::Sleep { id, .. } => self.sleeps.push(*id),
                 Effect::AskApproval { request } => self.asks.push(request.id().clone()),
-                Effect::CancelModel { .. } | Effect::CancelTool { .. } => {}
+                Effect::CancelModel { .. } | Effect::CancelTool { .. } | Effect::Stop { .. } => {}
             }
         }
     }
@@ -183,14 +183,15 @@ impl Seen {
 
     fn event(&mut self, choice: &Choice, core: &Core<Parsed>) -> Option<Event<Parsed>> {
         Some(match choice {
-            Choice::Message(slot, size) => {
-                let (message, turn) = ids(*slot);
-                Event::Message {
-                    message,
-                    turn,
-                    text: measure(text(*size)),
-                }
-            }
+            Choice::Message(slot, size) => Event::Deliver {
+                envelope: Envelope {
+                    id: EnvelopeId::User(message(*slot)),
+                    from: Address::User,
+                    to: born().actor,
+                    reply_to: None,
+                    body: Body::Text(measure(text(*size))),
+                },
+            },
             Choice::Approve(index, yes) => Event::Approve {
                 call: pick(&self.asks, *index)?,
                 verdict: if *yes {
@@ -200,7 +201,11 @@ impl Seen {
                 },
             },
             Choice::Interrupt(running) => Event::Interrupt {
-                turn: if *running { core.running()? } else { ids(9).1 },
+                turn: if *running {
+                    core.running()?
+                } else {
+                    TurnId(9_999)
+                },
             },
             Choice::Parts(index, sizes) => Event::ModelParts {
                 id: pick(&self.models, *index)?,
@@ -288,20 +293,20 @@ proptest! {
         let mut core: Core<Parsed> = Core::new(limits());
         let mut log: Vec<Record<Parsed>> = Vec::new();
         let mut seen = Seen::default();
-        let boot = core.resume(Some(Loaded::defaults()));
+        let boot = core.resume(Some(born()), Some(Loaded::defaults()));
         prop_assert_eq!(
             alpha::decision(&boot),
-            alpha::decision(&abstracted(&log).resume(Some(Loaded::defaults())))
+            alpha::decision(&abstracted(&log).resume(Some(born()), Some(Loaded::defaults())))
         );
         seen.note(&boot.effects);
         persist(&mut core, &mut log, boot);
         for choice in &choices {
             let decision = if matches!(choice, Choice::Crash) {
                 core = Core::recover(limits(), &log).expect("the log recovers");
-                let resumed = core.resume(None);
+                let resumed = core.resume(Some(born()), None);
                 prop_assert_eq!(
                     alpha::decision(&resumed),
-                    alpha::decision(&abstracted(&log).resume(None)),
+                    alpha::decision(&abstracted(&log).resume(Some(born()), None)),
                     "resume commutes with α"
                 );
                 resumed

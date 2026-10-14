@@ -200,9 +200,9 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
             }
             Record::ToolResult { exit, .. } => {
                 if let (true, Some((number, proposal))) = (new, target) {
-                    let (class, ran) = match proposal.request {
+                    let (class, ran) = match &proposal.request {
                         Request::Run { args } => (
-                            Class::of(args),
+                            Class::of(args.tool()),
                             after
                                 .runs
                                 .get(&proposal.id)
@@ -246,6 +246,9 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
             Record::TurnStarted { .. }
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::StepFinished { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
@@ -257,7 +260,7 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
 const fn class(job: &Job) -> Option<Class> {
     match job {
         Job::Tool { tool, .. } => Some(Class::of(*tool)),
-        Job::Model { .. } | Job::Sleep => None,
+        Job::Model { .. } | Job::Sleep | Job::Stop { .. } => None,
     }
 }
 
@@ -338,7 +341,9 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                         situation(&mut keys, Situation::SecondBatch);
                     }
                 }
-                Event::Message { .. }
+                Event::Born { .. }
+                | Event::Rules { .. }
+                | Event::Deliver { .. }
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
                 | Event::Woke { .. }
@@ -462,7 +467,9 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
              call tools until the step limit",
         ),
         Key::Action(
-            Kind::Send
+            Kind::Born
+            | Kind::Rules
+            | Kind::Send
             | Kind::Answer
             | Kind::Interrupt
             | Kind::Execute

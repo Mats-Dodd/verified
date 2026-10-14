@@ -5,13 +5,14 @@
 use stateright::{Checker as _, Expectation, Model as _};
 use verified_core::{Event, ModelExit, Verdict};
 use verified_domain::{
-    Abstract, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId, Proposal,
-    Record, Request, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Abstract, Body, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId,
+    Proposal, Record, Request, Shape, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
+    Unstarted,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::Divergence;
 use verified_model::{
-    Action, Bounded, Bug, Harness, Job, Kind, Mismatch, Observed, World, replay, suite,
+    Action, Bounded, Bug, Harness, Job, Kind, Mismatch, Observed, World, born, replay, suite,
 };
 
 /// Checks every `always` property, and that each `reachable` example
@@ -451,27 +452,31 @@ fn a_path_found_by_bfs_replays_in_trace_mode() {
 #[test]
 fn a_trace_carries_real_ids_and_sizes() {
     let at = UnixMillis::new(1_760_000_000_000).expect("a 48-bit time");
-    let turn = TurnId::from_parts(at, &[9; 10]);
-    let message = Event::Message {
-        message: MessageId::from_parts(at, &[7; 10]),
-        turn,
-        text: size(2_000),
-    };
-    // Boot is records 0 and 1 in epoch 1 (the epoch, the default rules);
-    // the turn's first model call is licensed by its `StepStarted` (record
-    // 3), two batches are records 4 and 5, and the read is dispatched by
-    // record 8, after `StepFinished` and `Approved`.
+    let mut message = verified_model::message(born().actor, MessageId::from_parts(at, &[7; 10]));
+    if let Event::Deliver { envelope } = &mut message {
+        envelope.body = Body::Text(size(2_000));
+    }
+    // Boot is records 0 to 2 in epoch 1 (the epoch, the actor's birth, the
+    // default rules); the message is delivered at 3 and starts turn 4,
+    // whose first model call is licensed by its `StepStarted` (record 5);
+    // two batches are records 6 and 7, and the read is dispatched by record
+    // 10, after `StepFinished` and `Approved`.
+    let turn = TurnId(4);
     let model = EffectId {
         epoch: Epoch(1),
-        seq: 3,
+        seq: 5,
     };
     let read = EffectId {
         epoch: Epoch(1),
-        seq: 8,
+        seq: 10,
     };
     let call = Proposal::<Abstract> {
         id: CallId::parse("toolu_01XFDUDYJgAACzvnptvVoYEL").expect("a protocol id"),
-        request: Request::Run { args: Tool::Read },
+        request: Request::Run {
+            args: Shape::Read {
+                subject: Vec::new(),
+            },
+        },
     };
     let run = |first: u64, second: u64| {
         let parts = |bytes: u64| {
@@ -521,7 +526,8 @@ fn a_trace_carries_real_ids_and_sizes() {
     assert_eq!(ended(&small), None, "the turn goes on");
     assert!(
         small.contains(&Record::StepStarted {
-            step: StepId { turn, index: 1 }
+            step: StepId { turn, index: 1 },
+            carries: Vec::new(),
         }),
         "a second step starts: {small:?}"
     );
@@ -533,11 +539,7 @@ fn a_trace_carries_real_ids_and_sizes() {
 #[test]
 fn trace_mode_offers_only_the_traces_values() {
     let at = UnixMillis::new(1_760_000_000_000).expect("a 48-bit time");
-    let message = Event::Message {
-        message: MessageId::from_parts(at, &[7; 10]),
-        turn: TurnId::from_parts(at, &[9; 10]),
-        text: size(10),
-    };
+    let message = verified_model::message(born().actor, MessageId::from_parts(at, &[7; 10]));
     let path = [Action::Sync, Action::Deliver(message), Action::Sync];
     let trace = Harness::trace(Limits::v0(), events(&path));
     let world = follow(&trace, &path);

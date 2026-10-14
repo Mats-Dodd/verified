@@ -15,7 +15,7 @@ use ratatui::layout::{Constraint, Layout, Position as CursorPosition};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
-use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
+use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
     Approve, CreateSession, MessageText, Rejection, SendMessage, Verdict,
@@ -32,9 +32,9 @@ use crate::view::{self, Activity, Connection, Status};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
     /// Create this session (minted by the caller from the seams), then follow it.
-    New(SessionId),
+    New(ActorId),
     /// Follow this existing session.
-    Open(SessionId),
+    Open(ActorId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +116,7 @@ pub struct Folded {
 #[derive(Debug)]
 pub struct App {
     limits: Limits,
-    session: SessionId,
+    session: ActorId,
     phase: Phase,
     transcript: Transcript,
     /// Where the next read starts: just past the last folded read.
@@ -146,7 +146,7 @@ impl App {
     }
 
     #[must_use]
-    pub const fn session(&self) -> SessionId {
+    pub const fn session(&self) -> ActorId {
         self.session
     }
 

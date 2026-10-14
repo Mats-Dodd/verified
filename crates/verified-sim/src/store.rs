@@ -15,7 +15,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 use verified_domain::{Millis, Record};
 use verified_server::log::{FileLogStore, Log, LogError, LogStore};
 use verified_server::payload::Parsed;
@@ -54,11 +54,11 @@ impl WatchedStore {
 
 #[async_trait]
 impl LogStore for WatchedStore {
-    async fn list(&self) -> Result<Vec<SessionId>, LogError> {
+    async fn list(&self) -> Result<Vec<ActorId>, LogError> {
         self.inner.list().await
     }
 
-    async fn create(&self, session: SessionId) -> Result<Box<dyn Log>, LogError> {
+    async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
         let log = self.inner.create(session).await?;
         self.ledger.record(Entry::Created);
         Ok(Box::new(WatchedLog {
@@ -70,7 +70,7 @@ impl LogStore for WatchedStore {
 
     async fn open(
         &self,
-        session: SessionId,
+        session: ActorId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
         let (log, records) = self.inner.open(session).await?;
         self.ledger.record(Entry::Recovered {

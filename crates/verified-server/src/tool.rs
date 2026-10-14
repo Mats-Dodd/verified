@@ -22,7 +22,7 @@ use core::fmt::Write as _;
 
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
-use verified_domain::id::SessionId;
+use verified_domain::id::ActorId;
 use verified_domain::{Exit, Unstarted};
 
 use crate::env::{
@@ -63,7 +63,7 @@ pub fn bounded_head(text: &str, limit: usize) -> ToolOutput {
 /// itself ([`Grant::of`]).
 pub async fn run(
     env: &dyn Env,
-    session: SessionId,
+    session: ActorId,
     call: &ToolCall<Approved, Parsed>,
     cancel: &CancellationToken,
     limits: &ServerLimits,

@@ -173,7 +173,7 @@ async fn serve(mut stream: DuplexStream, seen: SyncSender<Seen>) {
     } else if line.contains("/messages ") {
         seen.send(Seen::Message(body))
             .expect("the test is listening");
-        let reply = r#"{"turnId":"01a10400-0000-7000-8000-000000000002","outcome":"created"}"#;
+        let reply = r#"{"turnId":"2","outcome":"created"}"#;
         respond_json(stream, reply).await;
     } else if line.contains("offset=0000000000000000") {
         // The first read: the whole stream, then the daemon closes the
@@ -343,7 +343,7 @@ fn flaky(refusals: u32) -> (Arc<FlakyDaemon>, Receiver<Seen>) {
 fn hello(entropy: u8) -> verified_tui::client::Command {
     let at = UnixMillis::new(NOW).expect("in range");
     verified_tui::client::Command::SendMessage {
-        session: verified_domain::id::SessionId::from_parts(at, &[0; 10]),
+        session: verified_domain::id::ActorId::from_parts(at, &[0; 10]),
         body: SendMessage {
             message_id: MessageId::from_parts(at, &[entropy; 10]),
             text: verified_wire::command::MessageText::parse(
@@ -540,7 +540,7 @@ async fn a_dropped_stream_resumes_at_exactly_the_next_unseen_record() {
         Limits::DEFAULT,
     );
     let at = UnixMillis::new(NOW).expect("in range");
-    let session = verified_domain::id::SessionId::from_parts(at, &[0; 10]);
+    let session = verified_domain::id::ActorId::from_parts(at, &[0; 10]);
     let start = Offset::BEGINNING;
     let stop = tokio_util::sync::CancellationToken::new();
     let (inbox, mut updates) = tokio::sync::mpsc::channel(8);

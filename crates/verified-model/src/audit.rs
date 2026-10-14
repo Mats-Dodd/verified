@@ -124,6 +124,9 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 crossed.extend(unsafe_live.iter().copied());
             }
             Record::StepStarted { .. }
+            | Record::Delivered { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
             | Record::Approved { .. }
@@ -135,8 +138,8 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
 
 /// The class of the tool `proposal` asks for, if it asks for one.
 const fn class(proposal: &Proposal<Abstract>) -> Option<Class> {
-    match proposal.request {
-        Request::Run { args } => Some(args.class()),
+    match &proposal.request {
+        Request::Run { args } => Some(args.tool().class()),
         Request::Invalid { .. } => None,
     }
 }

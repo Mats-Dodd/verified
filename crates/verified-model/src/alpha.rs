@@ -1,15 +1,14 @@
 //! α, the abstraction from any payload to [`Abstract`].
 //!
 //! A record keeps every id and every size, drops each body, and reduces a
-//! call's arguments to the tool they name: its subject (a path, a command)
-//! is dropped, so a rule's pattern is matched in the model against an empty
-//! subject. The matcher itself is proved (A2); the model checks grants up
+//! call's arguments to their shape without its subject (a path, a command):
+//! a rule's pattern is matched in the model against an empty subject. The matcher itself is proved (A2); the model checks grants up
 //! to subjects, and commutes with the core under rules whose patterns are
 //! `Any` (the default rules). The core reads nothing else of a
 //! payload (it compares sizes against `Limits::context_bytes` and asks a
-//! call's tool), so a core run on α of a log decides α of what it decides on
-//! the log. An event likewise keeps its ids and sizes, and a call's arguments
-//! only their tool.
+//! call's shape), so a core run on α of a log decides α of what it decides
+//! on the log. An event likewise keeps its ids and sizes, and a call's
+//! arguments only their shape without its subject.
 //!
 //! A `ToolCall` can only be minted inside the core, so an effect does not
 //! become an `Effect<Abstract>`: it becomes [`Work`], the effect with every
@@ -20,8 +19,8 @@
 
 use verified_core::{Decision, Effect, Event, ModelExit, Outcome};
 use verified_domain::{
-    Abstract, CallId, CallIx, EffectId, Measured, Millis, Payload, Proposal, Record, Request,
-    StepId, Tool, Unit,
+    Abstract, ActorId, Body, CallId, CallIx, EffectId, Envelope, Measured, Millis, Payload,
+    Proposal, Record, Request, StepId, Tool, Unit,
 };
 
 /// A payload's size without its body.
@@ -33,17 +32,32 @@ pub const fn measured<T>(measured: &Measured<T>) -> Measured<Unit> {
     }
 }
 
-/// A proposal's id and the tool its arguments name; an invalid request
-/// stays invalid.
+/// A proposal's id and its arguments' shape without its subject; an
+/// invalid request stays invalid.
 #[must_use]
 pub fn proposal<P: Payload>(proposal: &Proposal<P>) -> Proposal<Abstract> {
     Proposal {
         id: proposal.id.clone(),
         request: match &proposal.request {
             Request::Run { args } => Request::Run {
-                args: P::tool(args),
+                args: P::shape(args).without_subject(),
             },
             Request::Invalid { .. } => Request::Invalid { reason: Unit },
+        },
+    }
+}
+
+/// α of an envelope: its ids, and its text's size.
+#[must_use]
+pub const fn envelope<P: Payload>(envelope: &Envelope<P>) -> Envelope<Abstract> {
+    Envelope {
+        id: envelope.id,
+        from: envelope.from,
+        to: envelope.to,
+        reply_to: envelope.reply_to,
+        body: match &envelope.body {
+            Body::Text(text) => Body::Text(measured(text)),
+            Body::Stop => Body::Stop,
         },
     }
 }
@@ -52,21 +66,21 @@ pub fn proposal<P: Payload>(proposal: &Proposal<P>) -> Proposal<Abstract> {
 #[must_use]
 pub fn record<P: Payload>(record: &Record<P>) -> Record<Abstract> {
     match record {
-        Record::TurnStarted {
-            turn,
-            message,
-            text,
-        } => Record::TurnStarted {
-            turn: *turn,
-            message: *message,
-            text: measured(text),
+        Record::Delivered {
+            envelope: delivered,
+        } => Record::Delivered {
+            envelope: envelope(delivered),
         },
+        Record::TurnStarted { turn } => Record::TurnStarted { turn: *turn },
         Record::Born { born } => Record::Born { born: born.clone() },
         Record::RulesLoaded { rules, file } => Record::RulesLoaded {
             rules: rules.clone(),
             file: file.as_ref().map(measured),
         },
-        Record::StepStarted { step } => Record::StepStarted { step: *step },
+        Record::StepStarted { step, carries } => Record::StepStarted {
+            step: *step,
+            carries: carries.clone(),
+        },
         Record::ModelOutput { step, parts } => Record::ModelOutput {
             step: *step,
             parts: measured(parts),
@@ -89,6 +103,12 @@ pub fn record<P: Payload>(record: &Record<P>) -> Record<Abstract> {
             exit: *exit,
             output: output.as_ref().map(measured),
         },
+        Record::TaskEnded { task, exit, output } => Record::TaskEnded {
+            task: *task,
+            exit: *exit,
+            output: output.as_ref().map(measured),
+        },
+        Record::StopSent { child } => Record::StopSent { child: *child },
         Record::CancelRequested { turn } => Record::CancelRequested { turn: *turn },
         Record::TurnEnded { turn, outcome } => Record::TurnEnded {
             turn: *turn,
@@ -102,14 +122,15 @@ pub fn record<P: Payload>(record: &Record<P>) -> Record<Abstract> {
 #[must_use]
 pub fn event<P: Payload>(event: &Event<P>) -> Event<Abstract> {
     match event {
-        Event::Message {
-            message,
-            turn,
-            text,
-        } => Event::Message {
-            message: *message,
-            turn: *turn,
-            text: measured(text),
+        Event::Born { born } => Event::Born { born: born.clone() },
+        Event::Rules { rules, file } => Event::Rules {
+            rules: rules.clone(),
+            file: file.as_ref().map(measured),
+        },
+        Event::Deliver {
+            envelope: delivered,
+        } => Event::Deliver {
+            envelope: envelope(delivered),
         },
         Event::Approve { call, verdict } => Event::Approve {
             call: call.clone(),
@@ -168,6 +189,10 @@ pub enum Work {
         id: EffectId,
         delay: Millis,
     },
+    Stop {
+        id: EffectId,
+        child: ActorId,
+    },
 }
 
 /// α of an effect.
@@ -194,6 +219,10 @@ pub fn work<P: Payload>(effect: &Effect<P>) -> Work {
         Effect::Sleep { id, delay } => Work::Sleep {
             id: *id,
             delay: *delay,
+        },
+        Effect::Stop { id, child } => Work::Stop {
+            id: *id,
+            child: *child,
         },
     }
 }
