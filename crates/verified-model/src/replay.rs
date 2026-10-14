@@ -1,7 +1,9 @@
 //! Replaying an observed run through the model.
 //!
 //! A run (the simulation's ledger, folded) is a sequence of [`Observed`]
-//! facts in the order they happened. Each one either is a step of the
+//! facts in the order they happened, each of one actor's (its log, its
+//! shell, its runs). Actors take slots in the order the trace first names
+//! them: the first root at slot 0, a child at the slot its spawn named. Each one either is a step of the
 //! model (an event entering the core, a group commit becoming durable, a
 //! boot after a crash, a tool's run acting on the world, the client folding
 //! a record) or is a check on the state the model is in (a tool dispatched
@@ -28,21 +30,24 @@ use std::collections::BTreeSet;
 
 use stateright::{Expectation, Model as _};
 use verified_core::Event;
-use verified_domain::{Abstract, Class, EffectId, Tool};
+use verified_domain::{Abstract, ActorId, Address, Class, EffectId, Tool};
 
 use crate::coverage::{self, Key};
 use crate::harness::{Action, Harness};
-use crate::world::{Flight, Job, Rec, World};
+use crate::world::{Flight, Job, Landing, Rec, Slot, World};
 
 /// One fact a run observed, in α of its values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Observed {
-    /// The daemon booted on a log holding exactly these records (a new
-    /// session: none). Every boot but the first follows a crash.
+    /// The daemon booted the actor on a log holding exactly these records
+    /// (a new actor: none; a child's log is created by its spawn). Every
+    /// other boot follows a crash, which reboots every actor.
     Booted(Vec<Rec>),
     /// The shell resumed, and `resume` decided these records.
     Resumed(Vec<Rec>),
-    /// An event entered `decide`, which decided these records.
+    /// An event entered `decide`, which decided these records. An
+    /// envelope from another actor (or a stop from `v`), and a child's
+    /// birth, are a delivery's steps landing.
     Decided(Event<Abstract>, Vec<Rec>),
     /// A full log refused the boot's resume: nothing of it was written, and
     /// none of its effects start. The shell interrupts the running turn
@@ -61,8 +66,9 @@ pub enum Observed {
     /// here only if it never mutated and was not `stopped` (it reports
     /// `NotStarted`: it saw its cancel before acting).
     Ran { id: EffectId, stopped: bool },
-    /// The client folded the record at this offset. Only the offset: what
-    /// it folded there is the simulation's I6 to check, not the replay's.
+    /// The client folded the record at this offset of the first root's
+    /// log. Only the offset: what it folded there is the simulation's I6
+    /// to check, not the replay's.
     Read(u64),
 }
 
@@ -100,6 +106,8 @@ pub struct Replayed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Divergence {
     pub index: usize,
+    /// The actor it was of.
+    pub actor: ActorId,
     pub observed: Observed,
     pub why: String,
     /// The state the run was in, summarised.
@@ -127,6 +135,7 @@ impl fmt::Display for Mismatch {
             Self::Diverged(divergence) => {
                 let Divergence {
                     index,
+                    actor,
                     observed,
                     why,
                     state,
@@ -134,7 +143,7 @@ impl fmt::Display for Mismatch {
                 } = divergence.as_ref();
                 write!(
                     formatter,
-                    "the run left the model at observation {index}: {observed:?}\n  \
+                    "the run left the model at observation {index} of {actor}: {observed:?}\n  \
                  why: {why}\n  state: {state}\n  enabled: {enabled:?}"
                 )
             }
@@ -153,34 +162,49 @@ impl fmt::Display for Mismatch {
 /// A state, short enough to read in a report.
 #[must_use]
 pub fn summary(world: &World) -> String {
-    let flights: Vec<String> = world
-        .flights
+    let actors: Vec<String> = world
+        .actors
         .iter()
-        .map(|(id, flight)| {
-            let job = match &flight.job {
-                Job::Model { batches } => format!("model({batches} batches)"),
-                Job::Tool { call, tool } => format!("{tool:?} {}", call.as_str()),
-                Job::Sleep => "sleep".to_owned(),
-                Job::Stop { child } => format!("stop {child}"),
-            };
+        .enumerate()
+        .filter(|(_, actor)| actor.created)
+        .map(|(slot, actor)| {
+            let flights: Vec<String> = actor
+                .flights
+                .iter()
+                .map(|(id, flight)| {
+                    let job = match &flight.job {
+                        Job::Model { batches } => format!("model({batches} batches)"),
+                        Job::Tool { call, tool } => format!("{tool:?} {}", call.as_str()),
+                        Job::Sleep => "sleep".to_owned(),
+                        Job::Deliver {
+                            to, what, landing, ..
+                        } => format!("{what:?} to {to:?} {landing:?}"),
+                    };
+                    format!(
+                        "{}.{} {job}{}{}{}",
+                        id.epoch.0,
+                        id.seq,
+                        if flight.executed { " ran" } else { "" },
+                        if flight.cancelled { " cancelled" } else { "" },
+                        if flight.hung { " hung" } else { "" },
+                    )
+                })
+                .collect();
             format!(
-                "{}.{} {job}{}{}",
-                id.epoch.0,
-                id.seq,
-                if flight.executed { " ran" } else { "" },
-                if flight.cancelled { " cancelled" } else { "" },
+                "actor {slot}: log {} records (last {:?}), pending {:?}, staged {:?}, \
+                 flights [{}], asks {:?}",
+                actor.log.len(),
+                actor.log.last(),
+                actor.pending,
+                actor.staged,
+                flights.join(", "),
+                actor.asks,
             )
         })
         .collect();
     format!(
-        "log {} records (last {:?}), pending {:?}, staged {:?}, flights [{}], asks {:?}, \
-         client at {} (cursor {:?}), crashes {}",
-        world.log.len(),
-        world.log.last(),
-        world.pending,
-        world.staged,
-        flights.join(", "),
-        world.asks,
+        "{}; client at {} (cursor {:?}), crashes {}",
+        actors.join("; "),
         world.client.next,
         world.client.cursor,
         world.crashes,
@@ -204,9 +228,13 @@ fn take(harness: &Harness, world: &World, action: &Action) -> Result<World, Stri
         .ok_or_else(|| format!("{action:?} has no next state"))
 }
 
-/// The tool of run `id`, which `world` started and has not yet returned.
-fn running(world: &World, id: EffectId) -> Result<Tool, String> {
-    match world.flights.get(&id) {
+/// The tool of run `id` of the actor at `slot`, which `world` started and
+/// has not yet returned.
+fn running(world: &World, slot: Slot, id: EffectId) -> Result<Tool, String> {
+    let actor = world
+        .actor(slot)
+        .ok_or_else(|| format!("no actor at slot {slot}"))?;
+    match actor.flights.get(&id) {
         Some(Flight {
             job: Job::Tool { tool, .. },
             executed: false,
@@ -224,67 +252,163 @@ fn running(world: &World, id: EffectId) -> Result<Tool, String> {
         )),
         None => Err(format!(
             "effect {id:?} is no run the model started (staged: {:?})",
-            world.staged
+            actor.staged
         )),
     }
 }
 
-/// The actions `observed` means at `world`, in order: none for a check on
-/// the state, or for a change the shell makes outside the model's actions
-/// (a refusal, and the resume after one).
-fn means(world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
+/// The steps of the delivery in flight whose next step lands at slot `to`
+/// at stage `at`, carrying `envelope` if it names one. A spawn of a child
+/// whose log exists already passes its creation unseen (the registry
+/// answers that it exists), so its birth takes that step first.
+fn landing(
+    world: &World,
+    to: Slot,
+    at: Landing,
+    envelope: Option<verified_domain::EnvelopeId>,
+) -> Result<Vec<Action>, String> {
+    let created = world.actor(to).is_some_and(|actor| actor.created);
+    world
+        .actors
+        .iter()
+        .enumerate()
+        .find_map(|(slot, actor)| {
+            actor
+                .flights
+                .iter()
+                .find_map(|(id, flight)| match &flight.job {
+                    Job::Deliver {
+                        to: Some(recipient),
+                        envelope: carried,
+                        landing,
+                        ..
+                    } if *recipient == to
+                        && envelope.is_none_or(|envelope| envelope == *carried) =>
+                    {
+                        if *landing == at {
+                            Some(vec![Action::Land(slot, *id)])
+                        } else if *landing == Landing::Create && at == Landing::Born && created {
+                            Some(vec![Action::Land(slot, *id), Action::Land(slot, *id)])
+                        } else {
+                            None
+                        }
+                    }
+                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep | Job::Deliver { .. } => None,
+                })
+        })
+        .ok_or_else(|| format!("no delivery in flight lands at slot {to} ({at:?})"))
+}
+
+/// Where the replay is between a crash and every actor's boot after it.
+#[derive(Default)]
+struct Rebooting {
+    /// The actors yet to boot after the last crash.
+    slots: BTreeSet<Slot>,
+}
+
+/// The actions observation `observed` of the actor at `slot` means at
+/// `world`, in order: none for a check on the state, or for a change the
+/// shell makes outside the model's actions (a refusal, and the resume after
+/// one). A crash reboots every actor: the first boot after it means the
+/// crash, keeping of each actor's pending records what its own boot in
+/// `rest` shows.
+fn means(
+    world: &World,
+    slot: Slot,
+    observed: &Observed,
+    rest: &[(Slot, Observed)],
+    rebooting: &mut Rebooting,
+) -> Result<Vec<Action>, String> {
+    let actor = world
+        .actor(slot)
+        .ok_or_else(|| format!("no actor at slot {slot}"))?;
     match observed {
         Observed::Booted(records) => {
-            // A crash is named by how many pending records it kept, so a
-            // boot means exactly one; `agrees` checks it left these.
-            let kept = records.len().checked_sub(world.log.len()).ok_or_else(|| {
-                format!(
-                    "no crash leaves the {} records booted on (log {})",
-                    records.len(),
-                    world.log.len()
-                )
-            })?;
-            Ok(vec![Action::Crash(kept)])
+            if !actor.created && records.is_empty() {
+                // A spawn creates the child's log.
+                return landing(world, slot, Landing::Create, None);
+            }
+            if rebooting.slots.remove(&slot) {
+                // The crash was taken at the first boot after it.
+                return Ok(Vec::new());
+            }
+            // A crash is named by how many pending records each actor
+            // kept, so a boot means exactly one; `agrees` checks it left
+            // these.
+            let kept = |slot: Slot, records: &[Rec]| {
+                let log = world.actor(slot).map_or(0, |actor| actor.log.len());
+                records.len().checked_sub(log).ok_or_else(|| {
+                    format!(
+                        "no crash leaves the {} records booted on (log {log})",
+                        records.len(),
+                    )
+                })
+            };
+            let mut keep = Vec::new();
+            for (other, actor) in world.actors.iter().enumerate() {
+                if other == slot {
+                    keep.push(kept(slot, records)?);
+                } else if actor.created {
+                    let booted = rest.iter().find_map(|(at, observed)| {
+                        if let Observed::Booted(records) = observed
+                            && *at == other
+                        {
+                            Some(records)
+                        } else {
+                            None
+                        }
+                    });
+                    keep.push(booted.map_or(Ok(0), |records| kept(other, records))?);
+                    rebooting.slots.insert(other);
+                } else {
+                    keep.push(0);
+                }
+            }
+            Ok(vec![Action::Crash(keep)])
         }
         Observed::Resumed(_) => Ok(Vec::new()),
         Observed::Refused => {
-            if world.persisting() {
+            if actor.persisting() {
                 Ok(Vec::new())
             } else {
                 Err("the log refused a resume, but none is being persisted".to_owned())
             }
         }
-        Observed::Decided(event, _) => Ok(vec![Action::Deliver(event.clone())]),
+        Observed::Decided(Event::Born { .. }, _) => landing(world, slot, Landing::Born, None),
+        Observed::Decided(Event::Deliver { envelope }, _) if envelope.from != Address::User => {
+            landing(world, slot, Landing::Queued, Some(envelope.id))
+        }
+        Observed::Decided(event, _) => Ok(vec![Action::Deliver(slot, event.clone())]),
         Observed::Acked { first, .. } => {
             let at = usize::try_from(*first).map_err(|error| error.to_string())?;
-            if at == world.log.len() {
-                Ok(vec![Action::Sync])
+            if at == actor.log.len() {
+                Ok(vec![Action::Sync(slot)])
             } else {
                 Err(format!(
                     "a group from {at} became durable on a log of {}",
-                    world.log.len()
+                    actor.log.len()
                 ))
             }
         }
         Observed::Dispatched(id) => {
-            running(world, *id)?;
+            running(world, slot, *id)?;
             Ok(Vec::new())
         }
         Observed::Mutated(id) => {
-            let tool = running(world, *id)?;
+            let tool = running(world, slot, *id)?;
             if tool.class() == Class::Safe {
                 return Err(format!(
                     "effect {id:?} is a {tool:?} run, which changes nothing in the world"
                 ));
             }
-            Ok(vec![Action::Execute(*id)])
+            Ok(vec![Action::Execute(slot, *id)])
         }
-        Observed::Ran { id, stopped } => match world.flights.get(id) {
+        Observed::Ran { id, stopped } => match actor.flights.get(id) {
             Some(flight) if matches!(flight.job, Job::Tool { .. }) => {
                 if flight.executed || *stopped {
                     Ok(Vec::new())
                 } else {
-                    Ok(vec![Action::Execute(*id)])
+                    Ok(vec![Action::Execute(slot, *id)])
                 }
             }
             Some(_) | None => Err(format!(
@@ -305,65 +429,71 @@ fn means(world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
     }
 }
 
-/// The state the run is in after `observed`, whose actions took the model
-/// from `before` to `after`: `after` itself, if it agrees with what was
-/// observed, or for a refusal and the resume after one, `after` changed as
-/// the shell changed it.
+/// The state the run is in after observation `observed` of the actor at
+/// `slot`, whose actions took the model from `before` to `after`: `after`
+/// itself, if it agrees with what was observed, or for a refusal and the
+/// resume after one, `after` changed as the shell changed it.
 fn agrees(
     harness: &Harness,
     before: &World,
     after: World,
+    slot: Slot,
     observed: &Observed,
 ) -> Result<World, String> {
+    let (Some(was), Some(now)) = (before.actor(slot), after.actor(slot)) else {
+        return Err(format!("no actor at slot {slot}"));
+    };
     match observed {
         Observed::Booted(records) => {
-            if after.log == *records {
+            if now.log == *records {
                 Ok(after)
             } else {
                 Err(format!(
                     "no crash leaves the {} records booted on (log {}, pending {})",
                     records.len(),
-                    before.log.len(),
-                    before.pending.len()
+                    was.log.len(),
+                    was.pending.len()
                 ))
             }
         }
         Observed::Resumed(records) => {
-            let resumed = if after.refused {
+            let resumed = if now.refused {
                 harness
                     .resumed(&after)
                     .ok_or_else(|| "the log the shell resumes on does not recover".to_owned())?
             } else {
                 after
             };
-            if resumed.pending == *records {
+            let pending = resumed.actor(slot).map(|actor| &actor.pending);
+            if pending == Some(records) {
                 Ok(resumed)
             } else {
                 Err(format!(
-                    "the model resumed to {:?}, the shell to {records:?}",
-                    resumed.pending
+                    "the model resumed to {pending:?}, the shell to {records:?}"
                 ))
             }
         }
         Observed::Refused => {
             let mut refused = after;
-            refused.pending.clear();
-            refused.staged.clear();
-            refused.refused = true;
+            if let Some(actor) = refused.actors.get_mut(slot) {
+                actor.pending.clear();
+                actor.staged.clear();
+                actor.refused = true;
+            }
             Ok(refused)
         }
         Observed::Decided(_, records) => {
-            if after.pending == *records {
+            if now.pending == *records {
                 Ok(after)
             } else {
                 Err(format!(
                     "the model decided {:?}, the shell {records:?}",
-                    after.pending
+                    now.pending
                 ))
             }
         }
         Observed::Acked { records, .. } => {
-            let made = after.log.get(before.log.len()..);
+            let made = now.log.get(was.log.len()..);
             if made == Some(records.as_slice()) {
                 Ok(after)
             } else {
@@ -399,38 +529,65 @@ fn broken(harness: &Harness, world: &World) -> Option<&'static str> {
         .map(|property| property.name)
 }
 
-/// Replays `trace` through `harness`, checking every `always` property on
-/// every state it reaches.
+/// Replays `trace`, the observations of the first root alone, through
+/// `harness`, checking every `always` property on every state it reaches.
 ///
 /// # Errors
 /// The trace does not start with a boot on an empty log, an observation is
 /// nothing the model allows, or a state breaks a property.
 pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatch> {
+    let actor = harness.born.actor;
+    let tagged: Vec<(ActorId, Observed)> = trace
+        .iter()
+        .map(|observed| (actor, observed.clone()))
+        .collect();
+    replay_actors(harness, &tagged)
+}
+
+/// Replays `trace`, the observations of several actors, through `harness`.
+///
+/// The observations are in the order they happened, each with its actor,
+/// at the slot `harness` gives it ([`Harness::slot_of`]); every `always`
+/// property is checked on every state the replay reaches.
+///
+/// # Errors
+/// The trace does not start with the first root's boot on an empty log, it
+/// names an actor `harness` has no slot for, an observation is nothing the
+/// model allows, or a state breaks a property.
+pub fn replay_actors(
+    harness: &Harness,
+    trace: &[(ActorId, Observed)],
+) -> Result<Replayed, Mismatch> {
     // The world boots once before anything is observed: the first
-    // observation is that boot, on an empty log.
+    // observation is the first root's boot, on an empty log.
     let mut world = harness.boot();
-    let diverged = |index: usize, observed: &Observed, why: String, world: &World| {
-        Mismatch::Diverged(Box::new(Divergence {
-            index,
-            observed: observed.clone(),
-            why,
-            state: summary(world),
-            enabled: enabled(harness, world),
-        }))
-    };
-    let Some((first, rest)) = trace.split_first() else {
+    let root = harness.born.actor;
+    let diverged =
+        |index: usize, actor: ActorId, observed: &Observed, why: String, world: &World| {
+            Mismatch::Diverged(Box::new(Divergence {
+                index,
+                actor,
+                observed: observed.clone(),
+                why,
+                state: summary(world),
+                enabled: enabled(harness, world),
+            }))
+        };
+    let Some(((first_actor, first), rest)) = trace.split_first() else {
         return Err(diverged(
             0,
+            root,
             &Observed::Booted(Vec::new()),
             "the trace is empty".to_owned(),
             &world,
         ));
     };
-    if *first != Observed::Booted(Vec::new()) {
+    if *first_actor != root || *first != Observed::Booted(Vec::new()) {
         return Err(diverged(
             0,
+            *first_actor,
             first,
-            "a run starts by booting on an empty log".to_owned(),
+            "a run starts by booting the first root on an empty log".to_owned(),
             &world,
         ));
     }
@@ -441,18 +598,33 @@ pub fn replay(harness: &Harness, trace: &[Observed]) -> Result<Replayed, Mismatc
             state: summary(&world),
         });
     }
+    let mut slotted: Vec<(Slot, Observed)> = Vec::with_capacity(rest.len());
+    for (index, (actor, observed)) in (1..).zip(rest) {
+        let slot = harness.slot_of(*actor).ok_or_else(|| {
+            diverged(
+                index,
+                *actor,
+                observed,
+                "the model has no slot for this actor".to_owned(),
+                &world,
+            )
+        })?;
+        slotted.push((slot, observed.clone()));
+    }
     let mut keys = BTreeSet::new();
-    for (index, observed) in (1..).zip(rest) {
+    let mut rebooting = Rebooting::default();
+    for (index, ((slot, observed), (actor, _))) in (1..).zip(slotted.iter().zip(rest)) {
         let mut after = world.clone();
-        let stepped = means(&world, observed).and_then(|taken| {
+        let later = slotted.get(index..).unwrap_or_default();
+        let stepped = means(&world, *slot, observed, later, &mut rebooting).and_then(|taken| {
             for action in taken {
                 let next = take(harness, &after, &action)?;
                 keys.extend(coverage::keys(harness, &after, &action, &next));
                 after = next;
             }
-            agrees(harness, &world, after, observed)
+            agrees(harness, &world, after, *slot, observed)
         });
-        world = stepped.map_err(|why| diverged(index, observed, why, &world))?;
+        world = stepped.map_err(|why| diverged(index, *actor, observed, why, &world))?;
         if let Some(property) = broken(harness, &world) {
             return Err(Mismatch::Violated {
                 index: Some(index),

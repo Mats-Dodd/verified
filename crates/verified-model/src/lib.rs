@@ -30,6 +30,8 @@ pub mod replay;
 pub mod suite;
 mod world;
 
-pub use harness::{Action, Bounded, Bug, Domain, Harness, Kind, born, message};
-pub use replay::{Divergence, Mismatch, Observed, Replayed, replay};
-pub use world::{Client, Flight, Job, Rec, Staged, World};
+pub use harness::{
+    Action, Bounded, Bug, Domain, Harness, Kind, background, born, message, plain, stop,
+};
+pub use replay::{Divergence, Mismatch, Observed, Replayed, replay, replay_actors};
+pub use world::{Actor, Client, Delivery, Flight, Job, Landing, Rec, Slot, Staged, World};

@@ -16,11 +16,12 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use stateright::Model as _;
 use verified_core::Event;
 use verified_domain::{
-    Exit, Failure, Limit, Record, Request, Reset, Tool, TurnOutcome, Unstarted, named,
+    Body, EnvelopeId, Exit, Failure, Limit, Record, Request, Reset, Tool, TurnOutcome, Unstarted,
+    named,
 };
 
 use crate::harness::{Action, Harness, Kind};
-use crate::world::{Job, World};
+use crate::world::{Actor, Job, World};
 
 /// A call's class: what its approval and a crash do to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -124,6 +125,23 @@ pub enum Situation {
     StepRetried,
     /// A step was reset because the daemon restarted under it.
     StepRestarted,
+    /// The user's message arrived while a turn ran: it steers the turn.
+    Steered,
+    /// A step carried two notifications or agents' messages together.
+    Coalesced,
+    /// A stopped actor sent a stop to a child.
+    StopCascade,
+    /// A run's deadline passed while it was unresolved.
+    Expired,
+}
+
+/// What started a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Started {
+    /// A background call: a command, or a timer.
+    Call,
+    /// A stop sent to a child.
+    Stop,
 }
 
 /// One thing a step of the model did.
@@ -143,6 +161,11 @@ pub enum Key {
     Crashed {
         class: Class,
         ran: bool,
+    },
+    /// A task ended: what started it, and how it ended.
+    Task {
+        started: Started,
+        resolved: Resolved,
     },
     /// An action of this kind was taken.
     Action(Kind),
@@ -169,6 +192,9 @@ impl fmt::Display for Key {
                 "crash {} the {class:?} run acted",
                 if *ran { "after" } else { "before" }
             ),
+            Self::Task { started, resolved } => {
+                write!(formatter, "task {started:?} -> {resolved:?}")
+            }
             Self::Action(kind) => write!(formatter, "action {kind:?}"),
             Self::Turn(ended) => write!(formatter, "turn {ended:?}"),
             Self::Situation(situation) => write!(formatter, "{situation:?}"),
@@ -178,8 +204,10 @@ impl fmt::Display for Key {
 
 /// The keys of the decision `after` holds (its records from `after.log`
 /// on), read against every record before it.
-fn decided(after: &World, keys: &mut BTreeSet<Key>) {
+fn decided(after: &Actor, keys: &mut BTreeSet<Key>) {
     let start = after.log.len();
+    // The seqs of the records that started a task, and by what.
+    let mut tasks: BTreeMap<u64, Started> = BTreeMap::new();
     // Calls approved, and the position of each call's last `Dispatched`,
     // by number.
     let mut approved: BTreeSet<usize> = BTreeSet::new();
@@ -194,8 +222,34 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
                 }
             }
             Record::Dispatched { .. } => {
-                if let Some((number, _)) = target {
+                if let Some((number, proposal)) = target {
                     dispatched.insert(number, at);
+                    if matches!(&proposal.request, Request::Run { args } if args.background()) {
+                        tasks.insert(u64::try_from(at).unwrap_or(u64::MAX), Started::Call);
+                    }
+                }
+            }
+            Record::StopSent { .. } => {
+                tasks.insert(u64::try_from(at).unwrap_or(u64::MAX), Started::Stop);
+                if new {
+                    keys.insert(Key::Situation(Situation::StopCascade));
+                }
+            }
+            Record::TaskEnded { task, exit, .. } => {
+                if let (true, Some(started)) = (new, tasks.get(&task.0)) {
+                    keys.insert(Key::Task {
+                        started: *started,
+                        resolved: Resolved::of(*exit),
+                    });
+                }
+            }
+            Record::StepStarted { carries, .. } => {
+                let mail = carries
+                    .iter()
+                    .filter(|id| !matches!(id, EnvelopeId::User(_)))
+                    .count();
+                if new && mail >= 2 {
+                    keys.insert(Key::Situation(Situation::Coalesced));
                 }
             }
             Record::ToolResult { exit, .. } => {
@@ -247,10 +301,7 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
             | Record::Delivered { .. }
-            | Record::TaskEnded { .. }
-            | Record::StopSent { .. }
             | Record::StepFinished { .. }
-            | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::CancelRequested { .. } => {}
         }
@@ -260,7 +311,7 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
 const fn class(job: &Job) -> Option<Class> {
     match job {
         Job::Tool { tool, .. } => Some(Class::of(*tool)),
-        Job::Model { .. } | Job::Sleep | Job::Stop { .. } => None,
+        Job::Model { .. } | Job::Sleep | Job::Deliver { .. } => None,
     }
 }
 
@@ -271,88 +322,130 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
     let situation = |keys: &mut BTreeSet<Key>, situation| {
         keys.insert(Key::Situation(situation));
     };
+    let decided_at = |slot: usize, keys: &mut BTreeSet<Key>| {
+        if let Some(actor) = after.actor(slot) {
+            decided(actor, keys);
+        }
+    };
     match action {
         Action::Crash(keep) => {
-            for flight in before.flights.values() {
-                if let Some(class) = class(&flight.job) {
-                    keys.insert(Key::Crashed {
-                        class,
-                        ran: flight.executed,
-                    });
+            for (actor, keep) in before.actors.iter().zip(keep) {
+                for flight in actor.flights.values() {
+                    if let Some(class) = class(&flight.job) {
+                        keys.insert(Key::Crashed {
+                            class,
+                            ran: flight.executed,
+                        });
+                    }
+                }
+                let pending = actor.pending.len();
+                if pending > 0 {
+                    situation(
+                        &mut keys,
+                        if *keep == 0 {
+                            Situation::CrashLostGroup
+                        } else if *keep < pending {
+                            Situation::CrashTornGroup
+                        } else {
+                            Situation::CrashKeptGroup
+                        },
+                    );
                 }
             }
-            let pending = before.pending.len();
-            if pending > 0 {
-                situation(
-                    &mut keys,
-                    if *keep == 0 {
-                        Situation::CrashLostGroup
-                    } else if *keep < pending {
-                        Situation::CrashTornGroup
-                    } else {
-                        Situation::CrashKeptGroup
-                    },
-                );
+            for slot in 0..after.actors.len() {
+                decided_at(slot, &mut keys);
             }
-            decided(after, &mut keys);
         }
-        Action::Execute(_) => {
-            if before.persisting() {
+        Action::Execute(slot, _) => {
+            let Some(actor) = before.actor(*slot) else {
+                return keys;
+            };
+            if actor.persisting() {
                 situation(&mut keys, Situation::RanWhilePersisting);
             }
-            let unsafe_ran = after
-                .flights
-                .values()
-                .filter(|flight| flight.executed && class(&flight.job) == Some(Class::Unsafe))
-                .count();
+            let unsafe_ran = after.actor(*slot).map_or(0, |actor| {
+                actor
+                    .flights
+                    .values()
+                    .filter(|flight| flight.executed && class(&flight.job) == Some(Class::Unsafe))
+                    .count()
+            });
             if unsafe_ran >= 2 {
                 situation(&mut keys, Situation::UnsafeTogether);
             }
         }
         Action::Read => {
-            if before.persisting() {
+            if before.root().persisting() {
                 situation(&mut keys, Situation::ReadWhilePersisting);
             }
         }
         Action::Reconnect => {
             if harness
-                .core(before)
+                .core(before, 0)
                 .is_some_and(|core| core.running().is_some())
             {
                 situation(&mut keys, Situation::ReconnectMidTurn);
             }
         }
-        Action::Deliver(event) => {
+        Action::Deliver(slot, event) => {
+            let Some(actor) = before.actor(*slot) else {
+                return keys;
+            };
             match event {
                 Event::Interrupt { .. } => {
-                    if !before.asks.is_empty() {
+                    if !actor.asks.is_empty() {
                         situation(&mut keys, Situation::InterruptAtPrompt);
                     }
                 }
                 Event::Approve { call, .. } => {
-                    if !before.asks.contains(call) {
+                    if !actor.asks.contains(call) {
                         situation(&mut keys, Situation::StaleAnswer);
                     }
                 }
                 Event::ModelParts { id, .. } => {
-                    if before.flights.get(id).is_some_and(
+                    if actor.flights.get(id).is_some_and(
                         |flight| matches!(flight.job, Job::Model { batches } if batches >= 1),
                     ) {
                         situation(&mut keys, Situation::SecondBatch);
                     }
                 }
+                Event::Deliver { envelope } => {
+                    if matches!(envelope.body, Body::Text(_))
+                        && harness
+                            .core(before, *slot)
+                            .is_some_and(|core| core.running().is_some())
+                        && !actor.log.iter().any(|record| matches!(record, Record::Delivered { envelope: seen } if seen.id == envelope.id))
+                    {
+                        situation(&mut keys, Situation::Steered);
+                    }
+                }
+                Event::Expired { id } => {
+                    if actor.flights.contains_key(id) {
+                        situation(&mut keys, Situation::Expired);
+                    }
+                }
                 Event::Born { .. }
                 | Event::Rules { .. }
-                | Event::Deliver { .. }
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
-                | Event::Woke { .. }
-                | Event::Expired { .. } => {}
+                | Event::Woke { .. } => {}
             }
-            decided(after, &mut keys);
+            decided_at(*slot, &mut keys);
         }
-        Action::OrphanExecute(_) | Action::OrphanComplete(_) | Action::Duplicate | Action::Sync => {
+        Action::Land(slot, id) => {
+            if let Some(Job::Deliver { to: Some(to), .. }) = before
+                .actor(*slot)
+                .and_then(|actor| actor.flights.get(id))
+                .map(|flight| &flight.job)
+            {
+                decided_at(*to, &mut keys);
+            }
         }
+        Action::OrphanExecute(..)
+        | Action::OrphanComplete(..)
+        | Action::Duplicate(_)
+        | Action::Sync(_)
+        | Action::Hang(..) => {}
     }
     keys
 }
@@ -470,6 +563,9 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
             Kind::Born
             | Kind::Rules
             | Kind::Send
+            | Kind::Stop
+            | Kind::Land
+            | Kind::Hang
             | Kind::Answer
             | Kind::Interrupt
             | Kind::Execute
@@ -485,6 +581,7 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
             | Kind::Reconnect,
         )
         | Key::Call { .. }
+        | Key::Task { .. }
         | Key::Crashed { .. }
         | Key::Turn(_)
         | Key::Situation(_) => TEST,

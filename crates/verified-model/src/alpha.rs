@@ -20,7 +20,7 @@
 use verified_core::{Decision, Effect, Event, ModelExit, Outcome};
 use verified_domain::{
     Abstract, ActorId, Body, CallId, CallIx, EffectId, Envelope, Measured, Millis, Payload,
-    Proposal, Record, Request, StepId, Tool, Unit,
+    Proposal, Record, Request, Shape, StepId, Tool, Unit,
 };
 
 /// A payload's size without its body.
@@ -161,7 +161,7 @@ pub fn event<P: Payload>(event: &Event<P>) -> Event<Abstract> {
 }
 
 /// An effect as the model sees it: every field but a call's arguments,
-/// which keep only their tool.
+/// which keep only their tool and their shape without its subject.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Work {
     CallModel {
@@ -176,10 +176,13 @@ pub enum Work {
         id: CallId,
         tool: Tool,
     },
+    /// A run: its call, and the call's shape without its subject (which
+    /// says whether it is a task, and a spawn's child).
     RunTool {
         call: CallIx,
         id: CallId,
         tool: Tool,
+        shape: Shape,
         effect: EffectId,
     },
     CancelTool {
@@ -213,6 +216,7 @@ pub fn work<P: Payload>(effect: &Effect<P>) -> Work {
             call: call.call(),
             id: call.id().clone(),
             tool: call.tool(),
+            shape: P::shape(call.args()).without_subject(),
             effect: call.effect(),
         },
         Effect::CancelTool { id } => Work::CancelTool { id: *id },

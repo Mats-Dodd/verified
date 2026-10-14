@@ -5,24 +5,25 @@
 use stateright::{Checker as _, Expectation, Model as _};
 use verified_core::{Event, ModelExit, Verdict};
 use verified_domain::{
-    Abstract, Body, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId,
-    Proposal, Record, Request, Shape, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
-    Unstarted,
+    Abstract, ActorId, Body, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured,
+    MessageId, Proposal, Record, Request, Shape, StepId, Tool, TurnId, TurnOutcome, Unit,
+    UnixMillis, Unstarted,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::Divergence;
 use verified_model::{
-    Action, Bounded, Bug, Harness, Job, Kind, Mismatch, Observed, World, born, replay, suite,
+    Action, Bounded, Bug, Harness, Job, Kind, Mismatch, Observed, World, born, replay,
+    replay_actors, suite,
 };
 
-/// Checks every `always` property, and that each `reachable` example
-/// occurs (so the `always` checks are not vacuous). Returns the states
-/// explored.
+/// Checks every `always` and `eventually` property, and that each
+/// `reachable` example occurs (so the checks are not vacuous). Returns the
+/// states explored.
 fn check(harness: Harness, reachable: &[&'static str]) -> usize {
     let properties = harness.properties();
     let checker = harness.checker().spawn_bfs().join();
     for property in properties {
-        if property.expectation == Expectation::Always {
+        if property.expectation != Expectation::Sometimes {
             let name = property.name;
             let counterexample = checker.discovery(name).map(stateright::Path::into_actions);
             assert_eq!(counterexample, None, "{name} is violated");
@@ -319,21 +320,275 @@ fn larger_bounds() {
             suite::limits(3),
             Bounded {
                 messages: 2,
-                scripts: vec![
-                    Vec::new(),
-                    vec![Tool::Read],
-                    vec![Tool::Edit, Tool::Bash],
-                    vec![Tool::Bash, Tool::Read],
-                ],
                 batches: 2,
                 stale_answers: 1,
                 max_crashes: 2,
                 max_interrupts: 1,
                 max_duplicates: 1,
                 client: Some(1),
+                ..suite::bounded(
+                    vec![
+                        Vec::new(),
+                        vec![Tool::Read],
+                        vec![Tool::Edit, Tool::Bash],
+                        vec![Tool::Bash, Tool::Read],
+                    ],
+                    2,
+                )
             },
         ),
         &[],
+    );
+}
+
+/// BFS of `harness` with `bug` planted finds a counterexample to each of
+/// `caught`.
+fn caught(harness: Harness, bug: Bug, caught: &[&'static str]) {
+    let checker = Harness {
+        bug: Some(bug),
+        ..harness
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+    for name in caught {
+        assert!(
+            checker.discovery(name).is_some(),
+            "{bug:?} is caught by \"{name}\""
+        );
+    }
+}
+
+/// O2 and A1: sends and spawns across a crash on either side of the
+/// delivery. An acknowledged delivery is in its recipient's log once, no
+/// call takes effect twice, and every envelope follows its durable license.
+#[test]
+fn deliveries_across_crashes() {
+    let states = check(
+        suite::deliveries_across_crashes(),
+        &[
+            "an envelope is acknowledged",
+            "a child is spawned",
+            "a delivery lands again after a crash",
+            "a turn completes",
+        ],
+    );
+    assert!(states > 500, "a real state space: {states}");
+}
+
+/// A1: an outbox that delivers before the `Dispatched` licensing it is
+/// durable; a crash then loses the license, and the envelope stays.
+#[test]
+fn delivering_before_the_license_is_durable_is_caught() {
+    caught(
+        suite::deliveries_across_crashes(),
+        Bug::DeliverBeforeDurable,
+        &["every delivery follows its durable license"],
+    );
+}
+
+/// O2: a rerun sent under a fresh key after a crash is a second envelope
+/// its recipient cannot tell from a new one.
+#[test]
+fn minting_a_fresh_key_on_resume_is_caught() {
+    caught(
+        suite::deliveries_across_crashes(),
+        Bug::FreshKeyOnResume,
+        &["no call is delivered twice"],
+    );
+}
+
+/// O2 and L3: the sender is told its envelope landed before the append is
+/// durable; a crash loses it.
+#[test]
+fn acknowledging_before_the_append_is_durable_is_caught() {
+    caught(
+        suite::deliveries_across_crashes(),
+        Bug::AckBeforeDurable,
+        &["an acknowledged delivery is in its recipient's durable log once"],
+    );
+}
+
+/// H1 and H3: tasks across a crash end once each, and every task has ended
+/// at quiescence; their notifications coalesce.
+#[test]
+fn tasks_across_crashes() {
+    let states = check(
+        suite::tasks_across_crashes(),
+        &[
+            "a task ends",
+            "a step carries two notifications",
+            "a turn completes",
+        ],
+    );
+    assert!(states > 1_000, "a real state space: {states}");
+}
+
+/// H1: a resume that ends again a task that already ended.
+#[test]
+fn ending_a_task_twice_after_a_crash_is_caught() {
+    caught(
+        suite::tasks_across_crashes(),
+        Bug::EndTaskTwice,
+        &[
+            "every call and task resolves at most once",
+            "every durable prefix recovers",
+        ],
+    );
+}
+
+/// H1 and H3: a resume that drops a running task's `Unknown` end leaves it
+/// running for good, and its actor is never notified.
+#[test]
+fn leaving_a_task_running_after_a_crash_is_caught() {
+    caught(
+        suite::tasks_across_crashes(),
+        Bug::LeaveTaskRunning,
+        &["at quiescence every task has ended"],
+    );
+}
+
+/// H1: runs report while Esc, a `cancel` and their deadlines race them; a
+/// known outcome is never followed by another.
+#[test]
+fn completions_race_cancels_and_deadlines() {
+    let states = check(
+        suite::completions_race_cancels_and_deadlines(),
+        &[
+            "a turn is cancelled",
+            "a task ends",
+            "a stale completion is refused",
+        ],
+    );
+    assert!(states > 1_000, "a real state space: {states}");
+}
+
+/// L4 and L5: the user's messages steer a turn awaiting approval, with Esc
+/// and a crash anywhere. Every envelope is carried once, at a step
+/// boundary.
+#[test]
+fn steering_cancels_and_crashes() {
+    let states = check(
+        suite::steering_cancels_and_crashes(),
+        &[
+            "a call is denied by a steer",
+            "a turn is cancelled",
+            "a turn completes",
+        ],
+    );
+    assert!(states > 1_000, "a real state space: {states}");
+}
+
+/// L4 and L5: a steered message lands at the next step of its own turn.
+#[test]
+fn steering_across_steps() {
+    let states = check(
+        suite::steering_across_steps(),
+        &[
+            "a call is denied by a steer",
+            "a steered message lands in its turn",
+            "a turn is cancelled",
+            "a turn completes",
+        ],
+    );
+    assert!(states > 1_000, "a real state space: {states}");
+}
+
+/// L4: a step that never carries the mail at the head of the mailbox
+/// leaves it unread at quiescence.
+#[test]
+fn skipping_the_mail_at_a_step_is_caught() {
+    caught(
+        suite::steering_cancels_and_crashes(),
+        Bug::SkipCarry,
+        &["at quiescence every envelope is carried"],
+    );
+}
+
+/// L4: a step that carries again what a step carried before.
+#[test]
+fn carrying_an_envelope_twice_is_caught() {
+    caught(
+        suite::steering_cancels_and_crashes(),
+        Bug::CarryTwice,
+        &["every envelope is carried at most once"],
+    );
+}
+
+/// L5: a message spliced into a step whose calls are still running.
+#[test]
+fn splicing_a_message_into_a_step_is_caught() {
+    caught(
+        suite::steering_cancels_and_crashes(),
+        Bug::SpliceSteering,
+        &["mail is carried only at a step boundary"],
+    );
+}
+
+/// B1: two actors answer each other's every message; neither waits for
+/// the other, and the world settles within its limits.
+#[test]
+fn an_actor_cycle_goes_quiet() {
+    let states = check(
+        suite::an_actor_cycle_goes_quiet(),
+        &["an envelope is acknowledged", "a call fails by a limit"],
+    );
+    assert!(states > 100, "a real state space: {states}");
+}
+
+/// B1: a `send` that waits for its recipient's turn to end is an `ask`:
+/// two actors asking each other never settle.
+#[test]
+fn a_blocking_send_deadlocks_and_is_caught() {
+    caught(
+        suite::an_actor_cycle_goes_quiet(),
+        Bug::BlockingSend,
+        &["the world settles"],
+    );
+}
+
+/// B2: a run that goes silent resolves `Unknown` at its deadline.
+#[test]
+fn hung_runs_resolve_by_their_deadline() {
+    let states = check(
+        suite::hung_runs_resolve_by_their_deadline(),
+        &["a run resolves at its deadline", "a task ends"],
+    );
+    assert!(states > 100, "a real state space: {states}");
+}
+
+/// B2: without a deadline, a silent run is waited on for ever.
+#[test]
+fn waiting_on_a_run_that_never_reports_is_caught() {
+    caught(
+        suite::hung_runs_resolve_by_their_deadline(),
+        Bug::NoDeadline,
+        &["the world settles"],
+    );
+}
+
+/// B3: a chain of spawns stops at the cap on actors, and a stop of the
+/// root reaches its child; the world settles within its limits.
+#[test]
+fn chatter_goes_quiet_within_limits() {
+    let states = check(
+        suite::chatter_goes_quiet_within_limits(),
+        &[
+            "a child is spawned",
+            "a stop reaches a child",
+            "a call fails by a limit",
+        ],
+    );
+    assert!(states > 100, "a real state space: {states}");
+}
+
+/// B3: a registry that ignores its cap on actors.
+#[test]
+fn a_missing_actor_limit_is_caught() {
+    caught(
+        suite::chatter_goes_quiet_within_limits(),
+        Bug::NoActorLimit,
+        &["every actor stays within its limits"],
     );
 }
 
@@ -399,30 +654,39 @@ fn the_world_runs_while_a_decision_is_persisted() {
         path.push(action);
         *world = follow(&harness, &path);
     };
-    take(&mut world, &|action| *action == Action::Sync);
+    take(&mut world, &|action| *action == Action::Sync(0));
     take(&mut world, &|action| action.kind() == Kind::Send);
-    take(&mut world, &|action| *action == Action::Sync);
+    take(&mut world, &|action| *action == Action::Sync(0));
     for _ in 0..2u8 {
         take(&mut world, &|action| action.kind() == Kind::Parts);
-        take(&mut world, &|action| *action == Action::Sync);
+        take(&mut world, &|action| *action == Action::Sync(0));
     }
     take(&mut world, &|action| action.kind() == Kind::Finish);
-    take(&mut world, &|action| *action == Action::Sync);
+    take(&mut world, &|action| *action == Action::Sync(0));
     // The read runs on policy's approval; the bash awaits the user, whose
     // approval is then being persisted.
     take(&mut world, &|action| {
         matches!(
             action,
-            Action::Deliver(Event::Approve {
-                verdict: Verdict::Approve,
-                ..
-            })
+            Action::Deliver(
+                0,
+                Event::Approve {
+                    verdict: Verdict::Approve,
+                    ..
+                }
+            )
         )
     });
     assert!(world.persisting(), "the approval is being persisted");
-    take(&mut world, &|action| matches!(action, Action::Execute(_)));
+    take(&mut world, &|action| {
+        matches!(action, Action::Execute(0, _))
+    });
     assert!(
-        world.runs.values().any(|(tool, _)| *tool == Tool::Read),
+        world
+            .root()
+            .runs
+            .values()
+            .any(|(tool, _)| *tool == Tool::Read),
         "the read ran while the approval was persisted: {path:?}"
     );
 }
@@ -500,33 +764,45 @@ fn a_trace_carries_real_ids_and_sizes() {
     };
     let run = |first: u64, second: u64| {
         let parts = |bytes: u64| {
-            Action::Deliver(Event::ModelParts {
-                id: model,
-                parts: size(bytes),
-            })
+            Action::Deliver(
+                0,
+                Event::ModelParts {
+                    id: model,
+                    parts: size(bytes),
+                },
+            )
         };
         let path = [
-            Action::Sync,
-            Action::Deliver(message.clone()),
-            Action::Sync,
+            Action::Sync(0),
+            Action::Deliver(0, message.clone()),
+            Action::Sync(0),
             parts(first),
-            Action::Sync,
+            Action::Sync(0),
             parts(second),
-            Action::Sync,
-            Action::Deliver(Event::ModelDone {
-                id: model,
-                result: ModelExit::Finished(vec![call.clone()]),
-            }),
-            Action::Sync,
-            Action::Execute(read),
-            Action::Deliver(Event::ToolDone {
-                id: read,
-                exit: Exit::Ok,
-                output: size(4_096),
-            }),
-            Action::Sync,
+            Action::Sync(0),
+            Action::Deliver(
+                0,
+                Event::ModelDone {
+                    id: model,
+                    result: ModelExit::Finished(vec![call.clone()]),
+                },
+            ),
+            Action::Sync(0),
+            Action::Execute(0, read),
+            Action::Deliver(
+                0,
+                Event::ToolDone {
+                    id: read,
+                    exit: Exit::Ok,
+                    output: size(4_096),
+                },
+            ),
+            Action::Sync(0),
         ];
-        follow(&Harness::trace(Limits::v0(), events(&path)), &path).log
+        follow(&Harness::trace(Limits::v0(), events(&path)), &path)
+            .root()
+            .log
+            .clone()
     };
     let ended = |log: &[Record<Abstract>]| {
         log.iter().find_map(|record| {
@@ -560,11 +836,16 @@ fn a_trace_carries_real_ids_and_sizes() {
 fn trace_mode_offers_only_the_traces_values() {
     let at = UnixMillis::new(1_760_000_000_000).expect("a 48-bit time");
     let message = verified_model::message(born().actor, MessageId::from_parts(at, &[7; 10]));
-    let path = [Action::Sync, Action::Deliver(message), Action::Sync];
+    let path = [
+        Action::Sync(0),
+        Action::Deliver(0, message),
+        Action::Sync(0),
+    ];
     let trace = Harness::trace(Limits::v0(), events(&path));
     let world = follow(&trace, &path);
     assert!(
         world
+            .root()
             .flights
             .values()
             .any(|flight| matches!(flight.job, Job::Model { .. })),
@@ -575,7 +856,7 @@ fn trace_mode_offers_only_the_traces_values() {
     assert!(
         !actions.iter().any(|action| matches!(
             action,
-            Action::Deliver(Event::ModelParts { .. } | Event::ModelDone { .. })
+            Action::Deliver(_, Event::ModelParts { .. } | Event::ModelDone { .. })
         )),
         "no completion the trace lacks: {actions:?}"
     );
@@ -597,23 +878,31 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
     let mut world = follow(harness, &[]);
     let mut trace = vec![
         Observed::Booted(Vec::new()),
-        Observed::Resumed(world.pending.clone()),
+        Observed::Resumed(world.root().pending.clone()),
     ];
     for (taken, action) in path.iter().enumerate() {
         let next = follow(harness, path.get(..=taken).expect("a prefix"));
         if let Some(event) = action.event() {
-            trace.push(Observed::Decided(event.clone(), next.pending.clone()));
+            trace.push(Observed::Decided(
+                event.clone(),
+                next.root().pending.clone(),
+            ));
         }
         match action {
-            Action::Sync => trace.push(Observed::Acked {
-                first: u64::try_from(world.log.len()).expect("a short log"),
-                records: next.log.get(world.log.len()..).expect("grown").to_vec(),
+            Action::Sync(_) => trace.push(Observed::Acked {
+                first: u64::try_from(world.root().log.len()).expect("a short log"),
+                records: next
+                    .root()
+                    .log
+                    .get(world.root().log.len()..)
+                    .expect("grown")
+                    .to_vec(),
             }),
             Action::Crash(_) => {
-                trace.push(Observed::Booted(next.log.clone()));
-                trace.push(Observed::Resumed(next.pending.clone()));
+                trace.push(Observed::Booted(next.root().log.clone()));
+                trace.push(Observed::Resumed(next.root().pending.clone()));
             }
-            Action::Execute(id) => trace.push(Observed::Ran {
+            Action::Execute(_, id) => trace.push(Observed::Ran {
                 id: *id,
                 stopped: false,
             }),
@@ -621,15 +910,172 @@ fn observations(harness: &Harness, path: &[Action]) -> Vec<Observed> {
                 u64::try_from(world.client.next).expect("a short log"),
             )),
             // Seen as the event entering the core above, or not at all.
-            Action::Deliver(_)
-            | Action::OrphanExecute(_)
-            | Action::OrphanComplete(_)
-            | Action::Duplicate
+            Action::Deliver(..)
+            | Action::OrphanExecute(..)
+            | Action::OrphanComplete(..)
+            | Action::Duplicate(_)
+            | Action::Land(..)
+            | Action::Hang(..)
             | Action::Reconnect => {}
         }
         world = next;
     }
     trace
+}
+
+/// What a run along `path` would observe of every actor: each step as
+/// that actor's shell, log, tools and the client report it, a delivery's
+/// steps as its recipient's.
+fn observations_of(harness: &Harness, path: &[Action]) -> Vec<(ActorId, Observed)> {
+    let id = |slot: usize| harness.id(slot).expect("an actor at the slot");
+    let mut world = follow(harness, &[]);
+    let mut trace = vec![
+        (id(0), Observed::Booted(Vec::new())),
+        (id(0), Observed::Resumed(world.root().pending.clone())),
+    ];
+    for (taken, action) in path.iter().enumerate() {
+        let next = follow(harness, path.get(..=taken).expect("a prefix"));
+        let pending = |slot: usize| next.actor(slot).expect("an actor").pending.clone();
+        match action {
+            Action::Deliver(slot, event) => {
+                trace.push((id(*slot), Observed::Decided(event.clone(), pending(*slot))));
+            }
+            Action::Land(slot, effect) => {
+                let (to, event) = harness
+                    .landing(&world, *slot, *effect)
+                    .expect("a delivery's next step");
+                match event {
+                    Some(event) => {
+                        trace.push((id(to), Observed::Decided(event, pending(to))));
+                    }
+                    None if !world.actor(to).expect("an actor").created => {
+                        trace.push((id(to), Observed::Booted(Vec::new())));
+                        trace.push((id(to), Observed::Resumed(pending(to))));
+                    }
+                    // The registry answers that the child exists.
+                    None => {}
+                }
+            }
+            Action::Sync(slot) => {
+                let before = world.actor(*slot).expect("an actor").log.len();
+                trace.push((
+                    id(*slot),
+                    Observed::Acked {
+                        first: u64::try_from(before).expect("a short log"),
+                        records: next
+                            .actor(*slot)
+                            .expect("an actor")
+                            .log
+                            .get(before..)
+                            .expect("grown")
+                            .to_vec(),
+                    },
+                ));
+            }
+            Action::Crash(_) => {
+                for (slot, actor) in next.actors.iter().enumerate() {
+                    if actor.created {
+                        trace.push((id(slot), Observed::Booted(actor.log.clone())));
+                        trace.push((id(slot), Observed::Resumed(actor.pending.clone())));
+                    }
+                }
+            }
+            Action::Execute(slot, effect) => trace.push((
+                id(*slot),
+                Observed::Ran {
+                    id: *effect,
+                    stopped: false,
+                },
+            )),
+            Action::Read => trace.push((
+                id(0),
+                Observed::Read(u64::try_from(world.client.next).expect("a short log")),
+            )),
+            Action::OrphanExecute(..)
+            | Action::OrphanComplete(..)
+            | Action::Duplicate(_)
+            | Action::Hang(..)
+            | Action::Reconnect => {}
+        }
+        world = next;
+    }
+    trace
+}
+
+/// `bounded` in trace mode for the actors of `trace`, its deliveries
+/// carrying the values `trace`'s do.
+fn traced(bounded: &Harness, trace: &[(ActorId, Observed)]) -> Harness {
+    Harness::traced(
+        bounded.limits.clone(),
+        trace.iter().filter_map(|(actor, observed)| {
+            Some((bounded.slot_of(*actor)?, observed.event()?.clone()))
+        }),
+    )
+    .with_others(bounded.others.clone())
+    .with_rules(bounded.rules.clone())
+}
+
+/// A path of two actors BFS found (a spawn and a send, a crash on either
+/// side of a delivery), observed actor by actor as a run would observe it,
+/// replays through the logs of both; with the child's delivery moved before
+/// the parent's `Dispatched` is durable, it does not.
+#[test]
+fn a_path_of_two_actors_replays_and_a_delivery_before_its_license_does_not() {
+    let bounded = suite::deliveries_across_crashes();
+    let checker = bounded.clone().checker().spawn_bfs().join();
+    for name in [
+        "a delivery lands again after a crash",
+        "an envelope is acknowledged",
+        "a child is spawned",
+    ] {
+        let path = observable(
+            checker
+                .discovery(name)
+                .expect("BFS reaches it")
+                .into_actions(),
+        );
+        let trace = observations_of(&bounded, &path);
+        let replayed = replay_actors(&traced(&bounded, &trace), &trace)
+            .map_err(|mismatch| format!("{name}: {mismatch}"))
+            .expect("the observed path replays");
+        assert_eq!(
+            replayed.end,
+            follow(&bounded, &path),
+            "the replay ends where the path does: {name}"
+        );
+    }
+    let path = observable(
+        checker
+            .discovery("an envelope is acknowledged")
+            .expect("BFS reaches it")
+            .into_actions(),
+    );
+    let trace = observations_of(&bounded, &path);
+    let child = bounded.id(1).expect("a child");
+    // The child's log is created, then the parent's `Dispatched` of the
+    // spawn: move the creation before it.
+    let created = trace
+        .iter()
+        .position(|(actor, observed)| *actor == child && *observed == Observed::Booted(Vec::new()))
+        .expect("the spawn creates the child");
+    let licensed = trace
+        .iter()
+        .rposition(|(actor, observed)| {
+            *actor != child
+                && matches!(observed, Observed::Acked { records, .. } if records.iter().any(|record| matches!(record, Record::Dispatched { .. })))
+        })
+        .filter(|at| *at < created)
+        .expect("the spawn is dispatched first");
+    let mut early = trace.clone();
+    let moved = early.remove(created);
+    early.insert(licensed, moved);
+    let found = match replay_actors(&traced(&bounded, &early), &early) {
+        Err(Mismatch::Diverged(divergence)) => Some(divergence),
+        Ok(_) | Err(Mismatch::Violated { .. }) => None,
+    }
+    .expect("a delivery before its license diverges");
+    assert_eq!(found.index, licensed, "where it was moved to: {found:?}");
+    assert_eq!(found.actor, child, "the child's log: {found:?}");
 }
 
 /// `bounded` in trace mode, its deliveries carrying the values `trace`'s
@@ -713,7 +1159,7 @@ fn an_observed_path_replays_and_a_tool_run_before_persist_does_not() {
     assert_eq!(divergence.index, acked, "where the run left the model");
     assert_eq!(divergence.observed, moved, "what it did there");
     assert!(
-        divergence.enabled.contains(&Action::Sync),
+        divergence.enabled.contains(&Action::Sync(0)),
         "the model awaits the commit: {divergence:?}"
     );
 }
@@ -807,15 +1253,15 @@ fn coverage_keys_name_what_the_path_did() {
         torn.get(..torn.len().saturating_sub(1)).expect("a prefix"),
     );
     let keep = if let Some(Action::Crash(keep)) = torn.last() {
-        Some(*keep)
+        keep.first().copied()
     } else {
         None
     }
     .expect("a torn group is keyed at its crash");
     assert!(
-        0 < keep && keep < before.pending.len(),
+        0 < keep && keep < before.root().pending.len(),
         "kept {keep} of {}",
-        before.pending.len()
+        before.root().pending.len()
     );
 }
 
@@ -849,9 +1295,9 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
             };
             let executed = path
                 .iter()
-                .position(|action| *action == Action::Execute(*id))?;
+                .position(|action| *action == Action::Execute(0, *id))?;
             let before = follow(&bounded, path.get(..executed)?);
-            if let Job::Tool { tool, .. } = before.flights.get(id)?.job {
+            if let Job::Tool { tool, .. } = before.root().flights.get(id)?.job {
                 Some((at, *id, tool))
             } else {
                 None
@@ -957,7 +1403,7 @@ fn a_stopped_run_did_not_act() {
         .witnesses
         .remove(&key)
         .expect("BFS interrupts a dispatched read");
-    let id = if let Some(Action::Deliver(Event::ToolDone { id, .. })) = path.last() {
+    let id = if let Some(Action::Deliver(_, Event::ToolDone { id, .. })) = path.last() {
         Some(*id)
     } else {
         None
