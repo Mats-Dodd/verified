@@ -437,8 +437,10 @@ fn a_small_log() -> ServerLimits {
 }
 
 /// Seeds whose turns fill [`a_small_log`] while a turn runs, and the
-/// simulated millisecond of a crash added as it fills.
-const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_585))];
+/// simulated millisecond of a crash added as it fills. The millisecond
+/// moves whenever the TUI's traffic does: it is where seed 28 first refuses
+/// an append.
+const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_659))];
 
 /// Storage is the world: a full log fails stop (L3). From the first refused
 /// append until the daemon boots again, nothing is acknowledged and no tool

@@ -5,7 +5,10 @@ use serde_json::Value;
 use verified_domain::Millis;
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId, UnixMillis};
 use verified_wire::chunk::UiChunk;
-use verified_wire::command::{CreateSessionReply, Outcome, Rejection, SendMessageReply, Verdict};
+use verified_wire::command::{
+    ActorList, ActorState, ActorSummary, CreateActorReply, Outcome, Rejection, SendMessageReply,
+    Verdict,
+};
 use verified_wire::stream::{Control, Freshness, Offset};
 use verified_wire::transcript::TranscriptTurn;
 
@@ -31,12 +34,13 @@ macro_rules! fixture {
 }
 
 /// The wire crate's golden streams and the turns the AI SDK folds them into.
-const FIXTURES: [(&str, &str, &str); 7] = [
+const FIXTURES: [(&str, &str, &str); 8] = [
     fixture!("cancelled"),
     fixture!("conversation"),
     fixture!("failed"),
     fixture!("in-progress"),
     fixture!("simple"),
+    fixture!("steering"),
     fixture!("steps"),
     fixture!("tools"),
 ];
@@ -76,7 +80,7 @@ fn message_id(byte: u8) -> MessageId {
 /// The command that sends `text` as the message minted from `stamp(byte)`.
 fn sent(byte: u8, text: &str) -> Cmd {
     Cmd::Send(Command::SendMessage {
-        session: session(),
+        actor: session(),
         body: SendMessage {
             message_id: message_id(byte),
             text: MessageText::parse(text.to_owned(), &Limits::DEFAULT.wire).expect("text"),
@@ -86,9 +90,20 @@ fn sent(byte: u8, text: &str) -> Cmd {
 
 fn opened() -> App {
     let (app, cmd) = App::init(Start::Open(session()), Limits::DEFAULT);
-    assert!(
-        matches!(cmd, Cmd::Follow { .. }),
-        "opening follows the stream"
+    assert_eq!(
+        cmd,
+        Cmd::Batch(vec![
+            Cmd::Follow {
+                follow: FollowId(1),
+                actor: session(),
+                from: Offset::BEGINNING,
+            },
+            Cmd::Batch(vec![
+                Cmd::Send(Command::ListActors),
+                Cmd::Tick(Limits::DEFAULT.refresh)
+            ]),
+        ]),
+        "opening follows the stream, lists the actors and ticks"
     );
     app
 }
@@ -146,30 +161,37 @@ fn a_new_session_is_created_before_it_is_followed() {
     let (mut app, cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     assert_eq!(
         cmd,
-        Cmd::Send(Command::CreateSession(CreateSession {
-            session_id: session()
-        }))
+        Cmd::Batch(vec![
+            Cmd::Send(Command::CreateActor(CreateActor {
+                actor_id: session()
+            })),
+            Cmd::Batch(vec![Cmd::None, Cmd::Tick(Limits::DEFAULT.refresh)]),
+        ]),
+        "nothing is listed before the actor exists"
     );
     type_text(&mut app, "hi");
     assert_eq!(app.update(Msg::Submit(stamp(1))), Cmd::None);
-    assert_eq!(app.draft(), "hi", "the draft waits for the session");
+    assert_eq!(app.draft(), "hi", "the draft waits for the actor");
 
     let cmd = answer(
         &mut app,
-        Answer::SessionCreated {
-            session: session(),
-            result: Ok(CreateSessionReply {
+        Answer::ActorCreated {
+            actor: session(),
+            result: Ok(CreateActorReply {
                 outcome: Outcome::Exists,
             }),
         },
     );
     assert_eq!(
         cmd,
-        Cmd::Follow {
-            follow: FollowId(1),
-            session: session(),
-            from: Offset::BEGINNING,
-        }
+        Cmd::Batch(vec![
+            Cmd::Follow {
+                follow: FollowId(1),
+                actor: session(),
+                from: Offset::BEGINNING,
+            },
+            Cmd::Send(Command::ListActors),
+        ])
     );
 }
 
@@ -178,16 +200,16 @@ fn a_session_that_cannot_be_created_is_retried_with_the_same_id() {
     let (mut app, _cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     let _cmd = answer(
         &mut app,
-        Answer::SessionCreated {
-            session: session(),
+        Answer::ActorCreated {
+            actor: session(),
             result: Err(ClientError::ClosedEarly),
         },
     );
     assert!(app.notice().is_some_and(|notice| notice.contains("^r")));
     assert_eq!(
         app.update(Msg::Reconnect),
-        Cmd::Send(Command::CreateSession(CreateSession {
-            session_id: session()
+        Cmd::Send(Command::CreateActor(CreateActor {
+            actor_id: session()
         }))
     );
 }
@@ -247,15 +269,54 @@ fn sending_mints_the_message_id_from_the_stamp() {
     assert!(app.settled());
 }
 
+/// Typing while a turn runs sends at once: the message steers the turn.
+/// It shows as queued until a step carries it.
 #[test]
-fn one_turn_at_a_time() {
+fn a_message_typed_while_a_turn_runs_is_sent_to_steer_it() {
     let mut app = opened();
     let _cmd = read(&mut app, fixture("in-progress"), 6);
-    assert!(app.transcript().running().is_some());
+    let running = app
+        .transcript()
+        .running()
+        .map(TranscriptTurn::id)
+        .expect("a running turn");
     type_text(&mut app, "second");
-    assert_eq!(app.update(Msg::Submit(stamp(2))), Cmd::None);
-    assert_eq!(app.draft(), "second");
-    assert!(app.notice().is_some_and(|notice| notice.contains("esc")));
+    assert_eq!(app.update(Msg::Submit(stamp(2))), sent(2, "second"));
+    assert_eq!(app.draft(), "");
+    let _cmd = answer(
+        &mut app,
+        Answer::MessageSent {
+            message_id: message_id(2),
+            result: Ok(SendMessageReply {
+                turn_id: running,
+                outcome: Outcome::Created,
+            }),
+        },
+    );
+    assert!(app.settled());
+    let landed = format!(
+        r#"{{"type":"data-envelope","data":{{"envelope":{{"user":"{}"}},"from":"user","text":"second"}}}}"#,
+        message_id(2)
+    );
+    let _cmd = read(
+        &mut app,
+        vec![serde_json::from_str(&landed).expect("a chunk")],
+        7,
+    );
+    assert_eq!(app.transcript().queued().len(), 1);
+    assert!(screen(&mut app, 60, 12).contains("second  queued"));
+    let carried = format!(
+        r#"{{"type":"data-step-carries","id":"{running}","data":{{"envelopes":[{{"user":"{}"}}]}}}}"#,
+        message_id(2)
+    );
+    let _cmd = read(
+        &mut app,
+        vec![serde_json::from_str(&carried).expect("a chunk")],
+        8,
+    );
+    assert!(app.transcript().queued().is_empty(), "carried");
+    let text = screen(&mut app, 60, 12);
+    assert!(text.contains("› second") && !text.contains("queued"));
 }
 
 #[test]
@@ -281,9 +342,8 @@ fn a_rejected_message_goes_back_to_the_draft() {
     let mut app = opened();
     type_text(&mut app, "hello");
     let _cmd = app.update(Msg::Submit(stamp(3)));
-    let rejection = Rejection::SessionBusy {
-        session_id: session(),
-        turn_id: turn_id(1),
+    let rejection = Rejection::MessageExistsWithDifferentText {
+        message_id: message_id(3),
     };
     let _cmd = answer(
         &mut app,
@@ -296,7 +356,7 @@ fn a_rejected_message_goes_back_to_the_draft() {
     assert!(app.settled());
     assert!(
         app.notice()
-            .is_some_and(|notice| notice.contains("running turn"))
+            .is_some_and(|notice| notice.contains("different text"))
     );
 }
 
@@ -390,7 +450,7 @@ fn escape_cancels_the_running_turn_once() {
     assert_eq!(
         app.update(Msg::CancelTurn),
         Cmd::Send(Command::Cancel {
-            session: session(),
+            actor: session(),
             turn: running,
         })
     );
@@ -490,7 +550,7 @@ fn the_approval_prompt_takes_y_and_n() {
     assert_eq!(
         app.update(Msg::Decide(Verdict::Deny)),
         Cmd::Send(Command::Approve {
-            session: session(),
+            actor: session(),
             body: Approve {
                 call_id: call_id.clone(),
                 verdict: Verdict::Deny
@@ -550,7 +610,7 @@ fn a_chunk_that_does_not_fold_breaks_the_stream_until_reloaded() {
         cmd,
         Cmd::Follow {
             follow: FollowId(3),
-            session: session(),
+            actor: session(),
             from: Offset::BEGINNING,
         }
     );
@@ -574,7 +634,7 @@ fn reconnecting_resumes_from_the_last_offset() {
         app.update(Msg::Reconnect),
         Cmd::Follow {
             follow: FollowId(2),
-            session: session(),
+            actor: session(),
             from: Offset::at(11).expect("in range"),
         }
     );
@@ -689,7 +749,7 @@ fn renders_every_golden_stream() {
 }
 
 #[test]
-fn renders_a_new_session_being_created() {
+fn renders_a_new_actor_being_created() {
     let (mut app, _cmd) = App::init(Start::New(session()), Limits::DEFAULT);
     type_text(&mut app, "first line\nsecond line");
     insta::assert_snapshot!(screen(&mut app, 80, 10));
@@ -722,14 +782,14 @@ fn renders_a_dropped_connection_with_a_failed_message() {
 fn capacity_refusals_are_retried_and_the_rest_are_final() {
     use crate::client::Recovery;
     let full = ClientError::Rejected(Rejection::TooManyFollowers {
-        session_id: session(),
+        actor_id: session(),
         limit: 4,
     });
     assert_eq!(full.recovery(), Recovery::Retry);
-    let sessions = ClientError::Rejected(Rejection::TooManySessions { limit: 8 });
-    assert_eq!(sessions.recovery(), Recovery::Retry);
-    let session_full = Rejection::SessionFull {
-        session_id: session(),
+    let actors = ClientError::Rejected(Rejection::TooManyActors { limit: 8 });
+    assert_eq!(actors.recovery(), Recovery::Retry);
+    let session_full = Rejection::ActorFull {
+        actor_id: session(),
         reason: "too many turns".to_owned(),
     };
     assert_eq!(
@@ -752,4 +812,130 @@ fn capacity_refusals_are_retried_and_the_rest_are_final() {
         app.notice()
             .is_some_and(|notice| notice.contains("is full") && notice.contains("new session"))
     );
+}
+
+fn summary(byte: u8, name: &str, parent: Option<ActorId>, state: ActorState) -> ActorSummary {
+    ActorSummary {
+        actor_id: ActorId::from_parts(
+            UnixMillis::new(1_760_000_000_000).expect("in range"),
+            &[byte; 10],
+        ),
+        name: name.to_owned(),
+        parent,
+        depth: u32::from(parent.is_some()),
+        state,
+        approvals: Vec::new(),
+        tasks: 0,
+        unread: 0,
+    }
+}
+
+/// The opened actor, a second root, and a child of the second: the tree
+/// lists the child under its parent.
+fn three_actors() -> Vec<ActorSummary> {
+    let mut main = summary(1, "main", None, ActorState::Idle);
+    main.actor_id = session();
+    let other = summary(2, "other", None, ActorState::Running { turn_id: TurnId(3) });
+    let mut child = summary(3, "helper", Some(other.actor_id), ActorState::Stopped);
+    child.approvals = vec![CallId::parse("toolu_4").expect("a call id")];
+    child.tasks = 2;
+    vec![child, other, main]
+}
+
+/// The tick lists the actors, at most one listing at a time, and ticks on.
+#[test]
+fn the_tick_lists_the_actors_one_listing_at_a_time() {
+    let mut app = opened();
+    assert_eq!(
+        app.update(Msg::Feedback(Feedback::Tick)),
+        Cmd::Batch(vec![Cmd::None, Cmd::Tick(Limits::DEFAULT.refresh)]),
+        "the listing from startup is still on its way"
+    );
+    let _cmd = answer(
+        &mut app,
+        Answer::Actors(Ok(ActorList {
+            actors: three_actors(),
+        })),
+    );
+    assert_eq!(app.actors().len(), 3);
+    assert_eq!(
+        app.update(Msg::Feedback(Feedback::Tick)),
+        Cmd::Batch(vec![
+            Cmd::Send(Command::ListActors),
+            Cmd::Tick(Limits::DEFAULT.refresh)
+        ])
+    );
+    let _cmd = answer(&mut app, Answer::Actors(Err(ClientError::ClosedEarly)));
+    assert_eq!(app.actors().len(), 3, "a failed listing keeps the last");
+    assert_eq!(app.notice(), None, "and says nothing");
+}
+
+/// Tab follows the next actor in tree order, from the start of its stream;
+/// approvals and Esc then go to it.
+#[test]
+fn tab_follows_the_next_actor_in_the_tree() {
+    let mut app = opened();
+    assert_eq!(
+        app.update(Msg::Switch(Direction::Next)),
+        Cmd::None,
+        "no other actor yet"
+    );
+    let _cmd = read(&mut app, fixture("simple"), 11);
+    let _cmd = answer(
+        &mut app,
+        Answer::Actors(Ok(ActorList {
+            actors: three_actors(),
+        })),
+    );
+    let order: Vec<&str> = view::tree(app.actors())
+        .into_iter()
+        .map(|(_, actor)| actor.name.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        ["other", "helper", "main"],
+        "roots by id, children under parents"
+    );
+    assert!(matches!(
+        key(&app, KeyCode::Tab, KeyModifiers::NONE),
+        Some(Msg::Switch(Direction::Next))
+    ));
+    let other = three_actors()
+        .get(1)
+        .map(|actor| actor.actor_id)
+        .expect("other");
+    assert_eq!(
+        app.update(Msg::Switch(Direction::Next)),
+        Cmd::Follow {
+            follow: FollowId(2),
+            actor: other,
+            from: Offset::BEGINNING,
+        }
+    );
+    assert_eq!(app.actor(), other);
+    assert!(app.transcript().turns().is_empty(), "its own stream");
+    let _cmd = app.update(Msg::Switch(Direction::Previous));
+    assert_eq!(app.actor(), session(), "and back");
+}
+
+#[test]
+fn renders_the_actor_tree_and_running_tasks() {
+    let mut app = opened();
+    let chunks = fixture("steering");
+    let started = chunks
+        .iter()
+        .position(|chunk| matches!(chunk, UiChunk::TaskStarted { .. }))
+        .expect("a task starts");
+    let _cmd = read(
+        &mut app,
+        chunks.get(..=started).expect("in range").to_vec(),
+        1,
+    );
+    let _cmd = answer(
+        &mut app,
+        Answer::Actors(Ok(ActorList {
+            actors: three_actors(),
+        })),
+    );
+    insta::assert_snapshot!(screen(&mut app, 90, 16));
 }

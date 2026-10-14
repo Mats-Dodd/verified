@@ -1,0 +1,20 @@
+---
+source: crates/verified-tui/src/app/tests.rs
+expression: "screen(&mut app, 90, 16)"
+---
+  other 02020202  ◆ running
+    helper 03030303  ■ stopped  ?1  2 tasks
+* main 000000f1
+ › edit lib.rs
+
+ ⚙ edit  ready
+   {"new":"b","old":"a","path":"lib.rs"}
+ ⚙ bash  approved
+   {"background":true,"command":"sleep 5"}
+
+
+ ⧗ task 9 bash  sleep 5
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│Say something…                                                                          │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+ verified  main 000000f1 claude-sonnet-4-5 ● live  ◆ replying   ⏎ send · ⇧⏎ newline · tab

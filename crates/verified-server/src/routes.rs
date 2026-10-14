@@ -1,9 +1,14 @@
-//! HTTP routes: commands in, the Durable Stream out.
+//! HTTP routes: commands in, the Durable Stream out. Every actor is
+//! addressed by its id.
 //!
-//! - `POST /sessions`, `/sessions/{id}/messages`, `/approvals`, `/cancel`:
+//! - `POST /actors`, `/actors/{id}/messages`, `/approvals`, `/cancel`:
 //!   commands with client-minted ids; a repeat answers `exists`
-//!   (`TigerBeetle`), a conflicting repeat is a 409 rejection.
-//! - `GET /sessions/{id}/stream?offset=…`: SSE from the offset, then every
+//!   (`TigerBeetle`), a conflicting repeat is a 409 rejection. A message is
+//!   answered once it is durably in the actor's mailbox; to a busy actor it
+//!   steers the running turn.
+//! - `GET /actors`: every born actor, with who waits for the user; `GET
+//!   /actors/{id}/tasks`: the actor's tasks. Both read the actors' logs.
+//! - `GET /actors/{id}/stream?offset=…`: SSE from the offset, then every
 //!   append, each read followed by a `control` event (Durable Streams §5.8);
 //!   closed after `ServerLimits::sse_lifetime` so clients reconnect from the
 //!   last offset. This is the part of Durable Streams the TUI uses; a web
@@ -27,8 +32,8 @@ use axum::routing::{get, post};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use verified_domain::id::ActorId;
 use verified_wire::command::{
-    Approve, Cancel, CreateSession, CreateSessionReply, Outcome as WireOutcome, Rejection,
-    SendMessage, encode_reply,
+    ActorList, Approve, Cancel, CreateActor, CreateActorReply, Outcome as WireOutcome, Rejection,
+    SendMessage, TaskList, encode_reply,
 };
 use verified_wire::sse::KEEP_ALIVE;
 use verified_wire::stream::{
@@ -37,8 +42,9 @@ use verified_wire::stream::{
 
 use crate::daemon::{CreateError, Registry};
 use crate::limits::ServerLimits;
+use crate::projection;
 use crate::seam::{Clock, Tasks};
-use crate::shell::{CommandError, Seams, SessionHandle};
+use crate::shell::{ActorHandle, CommandError, Seams};
 
 /// What every handler shares.
 #[derive(Clone)]
@@ -75,11 +81,12 @@ pub fn router(app: App) -> Router {
     let body_limit = app.limits.wire.max_body_bytes;
     Router::new()
         .route("/version", get(version))
-        .route("/sessions", post(create_session))
-        .route("/sessions/{id}/messages", post(send_message))
-        .route("/sessions/{id}/approvals", post(approve))
-        .route("/sessions/{id}/cancel", post(cancel))
-        .route("/sessions/{id}/stream", get(read_stream))
+        .route("/actors", post(create_actor).get(list_actors))
+        .route("/actors/{id}/messages", post(send_message))
+        .route("/actors/{id}/approvals", post(approve))
+        .route("/actors/{id}/cancel", post(cancel))
+        .route("/actors/{id}/tasks", get(list_tasks))
+        .route("/actors/{id}/stream", get(read_stream))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(app)
 }
@@ -140,33 +147,69 @@ async fn version() -> Response {
     )
 }
 
-async fn create_session(State(app): State<App>, body: Bytes) -> Response {
-    let command = match CreateSession::decode(&body, &app.limits.wire) {
+async fn create_actor(State(app): State<App>, body: Bytes) -> Response {
+    let command = match CreateActor::decode(&body, &app.limits.wire) {
         Ok(command) => command,
         Err(error) => return rejection(&Rejection::from(error)),
     };
-    match app.registry.create(command.session_id).await {
+    match app.registry.create(command.actor_id).await {
         Ok((outcome, _)) => json(
             created(outcome),
-            encode_reply(&CreateSessionReply { outcome }),
+            encode_reply(&CreateActorReply { outcome }),
         ),
-        Err(CreateError::Full { limit }) => rejection(&Rejection::TooManySessions { limit }),
+        Err(CreateError::Full { limit }) => rejection(&Rejection::TooManyActors { limit }),
         Err(error @ (CreateError::Log(_) | CreateError::Unavailable)) => {
             unavailable(&error.to_string())
         }
     }
 }
 
-async fn session(app: &App, id: &str) -> Result<SessionHandle, Box<Response>> {
-    let session_id = ActorId::parse(id).map_err(|error| {
+/// Every born actor, in id order, read from each one's log. One whose
+/// session stopped meanwhile is left out.
+async fn list_actors(State(app): State<App>) -> Response {
+    let mut actors = Vec::new();
+    for listed in app.registry.list().await {
+        let Some(handle) = app.registry.lookup(listed.actor).await else {
+            continue;
+        };
+        let Ok(records) = handle.records().await else {
+            continue;
+        };
+        match projection::summary(handle.session(), &app.limits.core, &records) {
+            Ok(Some(summary)) => actors.push(summary),
+            Ok(None) => {}
+            Err(corrupt) => crate::defect(&format!("a session's own records replay: {corrupt:?}")),
+        }
+    }
+    json(StatusCode::OK, encode_reply(&ActorList { actors }))
+}
+
+async fn list_tasks(State(app): State<App>, Path(id): Path<String>) -> Response {
+    let handle = match session(&app, &id).await {
+        Ok(handle) => handle,
+        Err(response) => return *response,
+    };
+    match handle.records().await {
+        Ok(records) => json(
+            StatusCode::OK,
+            encode_reply(&TaskList {
+                tasks: projection::tasks(&records),
+            }),
+        ),
+        Err(gone) => unavailable(&gone.to_string()),
+    }
+}
+
+async fn session(app: &App, id: &str) -> Result<ActorHandle, Box<Response>> {
+    let actor_id = ActorId::parse(id).map_err(|error| {
         Box::new(rejection(&Rejection::Malformed {
-            reason: format!("session id: {error}"),
+            reason: format!("actor id: {error}"),
         }))
     })?;
     app.registry
-        .lookup(session_id)
+        .lookup(actor_id)
         .await
-        .ok_or_else(|| Box::new(rejection(&Rejection::SessionNotFound { session_id })))
+        .ok_or_else(|| Box::new(rejection(&Rejection::UnknownActor { actor_id })))
 }
 
 async fn send_message(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
@@ -252,16 +295,16 @@ struct Slots {
     _daemon: OwnedSemaphorePermit,
 }
 
-fn live(app: &App, handle: SessionHandle, from: Offset) -> Response {
+fn live(app: &App, handle: ActorHandle, from: Offset) -> Response {
     let Some(session_slot) = handle.follower() else {
         return rejection(&Rejection::TooManyFollowers {
-            session_id: handle.session(),
+            actor_id: handle.session(),
             limit: app.limits.sse_followers_per_session,
         });
     };
     let Ok(daemon_slot) = Arc::clone(&app.followers).try_acquire_owned() else {
         return rejection(&Rejection::TooManyFollowers {
-            session_id: handle.session(),
+            actor_id: handle.session(),
             limit: app.limits.sse_followers,
         });
     };
@@ -296,7 +339,7 @@ fn live(app: &App, handle: SessionHandle, from: Offset) -> Response {
 /// (noticed at the next send: a commit or a keep-alive) or the session
 /// stops.
 async fn follow(
-    handle: SessionHandle,
+    handle: ActorHandle,
     from: Offset,
     sender: mpsc::Sender<Bytes>,
     clock: Arc<dyn Clock>,
@@ -314,7 +357,7 @@ async fn follow(
 /// Each read as a `data` event (when it has chunks) and a `control` event,
 /// then waits for the next commit, with keep-alives while idle.
 async fn feed(
-    handle: &SessionHandle,
+    handle: &ActorHandle,
     from: Offset,
     sender: &mpsc::Sender<Bytes>,
     clock: &dyn Clock,

@@ -1,6 +1,14 @@
 //! Folds UI chunks into a transcript, as the AI SDK does on the client.
 //!
-//! The reply to each user message is built the way the AI SDK builds a
+//! The transcript is an actor's conversation: its turns, each with the
+//! envelopes its steps carried (a user's message, a message from another
+//! actor, a task's notification) and the reply; the envelopes that landed
+//! and wait in the mailbox; and its tasks. An envelope lands
+//! (`data-envelope`, or a task's end, which is its own notification) and
+//! waits until a step carries it (`data-step-carries`): a message sent
+//! while a turn runs steers it, and enters that turn at its next step.
+//!
+//! The reply of each turn is built the way the AI SDK builds a
 //! `UIMessage`: a port of `processUIMessageStream` from `ai@7.0.127`
 //! (`packages/ai/src/ui/process-ui-message-stream.ts`, Copyright Vercel, Inc.,
 //! Apache License 2.0), by way of q's `src/transcript.rs`, cut to the chunks
@@ -20,15 +28,26 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::WireLimits;
-use crate::chunk::{TurnEndReason, UiChunk};
+use crate::chunk::{EffectEnd, TurnEndReason, UiChunk};
 use crate::partial_json::parse_partial_json;
-use verified_domain::id::{ApprovalId, CallId, MessageId, PartId, ToolName, TurnId};
+use verified_domain::id::{ApprovalId, CallId, PartId, TaskId, ToolName, TurnId};
+use verified_domain::{Address, EnvelopeId};
 
 /// Why a chunk cannot be folded into the transcript.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FoldError {
-    #[error("`{chunk}` arrived before any user message")]
+    #[error("`{chunk}` arrived before any turn started")]
     BeforeFirstTurn { chunk: &'static str },
+    #[error("turn {id} started twice, or while turn {running} runs")]
+    TurnStartedTwice { id: TurnId, running: TurnId },
+    #[error("a step of turn {turn} carries envelope {envelope:?}, which is not in the mailbox")]
+    NotQueued { turn: TurnId, envelope: EnvelopeId },
+    #[error("task {task} {what}")]
+    Task { task: TaskId, what: &'static str },
+    #[error("a mailbox, or a turn's inputs, hold at most {limit} envelopes")]
+    TooManyEnvelopes { limit: usize },
+    #[error("a transcript holds at most {limit} tasks")]
+    TooManyTasks { limit: usize },
     #[error("`{chunk}` names turn {found}, but the latest turn is {expected}")]
     TurnMismatch {
         chunk: &'static str,
@@ -61,6 +80,8 @@ struct FoldLimits {
     parts: usize,
     part_bytes: usize,
     errors: usize,
+    envelopes: usize,
+    tasks: usize,
 }
 
 /// Whether a text part is still streaming.
@@ -537,15 +558,18 @@ impl ReplyBuilder {
                 }
             }
             // Steps end and messages finish or abort without changing the
-            // message; errors and session data are the turn's (see
-            // `TranscriptTurn`).
+            // message; errors are the turn's, and actor data the
+            // transcript's (see `TranscriptTurn` and `Transcript`).
             UiChunk::FinishStep
             | UiChunk::Finish { .. }
             | UiChunk::Abort { .. }
             | UiChunk::Error { .. }
-            | UiChunk::UserMessage { .. }
+            | UiChunk::Envelope { .. }
             | UiChunk::TurnStarted { .. }
-            | UiChunk::TurnEnded { .. } => {}
+            | UiChunk::TurnEnded { .. }
+            | UiChunk::StepCarries { .. }
+            | UiChunk::TaskStarted { .. }
+            | UiChunk::TaskEnded { .. } => {}
         }
         Ok(())
     }
@@ -573,13 +597,47 @@ impl ReplyBuilder {
     }
 }
 
-/// One user message and everything the stream says about the reply to it.
+/// An envelope that landed in the mailbox: from whom, and what it says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mail {
+    pub envelope: EnvelopeId,
+    pub from: Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Address>,
+    pub text: String,
+}
+
+/// An envelope a step of a turn carried to the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Input {
+    #[serde(flatten)]
+    pub mail: Mail,
+    /// The step that carried it: the number of `step-start` parts of the
+    /// reply before it. 0 started the turn; a later one steered it.
+    pub step: usize,
+}
+
+/// A task as its stream tells it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskView {
+    pub tool: ToolName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// How it ended and what it said; `None` while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<(EffectEnd, String)>,
+}
+
+/// One turn: what its steps carried and everything the stream says about
+/// the reply.
 #[derive(Debug, Clone)]
 pub struct TranscriptTurn {
     id: TurnId,
-    text: String,
-    message_id: Option<MessageId>,
-    model: Option<String>,
+    inputs: Vec<Input>,
+    model: String,
     errors: Vec<String>,
     end: Option<TurnEndReason>,
     revision: u64,
@@ -587,12 +645,11 @@ pub struct TranscriptTurn {
 }
 
 impl TranscriptTurn {
-    const fn new(id: TurnId, text: String, message_id: Option<MessageId>) -> Self {
+    const fn new(id: TurnId, model: String) -> Self {
         Self {
             id,
-            text,
-            message_id,
-            model: None,
+            inputs: Vec::new(),
+            model,
             errors: Vec::new(),
             end: None,
             revision: 0,
@@ -607,23 +664,17 @@ impl TranscriptTurn {
         self.id
     }
 
-    /// What the user typed.
+    /// What the turn's steps carried, in order: the first step's started
+    /// it, later ones steered it.
     #[must_use]
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
     }
 
-    /// The client-minted id of the message that started the turn, when the
-    /// stream carries it.
+    /// The model the turn runs on.
     #[must_use]
-    pub const fn message_id(&self) -> Option<MessageId> {
-        self.message_id
-    }
-
-    /// The model the turn runs on, once it has started.
-    #[must_use]
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Every error reported during the turn.
@@ -662,11 +713,25 @@ impl TranscriptTurn {
         }
     }
 
+    /// The step a carried envelope enters at: the reply's `step-start`s
+    /// so far.
+    fn steps(&self) -> usize {
+        self.draft
+            .parts
+            .iter()
+            .filter(|part| matches!(part, Part::StepStart))
+            .count()
+    }
+
+    const fn bump(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("a turn sees fewer than u64::MAX chunks");
+    }
+
     fn apply(&mut self, chunk: &UiChunk, limits: FoldLimits) -> Result<(), FoldError> {
-        if let UiChunk::TurnStarted { id, payload } = chunk {
-            self.check_turn(chunk, *id)?;
-            self.model = Some(payload.model.clone());
-        } else if let UiChunk::TurnEnded { id, payload } = chunk {
+        if let UiChunk::TurnEnded { id, payload } = chunk {
             self.check_turn(chunk, *id)?;
             self.end = Some(payload.reason);
         } else if let UiChunk::Error { error_text } = chunk {
@@ -679,10 +744,7 @@ impl TranscriptTurn {
         } else {
             self.draft.apply(chunk, limits)?;
         }
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("a turn sees fewer than u64::MAX chunks");
+        self.bump();
         Ok(())
     }
 }
@@ -692,14 +754,14 @@ impl Serialize for TranscriptTurn {
         #[derive(Serialize)]
         struct View<'turn> {
             id: &'turn TurnId,
-            text: &'turn str,
+            inputs: &'turn [Input],
             reply: Option<Reply<'turn>>,
             errors: &'turn [String],
             end: Option<TurnEndReason>,
         }
         View {
             id: &self.id,
-            text: &self.text,
+            inputs: &self.inputs,
             reply: self.reply(),
             errors: &self.errors,
             end: self.end,
@@ -708,10 +770,14 @@ impl Serialize for TranscriptTurn {
     }
 }
 
-/// The conversation so far: a turn per user message, in order.
+/// An actor's conversation so far: its turns in order, the mail waiting,
+/// and its tasks.
 #[derive(Debug, Clone)]
 pub struct Transcript {
     turns: Vec<TranscriptTurn>,
+    queued: Vec<Mail>,
+    tasks: BTreeMap<TaskId, TaskView>,
+    stopped: bool,
     limits: FoldLimits,
 }
 
@@ -720,11 +786,16 @@ impl Transcript {
     pub fn new(limits: &WireLimits) -> Self {
         Self {
             turns: Vec::with_capacity(limits.max_turns),
+            queued: Vec::new(),
+            tasks: BTreeMap::new(),
+            stopped: false,
             limits: FoldLimits {
                 turns: limits.max_turns,
                 parts: limits.max_parts_per_reply,
                 part_bytes: limits.max_part_bytes,
                 errors: limits.max_errors_per_turn,
+                envelopes: limits.max_envelopes,
+                tasks: limits.max_tasks,
             },
         }
     }
@@ -740,29 +811,192 @@ impl Transcript {
         self.turns.last().filter(|turn| turn.end.is_none())
     }
 
+    /// What landed and no step has carried yet, in arrival order.
+    #[must_use]
+    pub fn queued(&self) -> &[Mail] {
+        &self.queued
+    }
+
+    /// Every task the actor started, by id.
+    #[must_use]
+    pub const fn tasks(&self) -> &BTreeMap<TaskId, TaskView> {
+        &self.tasks
+    }
+
+    /// A stop landed: the actor starts nothing more.
+    #[must_use]
+    pub const fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    fn queue(&mut self, mail: Mail) -> Result<(), FoldError> {
+        if self.queued.len() >= self.limits.envelopes {
+            return Err(FoldError::TooManyEnvelopes {
+                limit: self.limits.envelopes,
+            });
+        }
+        self.queued.push(mail);
+        Ok(())
+    }
+
+    /// Moves `envelopes` from the mailbox into the running turn `id`, at
+    /// its next step. Every check runs before the first change.
+    fn carry(
+        &mut self,
+        chunk: &UiChunk,
+        id: TurnId,
+        envelopes: &[EnvelopeId],
+    ) -> Result<(), FoldError> {
+        let limits = self.limits;
+        let turn = self.turns.last_mut().ok_or(FoldError::BeforeFirstTurn {
+            chunk: chunk.kind(),
+        })?;
+        turn.check_turn(chunk, id)?;
+        if turn.inputs.len().saturating_add(envelopes.len()) > limits.envelopes {
+            return Err(FoldError::TooManyEnvelopes {
+                limit: limits.envelopes,
+            });
+        }
+        let mut positions = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            let position = self
+                .queued
+                .iter()
+                .position(|mail| mail.envelope == *envelope)
+                .filter(|position| !positions.contains(position))
+                .ok_or(FoldError::NotQueued {
+                    turn: id,
+                    envelope: *envelope,
+                })?;
+            positions.push(position);
+        }
+        let step = turn.steps();
+        let mut taken: Vec<Option<Mail>> = self.queued.drain(..).map(Some).collect();
+        for position in positions {
+            if let Some(mail) = taken.get_mut(position).and_then(Option::take) {
+                turn.inputs.push(Input { mail, step });
+            }
+        }
+        self.queued = taken.into_iter().flatten().collect();
+        turn.bump();
+        Ok(())
+    }
+
     /// Folds one chunk in.
     ///
     /// # Errors
     /// A chunk that does not fit the transcript (see [`FoldError`]). The
     /// transcript is unchanged; the stream it came from is broken.
     pub fn apply(&mut self, chunk: &UiChunk) -> Result<(), FoldError> {
-        if let UiChunk::UserMessage { id, payload } = chunk {
-            if self.turns.len() >= self.limits.turns {
-                return Err(FoldError::TooManyTurns {
-                    limit: self.limits.turns,
-                });
+        match chunk {
+            UiChunk::Envelope { payload } => {
+                match &payload.text {
+                    Some(text) => self.queue(Mail {
+                        envelope: payload.envelope,
+                        from: payload.from,
+                        reply_to: payload.reply_to,
+                        text: text.clone(),
+                    })?,
+                    None => self.stopped = true,
+                }
+                Ok(())
             }
-            self.turns.push(TranscriptTurn::new(
-                *id,
-                payload.text.clone(),
-                payload.message_id,
-            ));
-            return Ok(());
+            UiChunk::TurnStarted { id, payload } => {
+                if let Some(running) = self
+                    .turns
+                    .last()
+                    .filter(|turn| turn.end.is_none() || turn.id >= *id)
+                {
+                    return Err(FoldError::TurnStartedTwice {
+                        id: *id,
+                        running: running.id,
+                    });
+                }
+                if self.turns.len() >= self.limits.turns {
+                    return Err(FoldError::TooManyTurns {
+                        limit: self.limits.turns,
+                    });
+                }
+                self.turns
+                    .push(TranscriptTurn::new(*id, payload.model.clone()));
+                Ok(())
+            }
+            UiChunk::StepCarries { id, payload } => self.carry(chunk, *id, &payload.envelopes),
+            UiChunk::TaskStarted { id, payload } => {
+                if self.tasks.contains_key(id) {
+                    return Err(FoldError::Task {
+                        task: *id,
+                        what: "started twice",
+                    });
+                }
+                if self.tasks.len() >= self.limits.tasks {
+                    return Err(FoldError::TooManyTasks {
+                        limit: self.limits.tasks,
+                    });
+                }
+                self.tasks.insert(
+                    *id,
+                    TaskView {
+                        tool: payload.tool.clone(),
+                        subject: payload.subject.clone(),
+                        end: None,
+                    },
+                );
+                Ok(())
+            }
+            UiChunk::TaskEnded { id, payload } => {
+                match self.tasks.get(id) {
+                    None => {
+                        return Err(FoldError::Task {
+                            task: *id,
+                            what: "ended but never started",
+                        });
+                    }
+                    Some(TaskView { end: Some(_), .. }) => {
+                        return Err(FoldError::Task {
+                            task: *id,
+                            what: "ended twice",
+                        });
+                    }
+                    Some(TaskView { end: None, .. }) => {}
+                }
+                // The end is also the notification, from `v`.
+                self.queue(Mail {
+                    envelope: EnvelopeId::Task(*id),
+                    from: Address::Runtime,
+                    reply_to: None,
+                    text: format!("task {id} ended: {}", payload.end),
+                })?;
+                if let Some(task) = self.tasks.get_mut(id) {
+                    task.end = Some((payload.end, payload.text.clone()));
+                }
+                Ok(())
+            }
+            UiChunk::Start { .. }
+            | UiChunk::Finish { .. }
+            | UiChunk::Abort { .. }
+            | UiChunk::Error { .. }
+            | UiChunk::StartStep
+            | UiChunk::FinishStep
+            | UiChunk::ResetStep
+            | UiChunk::TextStart { .. }
+            | UiChunk::TextDelta { .. }
+            | UiChunk::TextEnd { .. }
+            | UiChunk::ToolInputStart { .. }
+            | UiChunk::ToolInputDelta { .. }
+            | UiChunk::ToolInputAvailable { .. }
+            | UiChunk::ToolApprovalRequest { .. }
+            | UiChunk::ToolApprovalResponse { .. }
+            | UiChunk::ToolOutputAvailable { .. }
+            | UiChunk::ToolOutputError { .. }
+            | UiChunk::ToolOutputDenied { .. }
+            | UiChunk::TurnEnded { .. } => {
+                let limits = self.limits;
+                let turn = self.turns.last_mut().ok_or(FoldError::BeforeFirstTurn {
+                    chunk: chunk.kind(),
+                })?;
+                turn.apply(chunk, limits)
+            }
         }
-        let limits = self.limits;
-        let turn = self.turns.last_mut().ok_or(FoldError::BeforeFirstTurn {
-            chunk: chunk.kind(),
-        })?;
-        turn.apply(chunk, limits)
     }
 }

@@ -41,8 +41,8 @@ use verified_domain::Millis;
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    Approve, ApproveReply, Cancel, CancelReply, CreateSession, CreateSessionReply, DecodeError,
-    Rejection, SendMessage, SendMessageReply, decode_reply,
+    ActorList, Approve, ApproveReply, Cancel, CancelReply, CreateActor, CreateActorReply,
+    DecodeError, Rejection, SendMessage, SendMessageReply, decode_reply,
 };
 use verified_wire::sse::{SseDecoder, SseError};
 use verified_wire::stream::{Control, Offset, StreamError, StreamEvent, query};
@@ -106,19 +106,17 @@ impl ClientError {
             Self::Status { status } if *status >= 500 => Recovery::Retry,
             Self::Rejected(rejection) => match rejection {
                 // The daemon is at capacity for now; the same request may
-                // fit once a session or a reader goes away.
-                Rejection::TooManySessions { .. } | Rejection::TooManyFollowers { .. } => {
+                // fit once an actor or a reader goes away.
+                Rejection::TooManyActors { .. } | Rejection::TooManyFollowers { .. } => {
                     Recovery::Retry
                 }
                 Rejection::Malformed { .. }
-                | Rejection::SessionNotFound { .. }
-                | Rejection::SessionExists { .. }
-                | Rejection::SessionBusy { .. }
+                | Rejection::UnknownActor { .. }
                 | Rejection::MessageExistsWithDifferentText { .. }
                 | Rejection::NoPendingApproval { .. }
                 | Rejection::ApprovalExistsWithDifferentVerdict { .. }
                 | Rejection::TurnNotRunning { .. }
-                | Rejection::SessionFull { .. } => Recovery::GiveUp,
+                | Rejection::ActorFull { .. } => Recovery::GiveUp,
             },
             Self::Status { .. }
             | Self::Reply(_)
@@ -134,19 +132,22 @@ impl ClientError {
 /// reused on every retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    CreateSession(CreateSession),
+    CreateActor(CreateActor),
+    /// Lists the daemon's actors. A read: never retried, the next refresh
+    /// asks again.
+    ListActors,
     SendMessage {
-        session: ActorId,
+        actor: ActorId,
         body: SendMessage,
     },
     Approve {
-        session: ActorId,
+        actor: ActorId,
         body: Approve,
     },
     /// Cancels `turn`. Always names the turn: a cancel meant for one turn
     /// must never stop the next.
     Cancel {
-        session: ActorId,
+        actor: ActorId,
         turn: TurnId,
     },
 }
@@ -154,10 +155,11 @@ pub enum Command {
 /// The daemon's answer to a [`Command`], after any retries.
 #[derive(Debug)]
 pub enum Answer {
-    SessionCreated {
-        session: ActorId,
-        result: Result<CreateSessionReply, ClientError>,
+    ActorCreated {
+        actor: ActorId,
+        result: Result<CreateActorReply, ClientError>,
     },
+    Actors(Result<ActorList, ClientError>),
     MessageSent {
         message_id: MessageId,
         result: Result<SendMessageReply, ClientError>,
@@ -235,27 +237,28 @@ impl Client {
     /// Sends `command`, retrying transport failures on the command schedule.
     pub async fn send(&self, command: Command) -> Answer {
         match command {
-            Command::CreateSession(body) => Answer::SessionCreated {
-                session: body.session_id,
-                result: self.post("/sessions".to_owned(), body.encode()).await,
+            Command::CreateActor(body) => Answer::ActorCreated {
+                actor: body.actor_id,
+                result: self.post("/actors".to_owned(), body.encode()).await,
             },
-            Command::SendMessage { session, body } => Answer::MessageSent {
+            Command::ListActors => Answer::Actors(self.get("/actors").await),
+            Command::SendMessage { actor, body } => Answer::MessageSent {
                 message_id: body.message_id,
                 result: self
-                    .post(format!("/sessions/{session}/messages"), body.encode())
+                    .post(format!("/actors/{actor}/messages"), body.encode())
                     .await,
             },
-            Command::Approve { session, body } => Answer::Approved {
+            Command::Approve { actor, body } => Answer::Approved {
                 call_id: body.call_id.clone(),
                 result: self
-                    .post(format!("/sessions/{session}/approvals"), body.encode())
+                    .post(format!("/actors/{actor}/approvals"), body.encode())
                     .await,
             },
-            Command::Cancel { session, turn } => Answer::Cancelled {
+            Command::Cancel { actor, turn } => Answer::Cancelled {
                 turn_id: turn,
                 result: self
                     .post(
-                        format!("/sessions/{session}/cancel"),
+                        format!("/actors/{actor}/cancel"),
                         Cancel { turn_id: turn }.encode(),
                     )
                     .await,
@@ -289,6 +292,14 @@ impl Client {
                 },
             }
         }
+    }
+
+    /// One read, once: a failed read is asked again by whoever wants it.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        let request = self.request(Method::GET, path, Bytes::new());
+        self.exchange(request)
+            .await
+            .and_then(|response| self.reply(response))
     }
 
     fn reply<T: DeserializeOwned>(&self, (status, body): Response) -> Result<T, ClientError> {
@@ -353,12 +364,12 @@ impl Client {
         self.within(self.limits.exchange_timeout, exchange).await
     }
 
-    /// Follows `session`'s stream from `from` until `stop` is cancelled, the
+    /// Follows `actor`'s stream from `from` until `stop` is cancelled, the
     /// daemon refuses it, or the reconnect schedule is spent. Each update is
     /// wrapped by `wrap` and delivered to `inbox`, waiting while it is full.
     pub async fn follow<T, W>(
         &self,
-        session: ActorId,
+        actor: ActorId,
         from: Offset,
         inbox: &mpsc::Sender<T>,
         wrap: W,
@@ -374,7 +385,7 @@ impl Client {
             let read = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                read = self.read_live(session, &mut offset, &mut progress, inbox, &wrap) => read,
+                read = self.read_live(actor, &mut offset, &mut progress, inbox, &wrap) => read,
             };
             if progress == Progress::Made {
                 failures = 0;
@@ -409,7 +420,7 @@ impl Client {
     /// after them arrives, so a drop mid-read redelivers nothing twice.
     async fn read_live<T, W>(
         &self,
-        session: ActorId,
+        actor: ActorId,
         offset: &mut Offset,
         progress: &mut Progress,
         inbox: &mpsc::Sender<T>,
@@ -419,7 +430,7 @@ impl Client {
         T: Send,
         W: Fn(StreamUpdate) -> T + Sync,
     {
-        let path = format!("/sessions/{session}/stream?{}={offset}", query::OFFSET);
+        let path = format!("/actors/{actor}/stream?{}={offset}", query::OFFSET);
         let request = self.request(Method::GET, &path, Bytes::new());
         let opening = async {
             let stream = self.dialer.dial().await.map_err(ClientError::Connect)?;

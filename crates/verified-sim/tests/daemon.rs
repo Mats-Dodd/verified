@@ -28,7 +28,7 @@ use verified_tui::client::{Answer, Client, ClientError, Command, StreamUpdate};
 use verified_tui::seam::TcpDialer;
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
-use verified_wire::command::{CreateSession, MessageText, Rejection, SendMessage};
+use verified_wire::command::{CreateActor, MessageText, SendMessage};
 use verified_wire::stream::Offset;
 
 /// The daemon under `limits` with `model`, its project holding `files` (a
@@ -90,14 +90,14 @@ fn session() -> ActorId {
 }
 
 fn create() -> Command {
-    Command::CreateSession(CreateSession {
-        session_id: session(),
+    Command::CreateActor(CreateActor {
+        actor_id: session(),
     })
 }
 
 fn message(id: u8, text: &str) -> Command {
     Command::SendMessage {
-        session: session(),
+        actor: session(),
         body: SendMessage {
             message_id: MessageId::from_parts(epoch(), &[id; 10]),
             text: MessageText::parse(text.to_owned(), &WireLimits::DEFAULT)
@@ -109,7 +109,8 @@ fn message(id: u8, text: &str) -> Command {
 /// Sends `command`: whether the daemon took it.
 async fn send(client: &Client, command: Command) -> Result<(), ClientError> {
     match client.send(command).await {
-        Answer::SessionCreated { result, .. } => result.map(drop),
+        Answer::ActorCreated { result, .. } => result.map(drop),
+        Answer::Actors(result) => result.map(drop),
         Answer::MessageSent { result, .. } => result.map(drop),
         Answer::Approved { result, .. } => result.map(drop),
         Answer::Cancelled { result, .. } => result.map(drop),
@@ -118,6 +119,42 @@ async fn send(client: &Client, command: Command) -> Result<(), ClientError> {
 
 fn count(chunks: &[UiChunk], kind: impl Fn(&UiChunk) -> bool) -> usize {
     chunks.iter().filter(|chunk| kind(chunk)).count()
+}
+
+/// Follows the actor's stream from the start until `done` holds of what
+/// arrived.
+async fn followed(
+    client: &Client,
+    done: impl Fn(&[UiChunk]) -> bool,
+) -> Result<Vec<UiChunk>, ClientError> {
+    let stop = CancellationToken::new();
+    let (inbox, mut updates) = mpsc::channel(8);
+    let follower = async {
+        client
+            .follow(session(), Offset::BEGINNING, &inbox, |update| update, &stop)
+            .await;
+        drop(inbox);
+    };
+    let collector = async {
+        let mut seen = Vec::new();
+        while let Some(update) = updates.recv().await {
+            match update {
+                StreamUpdate::Read { chunks, .. } => {
+                    seen.extend(chunks);
+                    if done(&seen) {
+                        stop.cancel();
+                    }
+                }
+                StreamUpdate::Connected => {}
+                StreamUpdate::Disconnected { error, .. } | StreamUpdate::Ended { error } => {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(seen)
+    };
+    let ((), seen) = tokio::join!(follower, collector);
+    seen
 }
 
 /// A model whose stream panics: a broken invariant inside a daemon task.
@@ -191,43 +228,22 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
         let client = client();
         send(&client, create()).await?;
         let reads = vec!["read big.txt"; 14].join(" ; ");
-        // The sixth message is accepted only once the fifth turn has ended,
-        // so the first read from the start has over 4 MiB to serve.
+        // A message to a busy actor steers its turn, so the six are all
+        // accepted at once; the work is done once every read's output is
+        // in and no turn runs. Only then is the stream read from the
+        // start, so its first read has over 4 MiB to serve.
         for turn in 1..=6u8 {
-            // Refused while the last turn runs.
-            while let Err(ClientError::Rejected(Rejection::SessionBusy { .. })) =
-                send(&client, message(turn, &reads)).await
-            {
-                tokio::task::yield_now().await;
-            }
+            send(&client, message(turn, &reads)).await?;
         }
-        let stop = CancellationToken::new();
-        let (inbox, mut updates) = mpsc::channel(8);
-        let follower = async {
-            client
-                .follow(session(), Offset::BEGINNING, &inbox, |update| update, &stop)
-                .await;
-            drop(inbox);
+        let quiet = |seen: &[UiChunk]| {
+            count(seen, |chunk| {
+                matches!(chunk, UiChunk::ToolOutputAvailable { .. })
+            }) == 84
+                && count(seen, |chunk| matches!(chunk, UiChunk::TurnStarted { .. }))
+                    == count(seen, |chunk| matches!(chunk, UiChunk::TurnEnded { .. }))
         };
-        let collector = async {
-            let mut seen = Vec::new();
-            while let Some(update) = updates.recv().await {
-                match update {
-                    StreamUpdate::Read { chunks, .. } => {
-                        seen.extend(chunks);
-                        if count(&seen, |chunk| matches!(chunk, UiChunk::TurnEnded { .. })) == 6 {
-                            stop.cancel();
-                        }
-                    }
-                    StreamUpdate::Connected => {}
-                    StreamUpdate::Disconnected { error, .. } | StreamUpdate::Ended { error } => {
-                        return Err(error);
-                    }
-                }
-            }
-            Ok(seen)
-        };
-        let ((), seen) = tokio::join!(follower, collector);
+        followed(&client, quiet).await?;
+        let seen = followed(&client, quiet).await;
         let outputs = count(&seen?, |chunk| {
             matches!(chunk, UiChunk::ToolOutputAvailable { .. })
         });

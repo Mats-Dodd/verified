@@ -1,13 +1,19 @@
 //! Application model and `update`.
 //!
-//! One session's conversation, live, and a box to talk in. The stream is the
-//! truth: what the conversation looks like is the session's stream folded
-//! into a [`Transcript`]; the app itself keeps only UI state (the draft, the
-//! message in flight, scroll, notices). Every id it sends was minted here from
-//! a [`Stamp`] and is reused when the same command is retried.
+//! One actor's conversation, live, and a box to talk in. The stream is the
+//! truth: what the conversation looks like is the followed actor's stream
+//! folded into a [`Transcript`]; the app itself keeps only UI state (the
+//! draft, the message in flight, scroll, notices) and the daemon's actor
+//! list, refreshed on a tick. Every id it sends was minted here from a
+//! [`Stamp`] and is reused when the same command is retried.
 //!
-//! Ported from q's `app.rs`, trimmed to v0: no session picker, one session
-//! per run, plus approvals.
+//! The actor tree on top shows every actor, who is running, who waits for
+//! the user and who is stopped; Tab and Shift-Tab follow another one, and
+//! approvals and Esc go to the actor followed. A message typed while a turn
+//! runs is sent at once: it steers the turn, and shows as queued until a
+//! step carries it.
+//!
+//! Ported from q's `app.rs`, plus approvals and actors.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -18,7 +24,7 @@ use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    Approve, CreateSession, MessageText, Rejection, SendMessage, Verdict,
+    ActorSummary, Approve, CreateActor, MessageText, Rejection, SendMessage, Verdict,
 };
 use verified_wire::stream::{Freshness, Offset};
 use verified_wire::transcript::{Part, ToolPart, ToolState, Transcript};
@@ -28,13 +34,20 @@ use crate::client::{Answer, ClientError, Command, StreamUpdate};
 use crate::tea::{Cmd, Feedback, FollowId, Stamp};
 use crate::view::{self, Activity, Connection, Status};
 
-/// Which session the program shows.
+/// Which actor the program shows first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
-    /// Create this session (minted by the caller from the seams), then follow it.
+    /// Create this root actor (minted by the caller from the seams), then
+    /// follow it.
     New(ActorId),
-    /// Follow this existing session.
+    /// Follow this existing actor.
     Open(ActorId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Next,
+    Previous,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +67,8 @@ pub enum Msg {
     CancelTurn,
     /// Answer the approval prompt.
     Decide(Verdict),
+    /// Follow the next actor in the tree (Tab), or the previous (Shift-Tab).
+    Switch(Direction),
     Scroll(Scroll),
     /// Retry what stopped: creating the session, or following the stream.
     Reconnect,
@@ -61,7 +76,7 @@ pub enum Msg {
     Feedback(Feedback),
 }
 
-/// Whether the daemon has the session yet, and if not, whether creating it
+/// Whether the daemon has the actor yet, and if not, whether creating it
 /// is on its way or waiting for a retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -79,6 +94,7 @@ enum Delivery {
 /// A message the daemon has not acknowledged. Its id is reused on retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
+    actor: ActorId,
     message_id: MessageId,
     text: MessageText,
     delivery: Delivery,
@@ -116,8 +132,13 @@ pub struct Folded {
 #[derive(Debug)]
 pub struct App {
     limits: Limits,
-    session: ActorId,
+    /// The actor followed: its stream is the transcript.
+    actor: ActorId,
     phase: Phase,
+    /// The daemon's actors, as last listed.
+    actors: Vec<ActorSummary>,
+    /// A listing is on its way.
+    listing: bool,
     transcript: Transcript,
     /// Where the next read starts: just past the last folded read.
     offset: Offset,
@@ -145,9 +166,16 @@ impl App {
         &self.transcript
     }
 
+    /// The actor followed.
     #[must_use]
-    pub const fn session(&self) -> ActorId {
-        self.session
+    pub const fn actor(&self) -> ActorId {
+        self.actor
+    }
+
+    /// The daemon's actors, as last listed.
+    #[must_use]
+    pub fn actors(&self) -> &[ActorSummary] {
+        &self.actors
     }
 
     /// Where the next read starts.
@@ -180,7 +208,7 @@ impl App {
         self.pending.is_none() && self.approving.is_none() && self.cancelling.is_none()
     }
 
-    /// The daemon has not acknowledged the session yet.
+    /// The daemon has not acknowledged the actor yet.
     #[must_use]
     pub const fn creating(&self) -> bool {
         matches!(self.phase, Phase::Creating(_))
@@ -217,7 +245,7 @@ impl App {
 
     fn activity(&self) -> Activity {
         if self.creating() {
-            Activity::CreatingSession
+            Activity::CreatingActor
         } else if self
             .pending
             .as_ref()
@@ -233,8 +261,8 @@ impl App {
 
     const fn create(&mut self) -> Cmd {
         self.phase = Phase::Creating(Delivery::Sending);
-        Cmd::Send(Command::CreateSession(CreateSession {
-            session_id: self.session,
+        Cmd::Send(Command::CreateActor(CreateActor {
+            actor_id: self.actor,
         }))
     }
 
@@ -244,9 +272,63 @@ impl App {
         self.connection = Connection::Connecting;
         Cmd::Follow {
             follow: self.follow,
-            session: self.session,
+            actor: self.actor,
             from: self.offset,
         }
+    }
+
+    /// Folds the followed actor's stream again, from the beginning.
+    fn reload(&mut self) -> Cmd {
+        self.transcript = Transcript::new(&self.limits.wire);
+        self.rendered.clear();
+        self.offset = Offset::BEGINNING;
+        self.folded = None;
+        self.scroll = None;
+        self.refollow()
+    }
+
+    /// Follows the next or previous actor in the tree, if there is another.
+    fn switch(&mut self, direction: Direction) -> Cmd {
+        if self.creating() {
+            return Cmd::None;
+        }
+        let order: Vec<ActorId> = view::tree(&self.actors)
+            .into_iter()
+            .map(|(_, actor)| actor.actor_id)
+            .collect();
+        let Some(here) = order.iter().position(|actor| *actor == self.actor) else {
+            return Cmd::None;
+        };
+        let count = order.len();
+        let there = match direction {
+            Direction::Next => here.saturating_add(1).checked_rem(count),
+            Direction::Previous => here
+                .checked_add(count.saturating_sub(1))
+                .and_then(|index| index.checked_rem(count)),
+        };
+        match there.and_then(|index| order.get(index)) {
+            Some(actor) if *actor != self.actor => {
+                self.actor = *actor;
+                self.notice = None;
+                self.reload()
+            }
+            Some(_) | None => Cmd::None,
+        }
+    }
+
+    /// Asks the daemon for its actors, unless a listing is on its way.
+    const fn list(&mut self) -> Cmd {
+        if self.listing || self.creating() {
+            return Cmd::None;
+        }
+        self.listing = true;
+        Cmd::Send(Command::ListActors)
+    }
+
+    /// The tick: list the actors, and tick again.
+    fn tick(&mut self) -> Cmd {
+        let list = self.list();
+        Cmd::Batch(vec![list, Cmd::Tick(self.limits.refresh)])
     }
 
     fn push_text(&mut self, text: &str) {
@@ -260,7 +342,7 @@ impl App {
 
     fn send(&mut self, pending: Pending) -> Cmd {
         let command = Command::SendMessage {
-            session: self.session,
+            actor: pending.actor,
             body: SendMessage {
                 message_id: pending.message_id,
                 text: pending.text.clone(),
@@ -288,11 +370,7 @@ impl App {
             return Cmd::None;
         }
         if self.creating() {
-            self.notice = Some("the session is still being created".to_owned());
-            return Cmd::None;
-        }
-        if self.transcript.running().is_some() {
-            self.notice = Some("a turn is running (esc cancels it)".to_owned());
+            self.notice = Some("the actor is still being created".to_owned());
             return Cmd::None;
         }
         let text = match MessageText::parse(draft.to_owned(), &self.limits.wire) {
@@ -305,6 +383,7 @@ impl App {
         self.draft.clear();
         self.notice = None;
         self.send(Pending {
+            actor: self.actor,
             message_id: MessageId::from_parts(stamp.at, &stamp.entropy),
             text,
             delivery: Delivery::Sending,
@@ -324,7 +403,7 @@ impl App {
         }
         self.cancelling = Some(turn);
         Cmd::Send(Command::Cancel {
-            session: self.session,
+            actor: self.actor,
             turn,
         })
     }
@@ -341,7 +420,7 @@ impl App {
         };
         self.approving = Some(call_id.clone());
         Cmd::Send(Command::Approve {
-            session: self.session,
+            actor: self.actor,
             body: Approve { call_id, verdict },
         })
     }
@@ -358,10 +437,7 @@ impl App {
             }
             (Phase::Ready, Connection::Broken(_)) => {
                 // The fold failed part-way: start over from the beginning.
-                self.transcript = Transcript::new(&self.limits.wire);
-                self.rendered.clear();
-                self.offset = Offset::BEGINNING;
-                self.refollow()
+                self.reload()
             }
             (Phase::Ready, Connection::Idle | Connection::Down(_) | Connection::Retrying(_)) => {
                 self.refollow()
@@ -387,24 +463,34 @@ impl App {
 
     fn answered(&mut self, answer: Answer) -> Cmd {
         match answer {
-            Answer::SessionCreated { session, result } => {
-                if session != self.session || self.phase != Phase::Creating(Delivery::Sending) {
+            Answer::ActorCreated { actor, result } => {
+                if actor != self.actor || self.phase != Phase::Creating(Delivery::Sending) {
                     return Cmd::None;
                 }
                 match result {
                     Ok(_created_or_exists) => {
                         self.phase = Phase::Ready;
-                        self.refollow()
+                        let follow = self.refollow();
+                        Cmd::Batch(vec![follow, self.list()])
                     }
                     Err(error) => {
                         self.phase = Phase::Creating(Delivery::Failed);
                         self.notice = Some(format!(
-                            "cannot create the session: {} (^r retries)",
+                            "cannot create the actor: {} (^r retries)",
                             explain(&error)
                         ));
                         Cmd::None
                     }
                 }
+            }
+            Answer::Actors(result) => {
+                self.listing = false;
+                // A failed listing keeps the last one: the next tick asks
+                // again.
+                if let Ok(list) = result {
+                    self.actors = list.actors;
+                }
+                Cmd::None
             }
             Answer::MessageSent { message_id, result } => {
                 let Some(pending) = self
@@ -544,14 +630,16 @@ impl App {
 
     /// The app on `start`, and its startup effects.
     pub fn init(start: Start, limits: Limits) -> (Self, Cmd) {
-        let (session, phase) = match start {
-            Start::New(session) => (session, Phase::Creating(Delivery::Sending)),
-            Start::Open(session) => (session, Phase::Ready),
+        let (actor, phase) = match start {
+            Start::New(actor) => (actor, Phase::Creating(Delivery::Sending)),
+            Start::Open(actor) => (actor, Phase::Ready),
         };
         let mut app = Self {
             limits,
-            session,
+            actor,
             phase,
+            actors: Vec::new(),
+            listing: false,
             transcript: Transcript::new(&limits.wire),
             offset: Offset::BEGINNING,
             folded: None,
@@ -566,11 +654,12 @@ impl App {
             rendered: Vec::new(),
             viewport: Viewport::default(),
         };
-        let cmd = match phase {
+        let start = match phase {
             Phase::Creating(_) => app.create(),
             Phase::Ready => app.refollow(),
         };
-        (app, cmd)
+        let tick = app.tick();
+        (app, Cmd::Batch(vec![start, tick]))
     }
 
     /// Maps a terminal event to a message; `None` ignores it.
@@ -596,6 +685,8 @@ impl App {
             KeyCode::Esc => Some(Msg::CancelTurn),
             KeyCode::PageUp => Some(Msg::Scroll(Scroll::PageUp)),
             KeyCode::PageDown => Some(Msg::Scroll(Scroll::PageDown)),
+            KeyCode::Tab => Some(Msg::Switch(Direction::Next)),
+            KeyCode::BackTab => Some(Msg::Switch(Direction::Previous)),
             // The approval prompt takes the keyboard while it is shown.
             KeyCode::Char('y' | 'Y') if prompt => Some(Msg::Decide(Verdict::Grant)),
             KeyCode::Char('n' | 'N') if prompt => Some(Msg::Decide(Verdict::Deny)),
@@ -613,8 +704,6 @@ impl App {
             | KeyCode::Down
             | KeyCode::Home
             | KeyCode::End
-            | KeyCode::Tab
-            | KeyCode::BackTab
             | KeyCode::Delete
             | KeyCode::Insert
             | KeyCode::F(_)
@@ -653,6 +742,7 @@ impl App {
             Msg::Submit(stamp) => self.submit(stamp),
             Msg::CancelTurn => self.cancel_turn(),
             Msg::Decide(verdict) => self.decide(verdict),
+            Msg::Switch(direction) => self.switch(direction),
             Msg::Scroll(scroll) => {
                 self.scroll(scroll);
                 Cmd::None
@@ -660,6 +750,7 @@ impl App {
             Msg::Reconnect => self.reconnect(),
             Msg::Quit => Cmd::Quit,
             Msg::Feedback(Feedback::Answered(answer)) => self.answered(answer),
+            Msg::Feedback(Feedback::Tick) => self.tick(),
             Msg::Feedback(Feedback::Stream { follow, update }) => self.streamed(follow, update),
         }
     }
@@ -671,17 +762,36 @@ impl App {
         let input_height = draft_lines
             .clamp(1, self.limits.input_lines.max(1))
             .saturating_add(2);
-        let prompt = self.awaiting_approval().map(view::approval_line);
+        let name = self
+            .actors
+            .iter()
+            .find(|actor| actor.actor_id == self.actor)
+            .map(|actor| actor.name.clone());
+        let prompt = self
+            .awaiting_approval()
+            .map(|tool| view::approval_line(name.as_deref(), tool));
         let prompt_height = u16::from(prompt.is_some());
-        let [main, prompt_area, input, footer] = Layout::vertical([
+        let tree = if self.actors.len() > 1 {
+            view::tree_lines(&self.actors, self.actor, self.limits.tree_lines)
+        } else {
+            Vec::new()
+        };
+        let tasks = view::task_lines(self.transcript.tasks(), self.limits.task_lines);
+        let [tree_area, main, tasks_area, prompt_area, input, footer] = Layout::vertical([
+            Constraint::Length(u16::try_from(tree.len()).unwrap_or(u16::MAX)),
             Constraint::Fill(1),
+            Constraint::Length(u16::try_from(tasks.len()).unwrap_or(u16::MAX)),
             Constraint::Length(prompt_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .areas(frame.area());
+        frame.render_widget(Paragraph::new(tree), tree_area);
+        frame.render_widget(Paragraph::new(tasks), tasks_area);
 
-        let transcript = Paragraph::new(self.transcript_lines())
+        let mut lines = self.transcript_lines();
+        lines.extend(view::queued_lines(self.transcript.queued()));
+        let transcript = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::new().padding(Padding::horizontal(1)));
         self.viewport = Viewport {
@@ -725,18 +835,16 @@ impl App {
             inner.y.saturating_add(row),
         ));
 
-        let session = self.session.to_string();
-        let short = session
-            .get(session.len().saturating_sub(8)..)
-            .unwrap_or(&session);
+        let actor = self.actor.to_string();
+        let short = actor.get(actor.len().saturating_sub(8)..).unwrap_or(&actor);
         let model = self
             .transcript
             .turns()
-            .iter()
-            .rev()
-            .find_map(|turn| turn.model());
+            .last()
+            .map(verified_wire::transcript::TranscriptTurn::model);
         let status = Status {
-            session: short,
+            name: name.as_deref(),
+            actor: short,
             model,
             connection: &self.connection,
             activity: self.activity(),
@@ -750,14 +858,12 @@ impl App {
 /// purpose: each new kind of refusal gets its own thought here.
 fn refusal(rejection: &Rejection) -> String {
     let hint = match rejection {
-        Rejection::SessionBusy { .. } => Some("esc cancels it"),
-        Rejection::SessionNotFound { .. } | Rejection::SessionFull { .. } => {
+        Rejection::UnknownActor { .. } | Rejection::ActorFull { .. } => {
             Some("restart verified for a new session")
         }
-        Rejection::TooManySessions { .. } => Some("close another session's client"),
-        Rejection::TooManyFollowers { .. } => Some("close another client of this session"),
+        Rejection::TooManyActors { .. } => Some("close another session's client"),
+        Rejection::TooManyFollowers { .. } => Some("close another client of this actor"),
         Rejection::Malformed { .. }
-        | Rejection::SessionExists { .. }
         | Rejection::MessageExistsWithDifferentText { .. }
         | Rejection::NoPendingApproval { .. }
         | Rejection::ApprovalExistsWithDifferentVerdict { .. }

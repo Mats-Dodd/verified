@@ -1,7 +1,16 @@
 [
   {
     "id": "1",
-    "text": "fix the typo in lib.rs",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-0000000000a1"
+        },
+        "from": "user",
+        "text": "fix the typo in lib.rs",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "1",
       "role": "assistant",
@@ -64,7 +73,16 @@
   },
   {
     "id": "2",
-    "text": "run the tests",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0c"
+        },
+        "from": "user",
+        "text": "run the tests",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "2",
       "role": "assistant",
@@ -91,7 +109,16 @@
   },
   {
     "id": "3",
-    "text": "search for it",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0d"
+        },
+        "from": "user",
+        "text": "search for it",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "3",
       "role": "assistant",
@@ -149,7 +176,16 @@
   },
   {
     "id": "4",
-    "text": "delete the build dir",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0e"
+        },
+        "from": "user",
+        "text": "delete the build dir",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "4",
       "role": "assistant",

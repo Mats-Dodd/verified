@@ -31,7 +31,7 @@ use verified_server::log::{Log, LogError, LogStore, MemDisk, MemLogStore};
 use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
-use verified_server::shell::{CommandError, Planted, Seams, SessionHandle, ShellConfig};
+use verified_server::shell::{ActorHandle, CommandError, Planted, Seams, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
@@ -265,7 +265,7 @@ fn send(seed: u8, text: &str) -> SendMessage {
     }
 }
 
-async fn all_chunks(handle: &SessionHandle) -> Vec<UiChunk> {
+async fn all_chunks(handle: &ActorHandle) -> Vec<UiChunk> {
     let mut chunks = Vec::new();
     let mut from = Offset::BEGINNING;
     loop {
@@ -280,7 +280,7 @@ async fn all_chunks(handle: &SessionHandle) -> Vec<UiChunk> {
 }
 
 /// Waits until `ready` holds for the stream.
-async fn until<F>(handle: &SessionHandle, ready: F) -> Vec<UiChunk>
+async fn until<F>(handle: &ActorHandle, ready: F) -> Vec<UiChunk>
 where
     F: Fn(&[UiChunk]) -> bool,
 {
@@ -323,7 +323,7 @@ fn approval_requested(chunks: &[UiChunk]) -> Option<CallId> {
 
 /// Folds the stream like the TUI and checks the projection is a pure
 /// function of the log.
-async fn fold(handle: &SessionHandle) -> Transcript {
+async fn fold(handle: &ActorHandle) -> Transcript {
     let chunks = all_chunks(handle).await;
     let mut transcript = Transcript::new(&WireLimits::DEFAULT);
     for chunk in &chunks {
@@ -362,7 +362,7 @@ fn reply_text(transcript: &Transcript, turn: usize) -> String {
         .unwrap_or_default()
 }
 
-async fn records(handle: &SessionHandle) -> Vec<Record<Parsed>> {
+async fn records(handle: &ActorHandle) -> Vec<Record<Parsed>> {
     handle.records().await.expect("the session runs")
 }
 
@@ -1064,7 +1064,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             full,
-            Some(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Some(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "the session fills: {full:?}"
     );
@@ -1074,7 +1074,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             again,
-            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Err(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "fail-stop: every later command is refused: {again:?}"
     );
@@ -1109,7 +1109,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             refused,
-            Some(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Some(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "{refused:?}"
     );
@@ -1219,7 +1219,7 @@ async fn a_restart_on_a_full_log_fails_stop() {
     assert!(
         matches!(
             refused,
-            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Err(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "{refused:?}"
     );
@@ -1231,7 +1231,7 @@ async fn a_restart_on_a_full_log_fails_stop() {
     assert!(
         matches!(
             cancelled,
-            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Err(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "{cancelled:?}"
     );
@@ -1240,12 +1240,11 @@ async fn a_restart_on_a_full_log_fails_stop() {
     second.tasks.shutdown().cancel();
 }
 
-/// The first refusal of a new message within two seconds, other than busy
-/// (the turn a restart carried on may still be running).
-async fn eventually_refused(handle: &SessionHandle) -> Option<CommandError> {
+/// The first refusal of a new message within two seconds.
+async fn eventually_refused(handle: &ActorHandle) -> Option<CommandError> {
     for seed in 100..=120u8 {
         match handle.send_message(send(seed, "more")).await {
-            Err(CommandError::Rejected(Rejection::SessionBusy { .. })) | Ok(_) => {}
+            Ok(_) => {}
             Err(error) => return Some(error),
         }
         SystemClock.sleep(Millis::new(100)).await;
@@ -1409,7 +1408,7 @@ async fn fail_stop(planted: Planted) -> Result<(), String> {
     for answer in [approved.map(drop), more.map(drop)] {
         if !matches!(
             answer,
-            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Err(CommandError::Rejected(Rejection::ActorFull { .. }))
         ) {
             broken.push(format!("answered {answer:?}"));
         }
@@ -1537,7 +1536,7 @@ async fn the_rules_file_grants_and_is_read_before_each_message() {
 }
 
 /// Waits until `ready` holds for the log, and returns it.
-async fn until_log<F>(handle: &SessionHandle, ready: F) -> Vec<Record<Parsed>>
+async fn until_log<F>(handle: &ActorHandle, ready: F) -> Vec<Record<Parsed>>
 where
     F: Fn(&[Record<Parsed>]) -> bool,
 {

@@ -921,7 +921,7 @@ async fn real_daemon_with(
 
 /// The records of `handle`'s log once `ready` holds for them.
 async fn records_until(
-    handle: &verified_server::shell::SessionHandle,
+    handle: &verified_server::shell::ActorHandle,
     ready: impl Fn(&[Record<Parsed>]) -> bool,
 ) -> Vec<Record<Parsed>> {
     within(Duration::from_secs(20), async {

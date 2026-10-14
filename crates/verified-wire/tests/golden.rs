@@ -4,12 +4,16 @@
 //! (`<name>.jsonl`, one chunk per line) and the turns `readUIMessageStream`
 //! from `ai@7.0.127` makes of it (`<name>.turns.json`). The first six are q's
 //! fixtures, copied unchanged but for `steps`, which lost its reasoning part
-//! when the wire vocabulary was cut to what the daemon emits; `tools` covers
-//! tool parts and approvals.
+//! when the wire vocabulary was cut to what the daemon emits, and for the
+//! user's message, which is now an envelope that a step carries; `tools`
+//! covers tool parts and approvals, and `steering` a message that steers a
+//! running turn, a task, its notification and an agent's message.
 //! Regenerate the goldens with `tests/fixtures/golden.ts`.
 
 use proptest::prelude::*;
 use serde_json::Value;
+use verified_domain::id::{MessageId, TaskId, TurnId};
+use verified_domain::{Address, EnvelopeId};
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::sse::SseDecoder;
@@ -26,12 +30,13 @@ macro_rules! fixture {
     };
 }
 
-const FIXTURES: [(&str, &str, &str); 7] = [
+const FIXTURES: [(&str, &str, &str); 8] = [
     fixture!("cancelled"),
     fixture!("conversation"),
     fixture!("failed"),
     fixture!("in-progress"),
     fixture!("simple"),
+    fixture!("steering"),
     fixture!("steps"),
     fixture!("tools"),
 ];
@@ -88,7 +93,7 @@ fn every_fixture_chunk_round_trips() {
 fn the_last_turn_runs_until_it_ends() {
     let transcript = fold(&fixture("in-progress"));
     let running = transcript.running().expect("a running turn");
-    assert_eq!(running.model(), Some("claude-haiku-4-5"));
+    assert_eq!(running.model(), "claude-haiku-4-5");
     assert_eq!(
         fold(&fixture("simple"))
             .running()
@@ -106,13 +111,106 @@ fn the_last_turn_runs_until_it_ends() {
         )),
         "the bash call awaits approval"
     );
+    let message = MessageId::parse("01a10400-0000-7000-8000-0000000000a1").expect("an id");
     assert_eq!(
         tools
             .turns()
             .first()
-            .and_then(verified_wire::transcript::TranscriptTurn::message_id)
-            .map(|id| id.to_string()),
-        Some("01a10400-0000-7000-8000-0000000000a1".to_owned())
+            .and_then(|turn| turn.inputs().first())
+            .map(|input| (input.mail.envelope, input.step)),
+        Some((EnvelopeId::User(message), 0)),
+        "the first step carried the message"
+    );
+}
+
+/// A message sent while a turn runs waits in the mailbox, then enters the
+/// running turn at the step that carries it; a task's end is its
+/// notification, from `v`, and waits like any mail.
+#[test]
+fn a_steering_message_enters_its_turn_at_the_step_that_carries_it() {
+    let chunks = fixture("steering");
+    let steer = MessageId::parse("01a10400-0000-7000-8000-000000000c02").expect("an id");
+    let landed = chunks
+        .iter()
+        .position(|chunk| {
+            matches!(chunk, UiChunk::Envelope { payload } if payload.envelope == EnvelopeId::User(steer))
+        })
+        .expect("the steer lands");
+    let waiting = fold(chunks.get(..=landed).expect("in range"));
+    assert_eq!(
+        waiting
+            .queued()
+            .iter()
+            .map(|mail| mail.envelope)
+            .collect::<Vec<_>>(),
+        [EnvelopeId::User(steer)],
+        "queued until a step carries it"
+    );
+    let transcript = fold(&chunks);
+    let first = transcript.turns().first().expect("the steered turn");
+    assert_eq!(
+        first
+            .inputs()
+            .iter()
+            .map(|input| (input.mail.text.as_str(), input.step))
+            .collect::<Vec<_>>(),
+        [("edit lib.rs", 0), ("read it first", 1)]
+    );
+    let second = transcript
+        .turns()
+        .get(1)
+        .expect("the turn the notification started");
+    assert_eq!(
+        second
+            .inputs()
+            .first()
+            .map(|input| (input.mail.envelope, input.mail.from)),
+        Some((EnvelopeId::Task(TaskId(9)), Address::Runtime))
+    );
+    let task = transcript.tasks().get(&TaskId(9)).expect("the task");
+    assert_eq!(task.subject.as_deref(), Some("sleep 5"));
+    assert!(task.end.is_some(), "it ended");
+    assert_eq!(
+        transcript
+            .queued()
+            .iter()
+            .map(|mail| mail.text.as_str())
+            .collect::<Vec<_>>(),
+        ["queued, never carried"]
+    );
+}
+
+/// Mail is carried once, from the mailbox, into the turn that is running.
+#[test]
+fn a_step_carries_only_queued_mail_into_the_running_turn() {
+    let mut transcript = fold(&fixture("simple"));
+    let before = serde_json::to_value(transcript.turns()).expect("turns serialize");
+    let again = r#"{"type":"data-step-carries","id":"1","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000b09"}]}}"#;
+    assert!(
+        matches!(
+            transcript.apply(&decode(again)),
+            Err(FoldError::NotQueued {
+                turn: TurnId(1),
+                ..
+            })
+        ),
+        "carried already"
+    );
+    let other_turn = r#"{"type":"data-step-carries","id":"7","data":{"envelopes":[]}}"#;
+    assert!(
+        transcript.apply(&decode(other_turn)).is_err(),
+        "not the latest turn"
+    );
+    let twice = r#"{"type":"data-turn-start","id":"1","data":{"model":"m"}}"#;
+    assert!(
+        transcript.apply(&decode(twice)).is_err(),
+        "a turn starts once"
+    );
+    let ended = r#"{"type":"data-task-end","id":"3","data":{"end":"ok","text":""}}"#;
+    assert!(transcript.apply(&decode(ended)).is_err(), "never started");
+    assert_eq!(
+        serde_json::to_value(transcript.turns()).expect("turns serialize"),
+        before
     );
 }
 
@@ -162,14 +260,20 @@ fn bounds_turns_parts_part_text_and_errors() {
         ..WireLimits::DEFAULT
     };
     let mut transcript = Transcript::new(&tight);
-    let user = r#"{"type":"data-user-message","id":"1","data":{"text":"a"}}"#;
-    transcript
-        .apply(&decode(user))
-        .expect("the first turn fits");
+    let start = |id: u64| {
+        decode(&format!(
+            r#"{{"type":"data-turn-start","id":"{id}","data":{{"model":"m"}}}}"#
+        ))
+    };
+    let end = r#"{"type":"data-turn-end","id":"1","data":{"reason":"completed"}}"#;
+    transcript.apply(&start(1)).expect("the first turn fits");
+    transcript.apply(&decode(end)).expect("it ends");
     assert_eq!(
-        transcript.apply(&decode(user)),
+        transcript.apply(&start(2)),
         Err(FoldError::TooManyTurns { limit: 1 })
     );
+    let mut transcript = Transcript::new(&tight);
+    transcript.apply(&start(1)).expect("the first turn fits");
     transcript.apply(&UiChunk::StartStep).expect("one part");
     transcript
         .apply(&decode(r#"{"type":"text-start","id":"t0"}"#))
@@ -190,6 +294,33 @@ fn bounds_turns_parts_part_text_and_errors() {
     assert_eq!(
         transcript.apply(&error),
         Err(FoldError::TooManyErrors { limit: 1 })
+    );
+
+    let tight = WireLimits {
+        max_envelopes: 1,
+        max_tasks: 1,
+        ..WireLimits::DEFAULT
+    };
+    let mut transcript = Transcript::new(&tight);
+    let mail = |n: u32| {
+        decode(&format!(
+            r#"{{"type":"data-envelope","data":{{"envelope":{{"user":"01a10400-0000-7000-8000-00000000000{n}"}},"from":"user","text":"a"}}}}"#
+        ))
+    };
+    transcript.apply(&mail(1)).expect("one envelope waits");
+    assert_eq!(
+        transcript.apply(&mail(2)),
+        Err(FoldError::TooManyEnvelopes { limit: 1 })
+    );
+    let task = |n: u32| {
+        decode(&format!(
+            r#"{{"type":"data-task-start","id":"{n}","data":{{"tool":"wake"}}}}"#
+        ))
+    };
+    transcript.apply(&task(1)).expect("one task");
+    assert_eq!(
+        transcript.apply(&task(2)),
+        Err(FoldError::TooManyTasks { limit: 1 })
     );
 }
 

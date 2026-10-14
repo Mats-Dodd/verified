@@ -1,0 +1,40 @@
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000c01"},"from":"user","text":"edit lib.rs"}}
+{"type":"data-turn-start","id":"2","data":{"model":"claude-sonnet-4-5"}}
+{"type":"start","messageId":"2"}
+{"type":"data-step-carries","id":"2","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000c01"}]}}
+{"type":"start-step"}
+{"type":"tool-input-start","toolCallId":"toolu_1","toolName":"edit"}
+{"type":"tool-input-delta","toolCallId":"toolu_1","inputTextDelta":"{\"path\":\"lib.rs\",\"old\":\"a\",\"new\":\"b\"}"}
+{"type":"tool-input-available","toolCallId":"toolu_1","toolName":"edit","input":{"path":"lib.rs","old":"a","new":"b"}}
+{"type":"tool-input-start","toolCallId":"toolu_2","toolName":"bash"}
+{"type":"tool-input-available","toolCallId":"toolu_2","toolName":"bash","input":{"command":"sleep 5","background":true}}
+{"type":"tool-approval-request","approvalId":"toolu_2","toolCallId":"toolu_2","reason":"allowed by rule 1","isAutomatic":true}
+{"type":"tool-approval-response","approvalId":"toolu_2","approved":true}
+{"type":"data-task-start","id":"9","data":{"tool":"bash","subject":"sleep 5"}}
+{"type":"tool-output-available","toolCallId":"toolu_2","output":{"text":"task 9 started"}}
+{"type":"tool-approval-request","approvalId":"toolu_1","toolCallId":"toolu_1"}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000c02"},"from":"user","text":"read it first"}}
+{"type":"tool-approval-response","approvalId":"toolu_1","approved":false}
+{"type":"tool-output-denied","toolCallId":"toolu_1"}
+{"type":"data-step-carries","id":"2","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000c02"}]}}
+{"type":"finish-step"}
+{"type":"start-step"}
+{"type":"text-start","id":"t1-0"}
+{"type":"text-delta","id":"t1-0","delta":"Reading it first."}
+{"type":"text-end","id":"t1-0"}
+{"type":"data-task-end","id":"9","data":{"end":"ok","text":"slept"}}
+{"type":"finish-step"}
+{"type":"finish","finishReason":"stop"}
+{"type":"data-turn-end","id":"2","data":{"reason":"completed"}}
+{"type":"data-envelope","data":{"envelope":{"minted":{"actor":"01a10400-0000-7000-8000-0000000000d1","seq":14}},"from":"01a10400-0000-7000-8000-0000000000d1","replyTo":"01a10400-0000-7000-8000-0000000000d1","text":"found two typos"}}
+{"type":"data-turn-start","id":"31","data":{"model":"claude-sonnet-4-5"}}
+{"type":"start","messageId":"31"}
+{"type":"data-step-carries","id":"31","data":{"envelopes":[{"task":"9"},{"minted":{"actor":"01a10400-0000-7000-8000-0000000000d1","seq":14}}]}}
+{"type":"start-step"}
+{"type":"text-start","id":"t0-0"}
+{"type":"text-delta","id":"t0-0","delta":"Noted."}
+{"type":"text-end","id":"t0-0"}
+{"type":"finish-step"}
+{"type":"finish","finishReason":"stop"}
+{"type":"data-turn-end","id":"31","data":{"reason":"completed"}}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000c03"},"from":"user","text":"queued, never carried"}}

@@ -17,6 +17,7 @@ use crossterm::event::Event;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
+use verified_domain::Millis;
 use verified_domain::id::{ActorId, IdEntropy, UnixMillis};
 use verified_wire::stream::Offset;
 
@@ -61,12 +62,14 @@ pub enum Cmd {
     None,
     /// Send a command to the daemon; the answer arrives as [`Feedback::Answered`].
     Send(Command),
-    /// Follow a session's stream, replacing any current follower.
+    /// Follow an actor's stream, replacing any current follower.
     Follow {
         follow: FollowId,
-        session: ActorId,
+        actor: ActorId,
         from: Offset,
     },
+    /// Deliver [`Feedback::Tick`] after this long.
+    Tick(Millis),
     /// Stop the current follower.
     StopFollowing,
     /// Several effects, in order.
@@ -79,6 +82,8 @@ pub enum Cmd {
 #[derive(Debug)]
 pub enum Feedback {
     Answered(Answer),
+    /// The time a [`Cmd::Tick`] asked for has passed.
+    Tick,
     Stream {
         follow: FollowId,
         update: StreamUpdate,
@@ -111,6 +116,7 @@ enum Flow {
 /// The effects side of the loop.
 struct Effects {
     client: Client,
+    clock: Arc<dyn Clock>,
     inbox: mpsc::Sender<Incoming>,
     tasks: JoinSet<()>,
     root: CancellationToken,
@@ -149,7 +155,7 @@ impl Effects {
             }
             Cmd::Follow {
                 follow,
-                session,
+                actor,
                 from,
             } => {
                 if let Some(previous) = self.follower.take() {
@@ -161,7 +167,24 @@ impl Effects {
                 self.spawn(async move {
                     let wrap =
                         move |update| Incoming::Feedback(Feedback::Stream { follow, update });
-                    client.follow(session, from, &inbox, wrap, &stop).await;
+                    client.follow(actor, from, &inbox, wrap, &stop).await;
+                });
+                Flow::Continue
+            }
+            Cmd::Tick(delay) => {
+                let (clock, inbox, stop) = (
+                    Arc::clone(&self.clock),
+                    self.inbox.clone(),
+                    self.root.clone(),
+                );
+                self.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => {}
+                        () = clock.sleep(delay) => {
+                            let _delivered = inbox.send(Incoming::Feedback(Feedback::Tick)).await;
+                        }
+                    }
                 });
                 Flow::Continue
             }
@@ -244,6 +267,7 @@ pub async fn run(
     let (inbox, mut mailbox) = mpsc::channel::<Incoming>(limits.inbox);
     let mut effects = Effects {
         client: Client::new(dialer, Arc::clone(&clock), limits),
+        clock: Arc::clone(&clock),
         inbox,
         tasks: JoinSet::new(),
         root: CancellationToken::new(),
