@@ -238,7 +238,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 halted = false;
                 disk.boot(at, files);
             }
-            Entry::Shell(Observation::Refused) => halted = true,
+            Entry::Shell(Observation::Refused { .. }) => halted = true,
             Entry::Wrote { effect } => disk.wrote(at, *effect, &mut found),
             Entry::Mutation { call, effect, op } => {
                 if let Op::Write { path, text } = op {

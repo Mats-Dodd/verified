@@ -496,6 +496,13 @@ pub enum Barrier {
     },
     /// A group commit's bytes are written but not yet synced.
     GroupWritten { bytes: usize },
+    /// A delivery to another actor (a `send`, a `spawn`, a stop) with this
+    /// id is about to ask its recipient: its `Dispatched` or `StopSent` is
+    /// durable.
+    Delivering(verified_domain::EffectId),
+    /// The recipient answered that delivery (its `Delivered` durable, or a
+    /// refusal); the sender's `ToolDone` has not been sent.
+    Delivered(verified_domain::EffectId),
 }
 
 /// Triggers `point` for a simulation's barriers. Under `sim` it is first
@@ -520,21 +527,25 @@ pub async fn barrier(point: Barrier) {
 #[cfg(feature = "sim")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
-    /// The shell resumed at boot and `resume` decided these records.
+    /// The shell of `actor` resumed at boot and `resume` decided these
+    /// records.
     Resumed {
+        actor: verified_domain::ActorId,
         records: Vec<verified_domain::Record<crate::payload::Parsed>>,
     },
     /// `event` entered `decide`, which decided these records. The shell
     /// handles one input at a time, so this is the event's place in the
     /// core's order.
     Decided {
+        actor: verified_domain::ActorId,
         event: verified_core::Event<crate::payload::Parsed>,
         records: Vec<verified_domain::Record<crate::payload::Parsed>>,
     },
     /// The log refused the decision being persisted (the last one
     /// `Resumed` or `Decided` reported): none of its records were written
-    /// or applied, and none of its effects start.
-    Refused,
+    /// or applied, and none of its effects start. `actor`'s session then
+    /// fails stop.
+    Refused { actor: verified_domain::ActorId },
     /// A barrier was reached.
     Passed(Barrier),
 }

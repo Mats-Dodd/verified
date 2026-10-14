@@ -477,7 +477,7 @@ fn a_full_log_fails_stop_and_replays() {
         let mut filled = false;
         for stamped in &outcome.entries {
             match &stamped.entry {
-                Entry::Shell(Observation::Refused) => {
+                Entry::Shell(Observation::Refused { .. }) => {
                     halted = true;
                     filled = true;
                 }

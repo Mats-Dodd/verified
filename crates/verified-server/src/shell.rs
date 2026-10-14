@@ -582,6 +582,7 @@ impl Session {
         let resumed = self.core.resume(self.born.take(), load);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Resumed {
+            actor: self.id,
             records: resumed.records.clone(),
         });
         self.persist(resumed).await
@@ -636,7 +637,7 @@ impl Session {
                     if self.config.planted == Planted::ActAfterRefusal {
                         self.start_effects(effects);
                     }
-                    return Ok(refused());
+                    return Ok(refused(self.id));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -668,6 +669,7 @@ impl Session {
         let decision = self.core.decide(event);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Decided {
+            actor: self.id,
             event: observed,
             records: decision.records.clone(),
         });
@@ -1165,7 +1167,9 @@ impl Session {
                 let registry = self.registry.clone();
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
+                    barrier(Barrier::Delivering(id)).await;
                     let (exit, said) = outbox::stop(&registry, envelope).await;
+                    barrier(Barrier::Delivered(id)).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
@@ -1234,7 +1238,9 @@ impl Session {
                 let registry = self.registry.clone();
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
+                    barrier(Barrier::Delivering(id)).await;
                     let (exit, said) = outbox::deliver(&registry, work).await;
+                    barrier(Barrier::Delivered(id)).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
@@ -1407,9 +1413,11 @@ fn tasks(records: &[Record<Parsed>]) -> String {
         reason = "under sim it reports the refusal, which no const fn can"
     )
 )]
-fn refused() -> Persisted {
+fn refused(actor: ActorId) -> Persisted {
     #[cfg(feature = "sim")]
-    crate::shim::observe(crate::shim::Observation::Refused);
+    crate::shim::observe(crate::shim::Observation::Refused { actor });
+    #[cfg(not(feature = "sim"))]
+    let _: ActorId = actor;
     Persisted::Refused
 }
 

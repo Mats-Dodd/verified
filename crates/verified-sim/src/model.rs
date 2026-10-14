@@ -41,14 +41,17 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
             }),
             Entry::Mutation { effect, .. } => trace.push(Observed::Mutated(*effect)),
             Entry::Read { from, next, .. } => trace.extend((*from..*next).map(Observed::Read)),
-            Entry::Shell(Observation::Resumed { records: decided }) => {
+            Entry::Shell(Observation::Resumed {
+                records: decided, ..
+            }) => {
                 trace.push(Observed::Resumed(records(decided)));
             }
             Entry::Shell(Observation::Decided {
                 event,
                 records: decided,
+                ..
             }) => trace.push(Observed::Decided(alpha::event(event), records(decided))),
-            Entry::Shell(Observation::Refused) => {
+            Entry::Shell(Observation::Refused { .. }) => {
                 // What was refused is the last decision reported.
                 let last = trace.iter().rposition(|observed| {
                     matches!(observed, Observed::Decided(..) | Observed::Resumed(_))
@@ -69,7 +72,9 @@ pub fn observed(entries: &[Stamped]) -> Vec<Observed> {
                     stopped: *stopped,
                 });
             }
-            Entry::Shell(Observation::Passed(Barrier::GroupWritten { .. }))
+            Entry::Shell(Observation::Passed(
+                Barrier::GroupWritten { .. } | Barrier::Delivering(_) | Barrier::Delivered(_),
+            ))
             | Entry::Boot { .. }
             | Entry::Wrote { .. }
             | Entry::Fault(_)
