@@ -2189,3 +2189,84 @@ async fn acknowledging_before_the_append_loses_the_envelope() {
         .expect_err("the check catches the lost envelope");
     assert!(broken.contains("does not hold"), "{broken}");
 }
+
+/// A crash can tear an actor's first group, its birth with it. At boot an
+/// unborn log is a root's, born again as the user made it, unless a
+/// spawn in some log names it: then it is a child, born when its parent's
+/// `Keyed` spawn runs again, as its parent named it (never as a root).
+#[tokio::test]
+async fn a_birth_a_crash_tore_is_recorded_again_as_it_was_made() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let disk = MemDisk::new();
+    let limits = limits();
+    let parent = session_id();
+    // Every first group of an actor other than the parent never lands.
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let birth = records
+                .iter()
+                .any(|record| matches!(record, Record::Born { .. }));
+            if actor != parent && birth {
+                Act::Stall
+            } else {
+                Act::Append
+            }
+        }),
+    );
+    let first = boot_on(
+        store,
+        Arc::<MemEnv>::clone(&env),
+        limits.clone(),
+        Planted::None,
+    )
+    .await;
+    let (_, handle) = first.registry.create(parent).await.expect("created");
+    let (_, torn_root) = first.registry.create(other_id()).await.expect("created");
+    drop(torn_root);
+    handle
+        .send_message(send(1, "spawn helper bash echo born"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::Dispatched { .. }))
+    })
+    .await;
+    let child = other(&log);
+    first.tasks.shutdown().cancel();
+    drop(handle);
+
+    let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
+    let root = second.registry.lookup(other_id()).await.expect("recovered");
+    let root_log = until_log(&root, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::Born { .. }))
+    })
+    .await;
+    assert!(
+        root_log.iter().any(|record| matches!(
+            record,
+            Record::Born { born } if born.name.as_str() == "main" && born.depth == 0
+        )),
+        "a torn root is born again as a root"
+    );
+    let child_handle = second.registry.lookup(child).await.expect("recovered");
+    let child_log = until_log(&child_handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::Born { .. }))
+    })
+    .await;
+    assert!(
+        child_log.iter().any(|record| matches!(
+            record,
+            Record::Born { born } if born.name.as_str() == "helper"
+                && born.depth == 1
+                && born.parent == Some(parent)
+        )),
+        "a torn child is born as its parent named it: {child_log:?}"
+    );
+    second.tasks.shutdown().cancel();
+}

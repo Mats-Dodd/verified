@@ -13,7 +13,7 @@
 //! ```
 
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use verified_domain::id::ActorId;
-use verified_domain::{ActorName, Born, Record, Tool};
+use verified_domain::{ActorName, Born, Record, Request, Tool};
 use verified_wire::command::Outcome as WireOutcome;
 
 use crate::limits::ServerLimits;
 use crate::log::{FileLogStore, LogError, LogStore};
-use crate::payload::Parsed;
+use crate::payload::{Parsed, ToolArgs};
 use crate::routes;
 use crate::seam::{Lock, LockError, LockGuard};
 use crate::shell::{ActorHandle, Seams, Session, ShellConfig, ShellError};
@@ -202,6 +202,37 @@ impl Registry {
     }
 }
 
+/// The children `records`' spawns name.
+fn spawned(records: &[Record<Parsed>]) -> impl Iterator<Item = ActorId> + '_ {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            Record::StepFinished { calls, .. } => Some(calls),
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => None,
+        })
+        .flatten()
+        .filter_map(|call| match &call.request {
+            Request::Run {
+                args: ToolArgs::Spawn { child, .. },
+            } => Some(*child),
+            Request::Run { .. } | Request::Invalid { .. } => None,
+        })
+}
+
 /// A root actor the user made: named `main`, offered every tool the shell
 /// runs.
 #[must_use]
@@ -370,9 +401,22 @@ pub async fn boot(
         fatal,
         registry: registry.clone(),
     };
+    let mut opened = Vec::new();
     for actor in store.list().await? {
         let (log, records) = store.open(actor).await?;
-        task.spawn_session(actor, log, records, None)?;
+        opened.push((actor, log, records));
+    }
+    // A log a crash left unborn is a root's unless some log's spawn names
+    // it: a child's log is made only after its parent's `StepFinished`,
+    // which names its id, is durable. A root is born again as it was made;
+    // a child is born when its parent's spawn runs again.
+    let children: BTreeSet<ActorId> = opened
+        .iter()
+        .flat_map(|(_, _, records)| spawned(records))
+        .collect();
+    for (actor, log, records) in opened {
+        let born = (!children.contains(&actor)).then(|| root(actor));
+        task.spawn_session(actor, log, records, born)?;
     }
     seams.tasks.spawn(task.run(receiver));
     Ok(registry)
