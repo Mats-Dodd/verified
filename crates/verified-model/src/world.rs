@@ -1,14 +1,46 @@
-//! The model's state: the durable log, the decision being persisted, the
-//! effects in flight and orphaned, facts about the outside, and a client
-//! following the stream.
+//! The model's state: one daemon hosting actors, each with its durable log,
+//! the decision it is persisting, its effects in flight and orphaned, and
+//! facts about the outside; deliveries between their logs; and a client
+//! following the stream of the first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use verified_core::Event;
-use verified_domain::{Abstract, ActorId, CallId, EffectId, Record, Tool};
+use verified_domain::{Abstract, CallId, EffectId, EnvelopeId, Exit, Record, Tool};
 
 /// A record as the model sees it.
 pub type Rec = Record<Abstract>;
+
+/// An actor's place in the world: slot 0 is the first root.
+pub type Slot = usize;
+
+/// How far a `Keyed` delivery has got into its recipient's log.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Landing {
+    /// A spawn's child is not yet created: its log comes first.
+    Create,
+    /// A spawn's child has a log; its birth is next.
+    Born,
+    /// The envelope is next.
+    Queued,
+    /// The recipient decided to append the envelope and is persisting it:
+    /// it is acknowledged once that append is durable.
+    Pending,
+    /// The recipient answered at once (a repeat, a refusal, a limit): the
+    /// delivery reports this.
+    Answered(Exit),
+}
+
+/// What a delivery carries.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Delivery {
+    /// A `send`'s message.
+    Send,
+    /// A `spawn`: the child's log, its birth, then its prompt.
+    Spawn,
+    /// A stop, from `v`.
+    Stop,
+}
 
 /// What an effect in flight is doing.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -22,9 +54,16 @@ pub enum Job {
         tool: Tool,
     },
     Sleep,
-    /// A stop on its way to a child.
-    Stop {
-        child: ActorId,
+    /// A `Keyed` delivery into another actor's log. `to` is the
+    /// recipient, when the world knows it (a trace names it only if the
+    /// envelope ever landed); `call` is the call it carries out (none for
+    /// a stop).
+    Deliver {
+        to: Option<Slot>,
+        what: Delivery,
+        call: Option<CallId>,
+        envelope: EnvelopeId,
+        landing: Landing,
     },
 }
 
@@ -34,6 +73,9 @@ pub struct Flight {
     /// The side effect happened (tools only; others start executed).
     pub executed: bool,
     pub cancelled: bool,
+    /// The world made it silent: it never reports (B2). Only its deadline
+    /// resolves it.
+    pub hung: bool,
 }
 
 /// An effect of the decision being persisted; it starts at `Sync`.
@@ -61,8 +103,12 @@ pub struct Client {
     pub resumed_at: Option<usize>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct World {
+/// One actor: its log and its shell's view of the world.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Default)]
+pub struct Actor {
+    /// Its log exists (a root from boot; a child once its spawn created
+    /// it).
+    pub created: bool,
     pub log: Vec<Rec>,
     pub pending: Vec<Rec>,
     pub staged: Vec<Staged>,
@@ -76,26 +122,15 @@ pub struct World {
     /// Times a run of each call was started (a `RunTool` reached the world),
     /// with its tool.
     pub starts: BTreeMap<CallId, (Tool, u8)>,
-    pub sent: u8,
-    pub crashes: u8,
-    pub interrupts: u8,
-    pub duplicates: u8,
-    /// Answers given to calls not awaiting one.
-    pub stale_answers: u8,
     /// The last completion delivered, for late-duplicate redelivery.
     pub last: Option<Event<Abstract>>,
-    pub client: Client,
-    /// A reply that matched nothing live was refused, as it must be.
-    pub stale_refused: bool,
-    /// A reply that matched nothing live changed something.
-    pub stale_changed: bool,
     /// A full log refused the boot's resume: the shell owes it, and decides
     /// it again once the running turn is interrupted. Only a replay sets
     /// it ([`crate::Observed::Refused`]); BFS never fills the log.
     pub refused: bool,
 }
 
-impl World {
+impl Actor {
     /// The shell is persisting a decision: until `Sync` (or a crash) it
     /// delivers nothing more to the core. The world goes on meanwhile.
     #[must_use]
@@ -110,31 +145,84 @@ impl World {
     }
 }
 
-impl Default for World {
-    fn default() -> Self {
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct World {
+    /// Every actor the world may hold, by slot.
+    pub actors: Vec<Actor>,
+    pub sent: u8,
+    pub steers: u8,
+    pub stops: u8,
+    pub hangs: u8,
+    pub crashes: u8,
+    pub interrupts: u8,
+    pub duplicates: u8,
+    /// Answers given to calls not awaiting one.
+    pub stale_answers: u8,
+    pub client: Client,
+    /// A reply that matched nothing live was refused, as it must be.
+    pub stale_refused: bool,
+    /// A reply that matched nothing live changed something.
+    pub stale_changed: bool,
+    /// The calls each envelope a recipient appended carries out: its
+    /// sender's slot and call, by the recipient's slot and the envelope's
+    /// id. A delivery takes effect when its append is durable (O2).
+    pub carried_out: BTreeMap<(Slot, EnvelopeId), (Slot, CallId)>,
+    /// Deliveries acknowledged to their sender (`ToolDone` `Ok` decided):
+    /// the recipient's slot and the envelope's id. An acknowledgement
+    /// means the append is durable (O2, L3).
+    pub acked: BTreeSet<(Slot, EnvelopeId)>,
+}
+
+impl World {
+    /// A world of `slots` actors, none of them created.
+    #[must_use]
+    pub fn new(slots: usize) -> Self {
         Self {
-            log: Vec::new(),
-            pending: Vec::new(),
-            staged: Vec::new(),
-            flights: BTreeMap::new(),
-            orphans: BTreeMap::new(),
-            asks: BTreeSet::new(),
-            approved: BTreeSet::new(),
-            runs: BTreeMap::new(),
-            starts: BTreeMap::new(),
+            actors: vec![Actor::default(); slots],
             sent: 0,
+            steers: 0,
+            stops: 0,
+            hangs: 0,
             crashes: 0,
             interrupts: 0,
             duplicates: 0,
             stale_answers: 0,
-            last: None,
             client: Client {
                 cursor: Some(0),
                 ..Client::default()
             },
             stale_refused: false,
             stale_changed: false,
-            refused: false,
+            carried_out: BTreeMap::new(),
+            acked: BTreeSet::new(),
         }
+    }
+
+    /// The first root, which the client follows.
+    ///
+    /// # Panics
+    /// Never: a world holds at least one actor.
+    #[must_use]
+    pub fn root(&self) -> &Actor {
+        self.actors.first().expect("a world holds its root")
+    }
+
+    /// The actor at `slot`.
+    #[must_use]
+    pub fn actor(&self, slot: Slot) -> Option<&Actor> {
+        self.actors.get(slot)
+    }
+
+    /// Whether any actor's shell is persisting a decision.
+    #[must_use]
+    pub fn persisting(&self) -> bool {
+        self.actors.iter().any(Actor::persisting)
+    }
+
+    /// Every actor quiescent: nothing pending, owed, in flight (no run, no
+    /// task's run, no delivery) or awaiting the user.
+    #[must_use]
+    pub fn quiescent(&self) -> bool {
+        self.actors.iter().all(Actor::quiescent)
     }
 }
