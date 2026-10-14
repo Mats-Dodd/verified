@@ -9,17 +9,17 @@
 //! mailbox (`data-envelope`), which envelopes each step carried
 //! (`data-step-carries`), and when its tasks started and ended. The same
 //! fold answers who waits for the user and which tasks run
-//! ([`summary`], [`tasks`]).
+//! ([`summary`]).
 
 use std::collections::BTreeMap;
 
 use serde_json::json;
+use verified_core::Core;
 use verified_core::rules::grant;
-use verified_core::{Core, Corrupt};
 use verified_domain::id::{ActorId, ApprovalId, CallId, PartId, TaskId, ToolName, TurnId};
 use verified_domain::{
-    ActorName, Body, Exit, Failure, Grant, Limit, Limits, ModelFault, Payload as _, Record,
-    Request, Rules, Shape, Tool, TurnOutcome, Unstarted,
+    ActorName, Body, Exit, Failure, Grant, Limit, ModelFault, Payload as _, Record, Request, Rules,
+    Shape, Tool, TurnOutcome, Unstarted,
 };
 use verified_wire::chunk::{
     EffectEnd, EnvelopeData, FinishReason, StepCarriesData, TaskEndedData, TaskStartedData,
@@ -373,31 +373,14 @@ impl Projector {
     }
 }
 
-/// The projection of a whole log, kept for what it knows.
-fn projected(records: &[Record<Parsed>]) -> Projector {
-    let mut projector = Projector::new(String::new());
-    for record in records {
-        drop(projector.project(record));
-    }
-    projector
-}
-
-/// Where actor `actor` is, from its log: `None` while it is unborn. Its
-/// state and mailbox are its core's (the replay of the log); who waits for
-/// the user and which tasks run, the projection's.
+/// Where actor `actor` is: `None` while it is unborn.
 ///
-/// # Errors
-/// The log does not replay.
-pub fn summary(
-    actor: ActorId,
-    limits: &Limits,
-    records: &[Record<Parsed>],
-) -> Result<Option<ActorSummary>, Corrupt> {
-    let core: Core<Parsed> = Core::recover(limits.clone(), records)?;
-    let Some(born) = core.born() else {
-        return Ok(None);
-    };
-    let projector = projected(records);
+/// Its state and mailbox are its core's; who waits for the user and which
+/// tasks run, its projection's. Both are the session's live ones, so a
+/// listing costs nothing per record.
+#[must_use]
+pub fn summary(actor: ActorId, core: &Core<Parsed>, projector: &Projector) -> Option<ActorSummary> {
+    let born = core.born()?;
     // A stopped actor's last turn runs until its runs report: it is
     // running until then.
     let state = match (core.stopped(), core.running()) {
@@ -406,7 +389,7 @@ pub fn summary(
         (false, None) => ActorState::Idle,
     };
     let running = projector.tasks().filter(|task| task.end.is_none()).count();
-    Ok(Some(ActorSummary {
+    Some(ActorSummary {
         actor_id: actor,
         name: String::from_utf8_lossy(born.name.bytes()).into_owned(),
         parent: born.parent,
@@ -415,13 +398,7 @@ pub fn summary(
         approvals: projector.waiting().to_vec(),
         tasks: u32::try_from(running).unwrap_or(u32::MAX),
         unread: u32::try_from(core.unread()).unwrap_or(u32::MAX),
-    }))
-}
-
-/// Every task in `records`, in the order they started.
-#[must_use]
-pub fn tasks(records: &[Record<Parsed>]) -> Vec<TaskSummary> {
-    projected(records).tasks().cloned().collect()
+    })
 }
 
 fn end_chunks(id: TurnId, outcome: TurnOutcome, finish: FinishReason, chunks: &mut Vec<UiChunk>) {

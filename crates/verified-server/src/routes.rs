@@ -34,7 +34,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use verified_domain::id::ActorId;
 use verified_wire::command::{
     ActorList, Approve, Cancel, CreateActor, CreateActorReply, Outcome as WireOutcome, Rejection,
-    SendMessage, StopActor, TaskList, encode_reply,
+    SendMessage, StopActor, encode_reply,
 };
 use verified_wire::sse::KEEP_ALIVE;
 use verified_wire::stream::{
@@ -43,7 +43,6 @@ use verified_wire::stream::{
 
 use crate::daemon::{CreateError, Registry};
 use crate::limits::ServerLimits;
-use crate::projection;
 use crate::seam::{Clock, Tasks};
 use crate::shell::{ActorHandle, CommandError, Seams};
 
@@ -87,7 +86,6 @@ pub fn router(app: App) -> Router {
         .route("/actors/{id}/approvals", post(approve))
         .route("/actors/{id}/cancel", post(cancel))
         .route("/actors/{id}/stop", post(stop))
-        .route("/actors/{id}/tasks", get(list_tasks))
         .route("/actors/{id}/stream", get(read_stream))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(app)
@@ -166,7 +164,7 @@ async fn create_actor(State(app): State<App>, body: Bytes) -> Response {
     }
 }
 
-/// Every born actor, in id order, read from each one's log. One whose
+/// Every born actor, in id order, from each one's live session. One whose
 /// session stopped meanwhile is left out.
 async fn list_actors(State(app): State<App>) -> Response {
     let mut actors = Vec::new();
@@ -174,32 +172,11 @@ async fn list_actors(State(app): State<App>) -> Response {
         let Some(handle) = app.registry.lookup(listed.actor).await else {
             continue;
         };
-        let Ok(records) = handle.records().await else {
-            continue;
-        };
-        match projection::summary(handle.session(), &app.limits.core, &records) {
-            Ok(Some(summary)) => actors.push(summary),
-            Ok(None) => {}
-            Err(corrupt) => crate::defect(&format!("a session's own records replay: {corrupt:?}")),
+        if let Ok(Some(summary)) = handle.summary().await {
+            actors.push(summary);
         }
     }
     json(StatusCode::OK, encode_reply(&ActorList { actors }))
-}
-
-async fn list_tasks(State(app): State<App>, Path(id): Path<String>) -> Response {
-    let handle = match session(&app, &id).await {
-        Ok(handle) => handle,
-        Err(response) => return *response,
-    };
-    match handle.records().await {
-        Ok(records) => json(
-            StatusCode::OK,
-            encode_reply(&TaskList {
-                tasks: projection::tasks(&records),
-            }),
-        ),
-        Err(gone) => unavailable(&gone.to_string()),
-    }
 }
 
 async fn session(app: &App, id: &str) -> Result<ActorHandle, Box<Response>> {

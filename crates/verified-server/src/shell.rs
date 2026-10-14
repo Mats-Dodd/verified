@@ -57,8 +57,8 @@ use verified_domain::{
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    Approve, ApproveReply, Cancel, CancelReply, Outcome as WireOutcome, Rejection, SendMessage,
-    SendMessageReply, StopActor, StopReply, Verdict as WireVerdict,
+    ActorSummary, Approve, ApproveReply, Cancel, CancelReply, Outcome as WireOutcome, Rejection,
+    SendMessage, SendMessageReply, StopActor, StopReply, Verdict as WireVerdict,
 };
 use verified_wire::stream::{Freshness, Offset, encode_chunks};
 
@@ -232,6 +232,9 @@ enum Input {
     },
     Records {
         reply: oneshot::Sender<Vec<Record<Parsed>>>,
+    },
+    Summary {
+        reply: oneshot::Sender<Option<ActorSummary>>,
     },
     Done(Event<Parsed>),
 }
@@ -492,6 +495,15 @@ impl ActorHandle {
     /// The session is gone.
     pub async fn records(&self) -> Result<Vec<Record<Parsed>>, Unavailable> {
         self.ask(|reply| Input::Records { reply }).await
+    }
+
+    /// Where this actor is, from its live core and projection: `None`
+    /// while it is unborn.
+    ///
+    /// # Errors
+    /// The session is gone.
+    pub async fn summary(&self) -> Result<Option<ActorSummary>, Unavailable> {
+        self.ask(|reply| Input::Summary { reply }).await
     }
 
     /// The seq the next record will get; changes after every commit.
@@ -979,6 +991,11 @@ impl Session {
             }
             Input::Read { from, reply } => drop(reply.send(self.read(from))),
             Input::Records { reply } => drop(reply.send(self.records.clone())),
+            Input::Summary { reply } => drop(reply.send(crate::projection::summary(
+                self.id,
+                &self.core,
+                &self.projector,
+            ))),
         }
         Ok(())
     }
@@ -1465,7 +1482,7 @@ impl Session {
                 });
             }
             ToolArgs::Tasks => {
-                let listing = tasks(&self.records);
+                let listing = tasks(&self.projector);
                 let (inbox, actor) = (self.inbox.clone(), self.id);
                 self.seams.tasks.spawn(async move {
                     // It reads the log as a `read` reads a file: a run.
@@ -1603,66 +1620,27 @@ impl Session {
     }
 }
 
-/// The `tasks` tool's answer: each task of `records` (a background call, a
-/// timer, a stop), what started it and whether it ended.
-fn tasks(records: &[Record<Parsed>]) -> String {
-    let mut started: Vec<(u64, String)> = Vec::new();
-    let mut ended: BTreeMap<u64, Exit> = BTreeMap::new();
-    for (seq, (record, call)) in (0u64..).zip(named(records)) {
-        match record {
-            Record::Dispatched { .. } => {
-                let Some((_, proposal)) = call else {
-                    continue;
-                };
-                let verified_domain::Request::Run { args } = &proposal.request else {
-                    continue;
-                };
-                let what = match args {
-                    ToolArgs::Bash {
-                        command,
-                        background: true,
-                    } => format!("bash `{}`", command.as_str()),
-                    ToolArgs::Wake { after, .. } => format!("wake after {} ms", after.get()),
-                    ToolArgs::Read { .. }
-                    | ToolArgs::Edit { .. }
-                    | ToolArgs::Bash { .. }
-                    | ToolArgs::Spawn { .. }
-                    | ToolArgs::Send { .. }
-                    | ToolArgs::Tasks
-                    | ToolArgs::Cancel { .. } => continue,
-                };
-                started.push((seq, what));
+/// The `tasks` tool's listing: every task of the actor, from its live
+/// projection.
+fn tasks(projector: &Projector) -> String {
+    let listing: Vec<String> = projector
+        .tasks()
+        .map(|task| {
+            let what = match &task.subject {
+                Some(subject) => format!("{} `{subject}`", task.tool),
+                None => task.tool.to_string(),
+            };
+            match task.end {
+                Some(end) => format!("task {}: {what}: ended {end}", task.task_id),
+                None => format!("task {}: {what}: running", task.task_id),
             }
-            Record::StopSent { child } => started.push((seq, format!("stop {child}"))),
-            Record::TaskEnded { task, exit, .. } => {
-                ended.insert(task.0, *exit);
-            }
-            Record::Born { .. }
-            | Record::RulesLoaded { .. }
-            | Record::Delivered { .. }
-            | Record::TurnStarted { .. }
-            | Record::StepStarted { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::StepFinished { .. }
-            | Record::Approved { .. }
-            | Record::ToolResult { .. }
-            | Record::CancelRequested { .. }
-            | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
-        }
-    }
-    if started.is_empty() {
-        return "No tasks.".to_owned();
-    }
-    started
-        .into_iter()
-        .map(|(seq, what)| match ended.get(&seq) {
-            Some(exit) => format!("task {seq}: {what}: ended {exit:?}"),
-            None => format!("task {seq}: {what}: running"),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if listing.is_empty() {
+        "No tasks.".to_owned()
+    } else {
+        listing.join("\n")
+    }
 }
 
 /// A decision the log refused, as the simulation sees it too.

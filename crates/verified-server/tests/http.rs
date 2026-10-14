@@ -32,7 +32,7 @@ use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
     ActorList, ActorState, CreateActor, CreateActorReply, MessageText, Outcome, Rejection,
-    SendMessage, SendMessageReply, StopActor, StopReply, TaskList, decode_reply,
+    SendMessage, SendMessageReply, StopActor, StopReply, decode_reply,
 };
 use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
@@ -626,31 +626,6 @@ async fn a_message_to_a_busy_actor_steers_its_running_turn() {
     assert_eq!(after.approvals, []);
     assert_eq!(after.unread, 0);
 
-    let (status, body) = call(
-        &client,
-        Method::GET,
-        format!("{base}/actors/{busy}/tasks"),
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "the task list");
-    let listed: TaskList = decode_reply(&body, &wire).expect("a task list");
-    assert!(listed.tasks.is_empty(), "no background call ran");
-    let unknown = session_at(7);
-    let (status, body) = call(
-        &client,
-        Method::GET,
-        format!("{base}/actors/{unknown}/tasks"),
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(
-        rejected(status, &body),
-        (
-            StatusCode::NOT_FOUND,
-            Rejection::UnknownActor { actor_id: unknown }
-        )
-    );
     tasks.shutdown().cancel();
 }
 

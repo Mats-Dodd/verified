@@ -19,7 +19,6 @@
 //! - `POST /actors/{id}/cancel` [`Cancel`] (Esc);
 //! - `POST /actors/{id}/stop` [`StopActor`]: a 200 means the stop is durably
 //!   in the actor's mailbox; the actor and every actor it spawned stop;
-//! - `GET /actors/{id}/tasks` answers [`TaskList`];
 //! - `GET /actors/{id}/stream?offset=…`, the actor's stream.
 
 use core::fmt;
@@ -332,7 +331,7 @@ pub struct ActorList {
     pub actors: Vec<ActorSummary>,
 }
 
-/// One task of an actor, as `GET /actors/{id}/tasks` lists it.
+/// One task of an actor, as its projection holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSummary {
@@ -342,14 +341,6 @@ pub struct TaskSummary {
     pub subject: Option<String>,
     /// How it ended; `None` while it runs.
     pub end: Option<EffectEnd>,
-}
-
-/// Reply to `GET /actors/{id}/tasks`: the actor's tasks in the order they
-/// started, read from its log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TaskList {
-    pub tasks: Vec<TaskSummary>,
 }
 
 /// Decodes a reply body (the TUI's side).
@@ -553,20 +544,6 @@ mod tests {
             r#"{"actors":[{"actorId":"01a10400-0000-7000-8000-000000000001","name":"main","parent":null,"depth":0,"state":{"state":"running","turnId":"4"},"approvals":["toolu_1"],"tasks":1,"unread":2}]}"#
         );
         assert_eq!(decode_reply(&body, &LIMITS).ok(), Some(list));
-        let tasks = TaskList {
-            tasks: vec![TaskSummary {
-                task_id: TaskId(9),
-                tool: ToolName::parse("bash").expect("a name"),
-                subject: Some("sleep 1".to_owned()),
-                end: Some(EffectEnd::Unknown),
-            }],
-        };
-        let body = encode_reply(&tasks);
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            r#"{"tasks":[{"taskId":"9","tool":"bash","subject":"sleep 1","end":"unknown"}]}"#
-        );
-        assert_eq!(decode_reply(&body, &LIMITS).ok(), Some(tasks));
     }
 
     #[test]
