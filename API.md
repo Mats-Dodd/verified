@@ -85,6 +85,7 @@ pub enum Body {
     // Control plane: the kernel acts on it at once.
     Answer  { call: CallId, verdict: Verdict },   // Allow { remember: Scope } | Deny
     Cancel  { target: Target },                   // Turn(TurnId) | Task(TaskId) | Call(CallId) | Actor
+    Use     { model: ModelName },                 // switch this actor's model from its next step on
     Spawn   { spec: AgentSpec },                  // to: V
     Rules   { rules: Rules },                     // to: V; replaces all rules
 }
@@ -101,6 +102,11 @@ pub struct AgentSpec { pub name: Text, pub prompt: Text, pub model: ModelName, p
   principal per connection and the runtime stamps it the same way.
 - **An agent's `send` and `spawn` tools produce these same envelopes.**
   Agents address each other exactly as you address them.
+- **Models are switchable, per actor.** A runtime holds any number of
+  named models. `AgentSpec.model` is where an actor starts, and
+  `Body::Use` switches it at the next beat (step boundary), so a turn can
+  span models. An agent can spawn another on a different model. Each step
+  records the model it used.
 - `Rules` is data: `Rules::allow_all()`, `Rules::from_toml(&str)`, or a
   typed builder. `Verdict::Allow { remember }` records a rule, so a
   remembered approval is just another rule.
@@ -115,7 +121,7 @@ pub enum Event {
     // turns and steps
     TurnStarted     { turn: TurnId, consumed: Vec<Id> },
     Steered         { turn: TurnId, consumed: Vec<Id> },
-    StepStarted     { turn: TurnId, step: Step },
+    StepStarted     { turn: TurnId, step: Step, model: ModelName },
     Text            { turn: TurnId, delta: Text },
     Reasoning       { turn: TurnId, delta: Text },
     Retrying        { turn: TurnId, fault: Fault, after: Millis },
@@ -135,6 +141,7 @@ pub enum Event {
 
     // control
     CancelRequested { id: Id, target: Target },
+    ModelChanged    { id: Id, model: ModelName },
 
     // the runtime
     Recovered,
@@ -339,7 +346,10 @@ pub enum Part {
   arguments against the tool's schema at once. If they don't fit, the call
   is recorded as invalid and resolves `NotStarted(Invalid)`.
 - `Seal::new(token)` holds provider data that must be sent back untouched
-  (reasoning signatures, for example). It is opaque to v.
+  (reasoning signatures, for example). It is opaque to v, and it records
+  which model minted it. Because an actor can switch models mid-history,
+  `Request::history()` hands each model only the seals it minted. Another
+  provider's seals are dropped, and their reasoning text is kept.
 - Faults are typed (`Fault::{Overloaded, Network, Refused, …}`). The
   kernel decides retries.
 
