@@ -51,7 +51,7 @@
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (B2): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between. Which effects have one, and
-//!   how long, is this check's own table ([`due`]), not the shell's.
+//!   how long, is this check's own table (`due`), not the shell's.
 //! - I16 fail-stop (L3): from an actor's refused append until the daemon
 //!   boots again, nothing more of its log is acknowledged and none of its
 //!   runs or deliveries starts.
