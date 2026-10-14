@@ -79,6 +79,9 @@ pub enum Entry {
     /// entering the core, the boot's resume, or a barrier reached. Recorded
     /// on the daemon's task as it happens.
     Shell(Observation),
+    /// The fake Anthropic received a request that is no well-formed
+    /// conversation, and why (I13).
+    Malformed { reason: String },
     /// The TUI was quiescent: caught up, settled, no turn running. Its folded
     /// transcript then, and the offset just past what it had folded.
     Caught {
@@ -248,6 +251,7 @@ impl Ledger {
                     | Entry::GaveUp { .. }
                     | Entry::Read { .. }
                     | Entry::Shell(_)
+                    | Entry::Malformed { .. }
                     | Entry::Caught { .. } => {}
                 }
             }
@@ -294,6 +298,7 @@ pub fn root(entries: &[Stamped]) -> Option<ActorId> {
         | Entry::GaveUp { .. }
         | Entry::Read { .. }
         | Entry::Shell(_)
+        | Entry::Malformed { .. }
         | Entry::Caught { .. } => None,
     })
 }

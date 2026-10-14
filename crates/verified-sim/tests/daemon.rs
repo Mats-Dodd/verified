@@ -23,6 +23,7 @@ use verified_server::shim::{fs, net};
 use verified_sim::clock::SimClock;
 use verified_sim::entropy::SeededEntropy;
 use verified_sim::hosts::{ANTHROPIC, DAEMON, PORT, Software, anthropic, epoch, model};
+use verified_sim::ledger::Ledger;
 use verified_tui::Limits;
 use verified_tui::client::{Answer, Client, ClientError, Command, StreamUpdate};
 use verified_tui::seam::TcpDialer;
@@ -216,7 +217,7 @@ fn a_large_session_is_followed_from_the_start() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(600))
         .build();
-    sim.host(ANTHROPIC, anthropic());
+    sim.host(ANTHROPIC, anthropic(Ledger::new(1_000)));
     sim.host(
         DAEMON,
         daemon_host(

@@ -182,20 +182,27 @@ fn said_in(message: &Value) -> (String, Vec<(String, bool)>) {
 }
 
 /// The script the turn runs: the last user message that says something,
-/// and how many steps of it already ran (the assistant messages since).
-fn script(messages: &[Value]) -> (String, usize) {
+/// how many steps of it already ran (the assistant messages since), and
+/// every tool result since, oldest first.
+fn script(messages: &[Value]) -> (String, usize, Vec<(String, bool)>) {
     let mut steps = 0usize;
+    let mut results: Vec<Vec<(String, bool)>> = Vec::new();
     for message in messages.iter().rev() {
         if message.get("role").and_then(Value::as_str) == Some("assistant") {
             steps = steps.saturating_add(1);
         } else {
-            let (text, _) = said_in(message);
+            let (text, answered) = said_in(message);
             if !text.trim().is_empty() {
-                return (text, steps);
+                return (text, steps, results.into_iter().rev().flatten().collect());
             }
+            results.push(answered);
         }
     }
-    (String::new(), steps)
+    (
+        String::new(),
+        steps,
+        results.into_iter().rev().flatten().collect(),
+    )
 }
 
 /// The sender a header names: `[from ADDR] …` or `[from ADDR; reply to …] …`.
@@ -205,9 +212,9 @@ fn sender(said: &str) -> Option<&str> {
     rest.get(..end)
 }
 
-/// The first number after `task ` in `text`.
+/// The last number after `task ` in `text`.
 fn task_in(text: &str) -> Option<&str> {
-    text.match_indices("task ").find_map(|(at, word)| {
+    text.rmatch_indices("task ").find_map(|(at, word)| {
         let rest = text.get(at.saturating_add(word.len())..)?;
         let digits = rest
             .find(|symbol: char| !symbol.is_ascii_digit())
@@ -216,14 +223,15 @@ fn task_in(text: &str) -> Option<&str> {
     })
 }
 
-/// The address after `spawned NAME at ` in `text`.
+/// The address after the last `spawned NAME at ` in `text`.
 fn child_in(text: &str) -> Option<&str> {
-    let rest = text.get(text.find("spawned ")?..)?;
+    let rest = text.get(text.rfind("spawned ")?..)?;
     let rest = rest.get(rest.find(" at ")?.saturating_add(4)..)?;
     rest.split_whitespace().next()
 }
 
-/// `step` with its placeholders filled from `results` and the sender.
+/// `step` with its placeholders filled from `results` (the latest that
+/// names each) and the sender.
 fn filled(step: &str, results: &[(String, bool)], from: Option<&str>) -> String {
     let mut step = step.to_owned();
     let all: String = results
@@ -376,6 +384,83 @@ fn first_step(said: &str, from: Option<&str>) -> String {
     }
 }
 
+/// Why a Messages request body is not a well-formed conversation (L5).
+///
+/// The provider would refuse it: every `tool_use` has exactly one
+/// `tool_result`, in the next message, and the results come before any
+/// text there; no other message holds a result.
+#[must_use]
+pub fn malformed(request: &Value) -> Option<String> {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let blocks = |message: &Value| -> Vec<Value> {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let kind = |block: &Value| {
+        block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let id = |block: &Value, field: &str| {
+        block
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let mut owed: Vec<String> = Vec::new();
+    for (at, message) in messages.iter().enumerate() {
+        let content = blocks(message);
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            if !owed.is_empty() {
+                return Some(format!(
+                    "message {at} follows unanswered tool calls {owed:?}"
+                ));
+            }
+            owed = content
+                .iter()
+                .filter(|block| kind(block) == "tool_use")
+                .map(|block| id(block, "id"))
+                .collect();
+            continue;
+        }
+        let results = content
+            .iter()
+            .take_while(|block| kind(block) == "tool_result")
+            .count();
+        if content
+            .iter()
+            .skip(results)
+            .any(|block| kind(block) == "tool_result")
+        {
+            return Some(format!("message {at} has text before a tool result"));
+        }
+        let mut answered: Vec<String> = content
+            .iter()
+            .take(results)
+            .map(|block| id(block, "tool_use_id"))
+            .collect();
+        answered.sort();
+        owed.sort();
+        if answered != owed {
+            return Some(format!(
+                "message {at} answers tool calls {answered:?}, but {owed:?} were made"
+            ));
+        }
+        owed.clear();
+    }
+    (!owed.is_empty()).then(|| format!("the request ends with unanswered tool calls {owed:?}"))
+}
+
 /// The scripted reply to a Messages request body.
 #[must_use]
 pub fn reply(request: &Value) -> Reply {
@@ -387,19 +472,18 @@ pub fn reply(request: &Value) -> Reply {
         .unwrap_or_default();
     let turn = messages.len();
     let quick = Millis::new(0);
-    let (script, step) = script(messages);
+    let (script, step, results) = script(messages);
     let from = sender(&script).map(str::to_owned);
     // A later step of a script runs its next part, its placeholders filled
-    // from the results it follows.
-    if said.trim().is_empty() && step > 0 {
-        let results = messages.last().map(said_in).unwrap_or_default().1;
-        if let Some(next) = body(&script).split(" then ").nth(step) {
-            let next = filled(next, &results, from.as_deref());
-            let calls: Vec<(&'static str, Value)> =
-                next.split(" ; ").filter_map(tool_call).collect();
-            if !calls.is_empty() {
-                return tool_calls(turn, &calls);
-            }
+    // from the results of its steps so far (the latest that names one).
+    if said.trim().is_empty()
+        && step > 0
+        && let Some(next) = body(&script).split(" then ").nth(step)
+    {
+        let next = filled(next, &results, from.as_deref());
+        let calls: Vec<(&'static str, Value)> = next.split(" ; ").filter_map(tool_call).collect();
+        if !calls.is_empty() {
+            return tool_calls(turn, &calls);
         }
     }
     let said = first_step(&said, from.as_deref());
@@ -558,7 +642,7 @@ impl futures_core::Stream for Chunks {
 mod tests {
     use serde_json::json;
 
-    use super::{Reply, reply};
+    use super::{Reply, malformed, reply};
 
     /// The tool calls `reply` proposes: each one's name and input.
     fn proposed(reply: &Reply) -> Vec<(String, serde_json::Value)> {
@@ -639,6 +723,29 @@ mod tests {
             proposed(&reply(&request("send $child hi".to_owned()))).is_empty(),
             "an unfilled placeholder names no one"
         );
+    }
+
+    #[test]
+    fn a_message_between_a_tool_use_and_its_result_is_malformed() {
+        let ask = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "On it."},
+            {"type": "tool_use", "id": "toolu_1_0", "name": "read", "input": {}},
+        ]});
+        let result = json!({"type": "tool_result", "tool_use_id": "toolu_1_0", "content": "x"});
+        let text = json!({"type": "text", "text": "steer"});
+        let request = |answer: Vec<serde_json::Value>| {
+            json!({"messages": [
+                {"role": "user", "content": "read a"},
+                ask.clone(),
+                {"role": "user", "content": answer},
+            ]})
+        };
+        assert_eq!(
+            malformed(&request(vec![result.clone(), text.clone()])),
+            None
+        );
+        assert!(malformed(&request(vec![text, result])).is_some(), "spliced");
+        assert!(malformed(&request(Vec::new())).is_some(), "unanswered");
     }
 
     #[test]

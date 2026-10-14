@@ -454,7 +454,7 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
     }
     let mut sim = builder.build();
     let _observer = observer(&ledger);
-    sim.host(ANTHROPIC, hosts::anthropic());
+    sim.host(ANTHROPIC, hosts::anthropic(ledger.clone()));
     sim.host(
         DAEMON,
         hosts::daemon(

@@ -13,9 +13,12 @@
 use core::time::Duration;
 use std::collections::BTreeSet;
 
-use verified_domain::Unstarted;
+use core::num::{NonZeroU32, NonZeroUsize};
+
+use verified_domain::{Limits, LimitsConfig, Unstarted};
 use verified_model::Replayed;
-use verified_model::coverage::{Class, Key, Phase, Resolved, Situation};
+use verified_model::coverage::{Class, Ended, Key, Phase, Resolved, Situation, Started};
+use verified_server::limits::ServerLimits;
 use verified_wire::command::Verdict;
 
 use crate::hosts;
@@ -46,7 +49,19 @@ fn one_turn(turn: TurnPlan, hold: Option<Hold>) -> Scenario {
     }
 }
 
+/// v0's limits, with the core's changed by `change`.
+fn shrunk(change: impl FnOnce(&mut LimitsConfig)) -> ServerLimits {
+    let mut config = LimitsConfig::v0();
+    change(&mut config);
+    let mut limits = hosts::limits();
+    limits.core = Limits::new(config);
+    limits
+}
+
 /// Every directed scenario.
+///
+/// # Panics
+/// Never: every limit a scenario shrinks is a non-zero constant.
 #[must_use]
 pub fn all() -> Vec<Directed> {
     vec![
@@ -87,6 +102,95 @@ pub fn all() -> Vec<Directed> {
                 },
                 Some(Hold::CancelledFirst),
             ),
+        },
+        // A turn whose script runs past the step limit (4 here) fails by
+        // it. No seed's script runs more than three steps.
+        Directed {
+            name: "a_turn_past_its_step_limit",
+            target: Key::Turn(Ended::Steps),
+            scenario: Scenario {
+                limits: shrunk(|config| {
+                    config.steps_per_turn = NonZeroU32::new(4).expect("non-zero");
+                }),
+                ..one_turn(
+                    TurnPlan::granted(&["read notes.txt"; 6].join(" then ")),
+                    None,
+                )
+            },
+        },
+        // A background command that fails: its task ends `Failed`. No
+        // seed's background command fails.
+        Directed {
+            name: "a_background_command_that_fails",
+            target: Key::Task {
+                started: Started::Call,
+                resolved: Resolved::Failed,
+            },
+            scenario: one_turn(TurnPlan::granted("bg false"), None),
+        },
+        // A send to a child whose mailbox is full (two messages here) is
+        // refused by the limit: it never lands. No seed sends a child more
+        // than two messages.
+        Directed {
+            name: "a_send_past_its_recipients_limit",
+            target: Key::Call {
+                class: Class::Keyed,
+                phase: Phase::Dispatched,
+                crossed: false,
+                resolved: Resolved::NotStarted(Unstarted::Limit),
+            },
+            scenario: Scenario {
+                limits: shrunk(|config| {
+                    config.messages_per_actor = NonZeroUsize::new(2).expect("non-zero");
+                }),
+                ..Scenario::of(vec![TurnPlan::granted(
+                    "spawn helper hello then send $child a then send $child b",
+                )])
+            },
+        },
+        // A background command past the actor's task limit (one here)
+        // does not start, though approved; nor does a timer.
+        Directed {
+            name: "a_command_past_the_task_limit",
+            target: Key::Call {
+                class: Class::Unsafe,
+                phase: Phase::Approved,
+                crossed: false,
+                resolved: Resolved::NotStarted(Unstarted::Limit),
+            },
+            scenario: Scenario {
+                limits: shrunk(|config| {
+                    config.tasks_per_actor = NonZeroUsize::new(1).expect("non-zero");
+                }),
+                ..one_turn(TurnPlan::granted("bg sleep 300 ; bg sleep 300"), None)
+            },
+        },
+        Directed {
+            name: "a_timer_past_the_task_limit",
+            target: Key::Call {
+                class: Class::Safe,
+                phase: Phase::Approved,
+                crossed: false,
+                resolved: Resolved::NotStarted(Unstarted::Limit),
+            },
+            scenario: Scenario {
+                limits: shrunk(|config| {
+                    config.tasks_per_actor = NonZeroUsize::new(1).expect("non-zero");
+                }),
+                ..Scenario::of(vec![TurnPlan::granted("wake 300 ; wake 300")])
+            },
+        },
+        // A read past v0's 16 calls a step fails by the limit and never
+        // runs.
+        Directed {
+            name: "a_read_past_the_step_bound",
+            target: Key::Call {
+                class: Class::Safe,
+                phase: Phase::Proposed,
+                crossed: false,
+                resolved: Resolved::NotStarted(Unstarted::Limit),
+            },
+            scenario: one_turn(TurnPlan::granted(&["read other.txt"; 17].join(" ; ")), None),
         },
         // A call past v0's 16 calls a step fails by the limit and never
         // runs. No seed proposes more than four calls in a step.

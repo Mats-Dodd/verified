@@ -511,6 +511,7 @@ fn a_full_log_fails_stop_and_replays() {
                 | Entry::GaveUp { .. }
                 | Entry::Read { .. }
                 | Entry::Shell(_)
+                | Entry::Malformed { .. }
                 | Entry::Caught { .. } => {}
             }
         }
@@ -589,6 +590,7 @@ fn the_actor_scenarios_break_nothing() {
         a_steer_lost_to_esc(),
         a_stopped_parent(),
         a_silent_run(),
+        a_steer_while_a_command_runs(),
     ] {
         run::twice(&scenario)
             .map_err(|error| error.to_string())
@@ -723,6 +725,26 @@ fn consumption_recorded_at_injection_loses_a_steer_to_esc() {
     );
 }
 
+/// A message that steers a turn while its command runs.
+fn a_steer_while_a_command_runs() -> Scenario {
+    Scenario::of(vec![TurnPlan {
+        steer: Some(Steer {
+            at: SteerAt::ToolRunning,
+            text: "steer 0".to_owned(),
+        }),
+        ..TurnPlan::granted("bash sleep 3000")
+    }])
+}
+
+/// L5, as a mutation test: a history that renders a steer where it was
+/// delivered sends the model the message between the command's `tool_use`
+/// and its result. The fake provider refuses such a conversation (I13).
+#[test]
+fn splicing_a_steer_into_its_step_is_caught() {
+    let outcome = played(&a_steer_while_a_command_runs(), Planted::SpliceSteering);
+    assert!(broke(&outcome, "I13"), "{:#?}", outcome.violations);
+}
+
 /// A root that spawned a child, stopped by the user.
 fn a_stopped_parent() -> Scenario {
     Scenario {
@@ -745,12 +767,15 @@ fn a_silent_run() -> Scenario {
 }
 
 /// B2, as a mutation test: a shell that arms no deadline waits on a
-/// silent run for good. I15 finds the run still open long past its
-/// deadline; with deadlines it resolves `Unknown` by it.
+/// silent run for good, so its report is lost. I15 finds the run still
+/// open long past its deadline, and I5 (H1: a result for every call at
+/// quiescence) a world that never goes quiet; with deadlines it resolves
+/// `Unknown` by it.
 #[test]
 fn a_cancel_that_waits_for_a_silent_run_fails() {
     let outcome = played(&a_silent_run(), Planted::NoDeadline);
     assert!(broke(&outcome, "I15"), "{:#?}", outcome.violations);
+    assert!(broke(&outcome, "I5"), "{:#?}", outcome.violations);
 }
 
 /// L3, as a mutation test: a log that acknowledges appends it never

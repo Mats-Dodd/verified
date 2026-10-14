@@ -36,6 +36,8 @@ struct Step {
     parts: Vec<ModelPart>,
     /// Indexes into the turn's calls proposed by this step.
     calls: Vec<usize>,
+    /// What the planted history spliced into the step (`spliced`).
+    spliced: Vec<String>,
 }
 
 struct Builder {
@@ -45,6 +47,9 @@ struct Builder {
     /// What each envelope delivered or notified says, until a step carries
     /// it.
     mail: BTreeMap<EnvelopeId, String>,
+    /// The planted defect: a message lands where it was delivered, inside
+    /// the step that was running ([`spliced`]).
+    splice: bool,
 }
 
 /// The model-facing text of a result the core synthesized.
@@ -145,7 +150,13 @@ impl Builder {
             });
         }
         self.push(Role::Assistant, assistant);
-        self.push(Role::User, results);
+        let mut said: Vec<Content> = step
+            .spliced
+            .into_iter()
+            .map(|text| Content::Text { text })
+            .collect();
+        said.extend(results);
+        self.push(Role::User, said);
     }
 
     fn record(&mut self, seq: u64, record: &Record<Parsed>) {
@@ -162,7 +173,14 @@ impl Builder {
                             envelope.from, text.body
                         ),
                     };
-                    self.mail.insert(envelope.id, said);
+                    match &mut self.step {
+                        Some(step) if self.splice && !step.calls.is_empty() => {
+                            step.spliced.push(said);
+                        }
+                        Some(_) | None => {
+                            self.mail.insert(envelope.id, said);
+                        }
+                    }
                 }
             }
             Record::TaskEnded { task, exit, output } => {
@@ -286,11 +304,27 @@ fn tool_use(id: &CallId, name: &ToolName, input: &ToolInput) -> Content {
 /// The request for the next model call, from every record so far.
 #[must_use]
 pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    build(records, system, max_tokens, false)
+}
+
+/// The planted defect `Planted::SpliceSteering` (breaks L5).
+///
+/// The request with each message rendered where it was delivered, so one
+/// that arrived while a step's calls ran sits between their `tool_use` and
+/// their results. Only under `sim`.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn spliced(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    build(records, system, max_tokens, true)
+}
+
+fn build(records: &[Record<Parsed>], system: &str, max_tokens: u32, splice: bool) -> ModelRequest {
     let mut builder = Builder {
         messages: Vec::new(),
         calls: Vec::new(),
         step: None,
         mail: BTreeMap::new(),
+        splice,
     };
     for (seq, record) in (0u64..).zip(records) {
         builder.record(seq, record);

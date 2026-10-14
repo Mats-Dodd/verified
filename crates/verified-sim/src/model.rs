@@ -106,6 +106,7 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
             | Entry::Fault(_)
             | Entry::User(_)
             | Entry::GaveUp { .. }
+            | Entry::Malformed { .. }
             | Entry::Caught { .. } => {}
         }
     }

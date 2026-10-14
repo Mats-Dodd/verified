@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::middleware::{Next, from_fn};
 use verified_domain::id::UnixMillis;
 use verified_server::daemon::{self, Layout};
 use verified_server::env::LocalEnv;
@@ -68,13 +70,36 @@ const fn any_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
 }
 
-/// The fake Anthropic: q's scripted model, served over HTTP.
-pub fn anthropic() -> impl Fn() -> Software {
-    || {
-        Box::pin(async {
+/// The largest request the fake Anthropic reads to check it.
+const REQUEST_BYTES: usize = 32 << 20;
+
+/// The fake Anthropic: q's scripted model, served over HTTP. It checks
+/// every request it receives is a well-formed conversation, as the
+/// provider would, and tells `ledger` of each that is not (I13).
+pub fn anthropic(ledger: Ledger) -> impl Fn() -> Software {
+    move || {
+        let ledger = ledger.clone();
+        Box::pin(async move {
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let listener = net::bind(any_addr(MODEL_PORT)).await?;
-            axum::serve(listener, fake::router(clock, Tasks::new())).await?;
+            let watched = move |request: Request, next: Next| {
+                let ledger = ledger.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, REQUEST_BYTES)
+                        .await
+                        .unwrap_or_default();
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_default();
+                    if let Some(reason) = fake::malformed(&value) {
+                        ledger.record(Entry::Malformed { reason });
+                    }
+                    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+                        .await
+                }
+            };
+            let router = fake::router(clock, Tasks::new()).layer(from_fn(watched));
+            axum::serve(listener, router).await?;
             Ok(())
         })
     }

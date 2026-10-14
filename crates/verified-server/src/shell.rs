@@ -155,6 +155,10 @@ pub enum Planted {
     /// child runs on though its parent stopped.
     #[cfg(feature = "sim")]
     StopSkipsChildren,
+    /// Render a message where it was delivered, between a running step's
+    /// `tool_use` and its results (breaks L5's well-formed history).
+    #[cfg(feature = "sim")]
+    SpliceSteering,
     /// Acknowledge a group commit without its fsync (breaks L3): a crash
     /// loses records the shell acted on. The simulation's log store
     /// plants it ([`crate::log::FileLogStore::skipping_sync`]).
@@ -1267,6 +1271,17 @@ impl Session {
                     &self.config.system,
                     self.config.limits.model_max_tokens,
                 );
+                // The planted defect: a steer spliced into its step.
+                #[cfg(feature = "sim")]
+                let request = if self.config.planted == Planted::SpliceSteering {
+                    history::spliced(
+                        &self.records,
+                        &self.config.system,
+                        self.config.limits.model_max_tokens,
+                    )
+                } else {
+                    request
+                };
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 let task = ModelTask {

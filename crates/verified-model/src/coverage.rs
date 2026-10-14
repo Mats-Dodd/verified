@@ -554,11 +554,6 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
             "a real tool's child process outlives the daemon and may act after the \
              crash; the simulation's tool tasks die with the turmoil host",
         ),
-        Key::Turn(Ended::Steps) => (
-            Gap::Fidelity,
-            "the fake model ends a turn after one round of tools; a real model may \
-             call tools until the step limit",
-        ),
         Key::Action(
             Kind::Born
             | Kind::Rules

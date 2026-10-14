@@ -42,6 +42,9 @@
 //!   notification (H3).
 //! - I12 at quiescence every actor a stopped actor spawned is stopped
 //!   too (the stop cascade).
+//! - I13 every request the model was sent is a well-formed conversation
+//!   (L5): each `tool_use` answered by exactly one result in the next
+//!   message, before any text there.
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (B2): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between.
@@ -674,6 +677,10 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                     typed = typed.saturating_add(1);
                 }
             }
+            Entry::Malformed { reason } => found.push(violation(
+                "I13",
+                format!("the model was sent a malformed conversation: {reason}"),
+            )),
             Entry::Fault(_) | Entry::Shell(_) => {}
         }
     }
