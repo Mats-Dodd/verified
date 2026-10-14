@@ -20,8 +20,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, Core, Effect, Event, ModelExit, ToolCall, Verdict};
 use verified_domain::{
-    CallId, Cause, Epoch, Exit, Fault, Limits, MessageId, Millis, Proposal, Record, Request,
-    SessionId, TurnId, UnixMillis,
+    CallId, Epoch, Exit, Limits, MessageId, Millis, Proposal, Record, Request, SessionId, TurnId,
+    UnixMillis,
 };
 use verified_server::daemon::{self, DaemonError, Layout};
 use verified_server::env::LocalEnv;
@@ -140,12 +140,7 @@ async fn bash_reports_status_output_and_call_id() {
         &limits,
     )
     .await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "nonzero exit fails: {}",
-        output.text
-    );
+    assert_eq!(exit, Exit::Failed, "nonzero exit fails: {}", output.text);
     assert!(output.text.contains("id=toolu_test"), "{}", output.text);
     assert!(output.text.contains("oops"), "stderr is captured");
     assert!(output.text.ends_with("[exit status 3]"), "{}", output.text);
@@ -169,7 +164,7 @@ async fn cancelling_bash_kills_its_group_and_reports_the_honest_message() {
     let ((exit, output), ()) = within(Duration::from_secs(10), async { tokio::join!(ran, stop) })
         .await
         .expect("cancel returns promptly: the background sleep died too");
-    assert_eq!(exit, Exit::Err(Cause::Interrupted), "interrupted");
+    assert_eq!(exit, Exit::Unknown, "stopped mid-run: it may have acted");
     assert!(output.text.contains("started"), "{}", output.text);
     assert!(!output.text.contains("never"), "{}", output.text);
     assert!(
@@ -197,12 +192,7 @@ async fn a_leader_that_closes_its_output_still_runs_to_its_exit() {
         &limits,
     )
     .await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
+    assert_eq!(exit, Exit::Failed, "{}", output.text);
     assert!(output.text.contains("hi"), "{}", output.text);
     assert!(output.text.ends_with("[exit status 4]"), "{}", output.text);
 }
@@ -233,7 +223,7 @@ async fn a_leader_the_kill_cannot_reach_does_not_hang_a_stopped_command() {
         })
         .await
         .expect("the reap is bounded although the leader outlives the kill");
-        assert_eq!(exit, Exit::Err(Cause::Interrupted), "{}", output.text);
+        assert_eq!(exit, Exit::Unknown, "{}", output.text);
         assert!(output.text.contains("moved"), "{}", output.text);
         assert!(
             output.text.contains("may still be running"),
@@ -257,7 +247,7 @@ async fn timeout_kills_and_output_is_bounded() {
         &limits,
     )
     .await;
-    assert_eq!(exit, Exit::Err(Cause::Failed(Fault::Other)), "timed out");
+    assert_eq!(exit, Exit::Unknown, "timed out: it may have acted");
     assert!(
         output
             .text
@@ -340,12 +330,7 @@ async fn edit_is_compare_and_swap() {
     // twice.
     let (exit, output) =
         tool::run(&env, session(), &call, &CancellationToken::new(), &limits).await;
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
+    assert_eq!(exit, Exit::Failed, "{}", output.text);
     assert!(output.text.contains("not found"), "{}", output.text);
     let text = fs::read(&root.join("lib.rs")).await.expect("read back");
     assert_eq!(text, b"fn main() {}\n", "unchanged");
@@ -355,7 +340,7 @@ async fn edit_is_compare_and_swap() {
     });
     let (exit, output) =
         tool::run(&env, session(), &read, &CancellationToken::new(), &limits).await;
-    assert_eq!(exit, Exit::Err(Cause::Failed(Fault::Other)), "missing");
+    assert_eq!(exit, Exit::Failed, "missing");
     assert!(output.text.contains("not found"), "{}", output.text);
 }
 
@@ -705,12 +690,7 @@ async fn a_daemonized_child_cannot_hang_bash() {
             rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
     assert!(alive, "the child escaped the group and outlived the call");
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
+    assert_eq!(exit, Exit::Unknown, "{}", output.text);
     assert!(output.text.contains("leader-done"), "{}", output.text);
     assert!(
         output.text.contains("may still be running"),
@@ -733,7 +713,7 @@ async fn a_daemonized_child_cannot_hang_bash() {
     })
     .await
     .expect("cancel returns while the escaped child holds the output");
-    assert_eq!(exit, Exit::Err(Cause::Interrupted), "{}", output.text);
+    assert_eq!(exit, Exit::Unknown, "{}", output.text);
     assert!(
         output.text.contains("may still be running"),
         "{}",
@@ -780,12 +760,7 @@ async fn a_stopping_daemon_kills_whole_process_groups() {
     })
     .await
     .expect("the command ends once its group is killed");
-    assert_eq!(
-        exit,
-        Exit::Err(Cause::Failed(Fault::Other)),
-        "{}",
-        output.text
-    );
+    assert_eq!(exit, Exit::Failed, "{}", output.text);
     assert!(gone(background).await, "the background sleep died too");
     assert!(groups.is_empty(), "a reaped group is unregistered");
 }

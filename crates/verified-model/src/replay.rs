@@ -59,7 +59,7 @@ pub enum Observed {
     Mutated(EffectId),
     /// A tool run returned: its side effect, if any, has happened. It acted
     /// here only if it never mutated and was not `stopped` (it reports
-    /// `Interrupted`).
+    /// `NotStarted`: it saw its cancel before acting).
     Ran { id: EffectId, stopped: bool },
     /// The client folded the record at this offset. Only the offset: what
     /// it folded there is the simulation's I6 to check, not the replay's.

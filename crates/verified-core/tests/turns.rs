@@ -11,9 +11,9 @@ use verified_core::{
     Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Verdict, Violation,
 };
 use verified_domain::{
-    Abstract, Approver, CallId, CallIx, Cause, EffectId, Epoch, Exit, Failure, Fault, Limit,
-    Limits, LimitsConfig, Measured, MessageId, Millis, Payload, Proposal, Record, Request, Reset,
-    StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
+    Abstract, Approver, CallId, CallIx, EffectId, Epoch, Exit, Failure, Limit, Limits,
+    LimitsConfig, Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request,
+    Reset, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 // ---------------------------------------------------------------------------
@@ -421,7 +421,7 @@ fn denied_call_resolves_without_running() {
     assert_eq!(
         driver.since(from),
         vec![
-            result(0, Exit::Err(Cause::Denied), None),
+            result(0, Exit::NotStarted(Unstarted::Denied), None),
             Record::StepStarted { step: step(1) }
         ],
         "the model hears about the denial"
@@ -445,7 +445,7 @@ fn invalid_request_fails_without_running() {
                 step: step(0),
                 calls: vec![invalid]
             },
-            result(0, Exit::Err(Cause::Failed(Fault::Other)), None),
+            result(0, Exit::NotStarted(Unstarted::Invalid), None),
             Record::StepStarted { step: step(1) },
         ],
         "an invalid call fails and the next step starts"
@@ -523,7 +523,7 @@ fn interrupt_during_model_call() {
     assert_eq!(outcome, Outcome::Exists, "a second interrupt is a repeat");
     let (outcome, _) = driver.send(Event::ModelDone {
         id: call,
-        result: ModelExit::Failed(Cause::Interrupted),
+        result: ModelExit::Failed(ModelFault::Cancelled),
     });
     assert_eq!(outcome, Outcome::Accepted, "the model reports back");
     assert_eq!(
@@ -533,7 +533,7 @@ fn interrupt_during_model_call() {
     );
     let (outcome, _) = driver.send(Event::ModelDone {
         id: call,
-        result: ModelExit::Failed(Cause::Interrupted),
+        result: ModelExit::Failed(ModelFault::Cancelled),
     });
     assert_eq!(outcome, Outcome::Stale, "a late duplicate is stale");
     let ends = driver
@@ -584,8 +584,8 @@ fn interrupt_wins_over_proposed_calls_that_arrive_late() {
                 step: step(0),
                 calls: vec![propose("read", Tool::Read), propose("edit", Tool::Edit)]
             },
-            result(0, Exit::Err(Cause::Interrupted), None),
-            result(1, Exit::Err(Cause::Interrupted), None),
+            result(0, Exit::NotStarted(Unstarted::Cancelled), None),
+            result(1, Exit::NotStarted(Unstarted::Cancelled), None),
             ended(TurnOutcome::Cancelled),
         ],
         "the calls are recorded and resolved as interrupted"
@@ -612,7 +612,7 @@ fn interrupt_during_tools() {
         driver.since(from),
         vec![
             Record::CancelRequested { turn: turn(1) },
-            result(1, Exit::Err(Cause::Interrupted), None)
+            result(1, Exit::NotStarted(Unstarted::Cancelled), None)
         ],
         "the unapproved call never runs"
     );
@@ -640,7 +640,7 @@ fn interrupt_during_backoff_ends_at_once() {
     let call = driver.start();
     let (_, effects) = driver.send(Event::ModelDone {
         id: call,
-        result: ModelExit::Failed(Cause::Failed(Fault::Overloaded)),
+        result: ModelExit::Failed(ModelFault::Overloaded),
     });
     let sleep = effects
         .iter()
@@ -671,11 +671,11 @@ fn interrupt_during_backoff_ends_at_once() {
 fn transient_model_failures_retry_on_schedule() {
     let mut driver = Driver::new(small_limits());
     let mut call = driver.start();
-    for (fault, delay) in [(Fault::Overloaded, 10), (Fault::Network, 20)] {
+    for (fault, delay) in [(ModelFault::Overloaded, 10), (ModelFault::Network, 20)] {
         let from = driver.log.len();
         let (_, effects) = driver.send(Event::ModelDone {
             id: call,
-            result: ModelExit::Failed(Cause::Failed(fault)),
+            result: ModelExit::Failed(fault),
         });
         let reset = Record::StepReset {
             step: step(0),
@@ -714,13 +714,13 @@ fn transient_model_failures_retry_on_schedule() {
     }
     driver.send(Event::ModelDone {
         id: call,
-        result: ModelExit::Failed(Cause::Failed(Fault::Overloaded)),
+        result: ModelExit::Failed(ModelFault::Overloaded),
     });
     assert_eq!(
         driver.log.last(),
-        Some(&ended(TurnOutcome::Failed(Failure::Model(Cause::Failed(
-            Fault::Overloaded
-        ))))),
+        Some(&ended(TurnOutcome::Failed(Failure::Model(
+            ModelFault::Overloaded
+        )))),
         "the budget is spent: the turn fails"
     );
 }
@@ -731,13 +731,13 @@ fn other_model_failures_do_not_retry() {
     let call = driver.start();
     driver.send(Event::ModelDone {
         id: call,
-        result: ModelExit::Failed(Cause::Failed(Fault::Other)),
+        result: ModelExit::Failed(ModelFault::Other),
     });
     assert_eq!(
         driver.log.last(),
-        Some(&ended(TurnOutcome::Failed(Failure::Model(Cause::Failed(
-            Fault::Other
-        ))))),
+        Some(&ended(TurnOutcome::Failed(Failure::Model(
+            ModelFault::Other
+        )))),
         "failed"
     );
 }
@@ -789,7 +789,7 @@ fn a_discarded_attempt_does_not_count_against_context() {
     });
     let (_, effects) = driver.send(Event::ModelDone {
         id: first,
-        result: ModelExit::Failed(Cause::Failed(Fault::Network)),
+        result: ModelExit::Failed(ModelFault::Network),
     });
     let sleep = effects
         .iter()
@@ -840,11 +840,9 @@ fn the_turn_budget_counts_proposals() {
         "one call ran, but two were proposed: the turn's budget is spent"
     );
     assert!(
-        driver.since(from).contains(&result(
-            2,
-            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
-            None
-        )),
+        driver
+            .since(from)
+            .contains(&result(2, Exit::NotStarted(Unstarted::Limit), None)),
         "step 2's read fails by the limit"
     );
 }
@@ -867,11 +865,9 @@ fn calls_past_the_step_bound_are_recorded_and_fail() {
         "every call the model made is recorded"
     );
     assert!(
-        driver.since(from).contains(&result(
-            4,
-            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
-            None
-        )),
+        driver
+            .since(from)
+            .contains(&result(4, Exit::NotStarted(Unstarted::Limit), None)),
         "the call past calls_per_step fails by the limit"
     );
     let runs = tool_runs(&effects);
@@ -896,11 +892,9 @@ fn calls_past_the_turn_bound_fail() {
     );
     let read = single_run(&effects, "read-a");
     assert!(
-        driver.log.contains(&result(
-            1,
-            Exit::Err(Cause::Failed(Fault::TooManyCalls)),
-            None
-        )),
+        driver
+            .log
+            .contains(&result(1, Exit::NotStarted(Unstarted::Limit), None)),
         "the second call is past calls_per_turn"
     );
     let (_, effects) = driver.tool_done(read, Exit::Ok);
@@ -921,9 +915,9 @@ fn reused_call_ids_fail_the_step() {
     assert!(effects.is_empty(), "nothing runs");
     assert_eq!(
         driver.since(from),
-        vec![ended(TurnOutcome::Failed(Failure::Model(Cause::Failed(
-            Fault::Other
-        ))))],
+        vec![ended(TurnOutcome::Failed(Failure::Model(
+            ModelFault::Other
+        )))],
         "never two live calls with one id"
     );
 }
@@ -946,7 +940,7 @@ fn crash_makes_dispatched_bash_unknown() {
         driver.since(from),
         vec![
             Record::EpochBumped { epoch: Epoch(1) },
-            result(0, Exit::Err(Cause::Unknown), None),
+            result(0, Exit::Unknown, None),
             Record::StepStarted { step: step(1) },
         ],
         "its outcome is unknown and the model is told"
@@ -969,7 +963,7 @@ fn crash_makes_dispatched_edit_unknown() {
         driver.since(from),
         vec![
             Record::EpochBumped { epoch: Epoch(1) },
-            result(0, Exit::Err(Cause::Unknown), None),
+            result(0, Exit::Unknown, None),
             Record::StepStarted { step: step(1) },
         ],
         "its outcome is unknown and the model is told"
@@ -1004,7 +998,7 @@ fn crash_reruns_a_safe_tool_and_resolves_the_rest_unknown() {
         driver.since(from),
         vec![
             Record::EpochBumped { epoch: Epoch(1) },
-            result(1, Exit::Err(Cause::Unknown), None),
+            result(1, Exit::Unknown, None),
         ],
         "bash is unknown; the read runs again"
     );
@@ -1044,6 +1038,85 @@ fn crash_restarts_model_step() {
         "partial output is reset and the step runs again"
     );
     assert_eq!(model_call(&effects).epoch, Epoch(1), "new epoch");
+}
+
+/// H4: a crash while the turn is being cancelled leaves a dispatched read
+/// `Unknown`, never `NotStarted`: it was dispatched, so it may have acted.
+#[test]
+fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+    single_run(&effects, "read");
+    driver.send(Event::Interrupt { turn: turn(1) });
+    let from = driver.log.len();
+    let effects = driver.crash();
+    assert!(
+        tool_runs(&effects).is_empty(),
+        "nothing reruns under a cancel"
+    );
+    assert_eq!(
+        driver.since(from),
+        vec![
+            Record::EpochBumped { epoch: Epoch(1) },
+            result(0, Exit::Unknown, None),
+            ended(TurnOutcome::Cancelled),
+        ],
+        "the read may have run: its outcome is unknown"
+    );
+}
+
+/// H4: the log refuses a result that claims more than v knows.
+#[test]
+fn a_log_claiming_more_than_v_knows_is_corrupt() {
+    let dispatched = vec![
+        Record::TurnStarted {
+            turn: turn(1),
+            message: message(1),
+            text: payload(1),
+        },
+        Record::StepStarted { step: step(0) },
+        Record::StepFinished {
+            step: step(0),
+            calls: vec![propose("bash", Tool::Bash)],
+        },
+        Record::Approved {
+            call: CallIx(0),
+            by: Approver::User,
+        },
+        Record::Dispatched { call: CallIx(0) },
+    ];
+    let mut never_started = dispatched.clone();
+    never_started.push(result(0, Exit::NotStarted(Unstarted::Cancelled), None));
+    assert_eq!(
+        Core::recover(small_limits(), &never_started),
+        Err(Corrupt {
+            seq: 5,
+            violation: Violation::WrongResult
+        }),
+        "v cannot know a dispatched call never acted"
+    );
+    let mut reported = dispatched.clone();
+    reported.push(result(
+        0,
+        Exit::NotStarted(Unstarted::Cancelled),
+        Some(payload(1)),
+    ));
+    assert!(
+        Core::recover(small_limits(), &reported).is_ok(),
+        "its run may report that it never began"
+    );
+    let mut unknown_before_dispatch = dispatched;
+    unknown_before_dispatch.truncate(4);
+    unknown_before_dispatch.push(result(0, Exit::Unknown, None));
+    assert_eq!(
+        Core::recover(small_limits(), &unknown_before_dispatch),
+        Err(Corrupt {
+            seq: 4,
+            violation: Violation::WrongResult
+        }),
+        "an undispatched call provably never acted"
+    );
 }
 
 #[test]
@@ -1261,13 +1334,13 @@ fn record_json_shape() {
         },
         Record::ToolResult {
             call: CallIx(0),
-            exit: Exit::Err(Cause::Failed(Fault::TooManyCalls)),
+            exit: Exit::NotStarted(Unstarted::Limit),
             output: None,
         },
         Record::StepReset {
             step: StepId { turn, index: 0 },
             reason: Reset::Retry {
-                fault: Fault::Overloaded,
+                fault: ModelFault::Overloaded,
                 delay: Millis::new(500),
             },
         },
@@ -1287,7 +1360,7 @@ fn record_json_shape() {
             r#"{"type":"TurnStarted","turn":"01900000-0000-7000-8000-000000000001","message":"0190a8e2-7c3b-7d4e-8f00-0123456789ab","text":{"body":"hi","bytes":2}}"#,
             r#"{"type":"StepFinished","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"calls":[{"id":"toolu_01","request":{"Run":{"args":"Edit"}}}]}"#,
             r#"{"type":"Approved","call":0,"by":"User"}"#,
-            r#"{"type":"ToolResult","call":0,"exit":{"Err":{"Failed":"TooManyCalls"}},"output":null}"#,
+            r#"{"type":"ToolResult","call":0,"exit":{"NotStarted":"Limit"},"output":null}"#,
             r#"{"type":"StepReset","step":{"turn":"01900000-0000-7000-8000-000000000001","index":0},"reason":{"Retry":{"fault":"Overloaded","delay":500}}}"#,
             r#"{"type":"TurnEnded","turn":"01900000-0000-7000-8000-000000000001","outcome":{"Failed":{"Limit":"Context"}}}"#,
             r#"{"type":"EpochBumped","epoch":2}"#,
@@ -1388,12 +1461,12 @@ impl Seen {
     }
 }
 
-const fn cause(number: u8) -> Cause {
+const fn cause(number: u8) -> ModelFault {
     match number {
-        0 => Cause::Failed(Fault::Overloaded),
-        1 => Cause::Failed(Fault::Network),
-        2 => Cause::Interrupted,
-        _ => Cause::Failed(Fault::Other),
+        0 => ModelFault::Overloaded,
+        1 => ModelFault::Network,
+        2 => ModelFault::Cancelled,
+        _ => ModelFault::Other,
     }
 }
 
@@ -1429,11 +1502,7 @@ fn event_for(choice: &Choice, seen: &Seen, driver: &Driver) -> Option<Event<Abst
         },
         Choice::ToolDone(index, ok) => Event::ToolDone {
             id: pick(&seen.tools, *index)?,
-            exit: if *ok {
-                Exit::Ok
-            } else {
-                Exit::Err(Cause::Failed(Fault::Other))
-            },
+            exit: if *ok { Exit::Ok } else { Exit::Failed },
             output: payload(11),
         },
         Choice::Woke(index) => Event::Woke {

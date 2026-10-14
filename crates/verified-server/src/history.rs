@@ -9,7 +9,7 @@
 //! guesses or substitutes.
 
 use verified_domain::id::{CallId, ToolName};
-use verified_domain::{Cause, Exit, Fault, Record, Request};
+use verified_domain::{Exit, Record, Request, Unstarted};
 
 use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
 use crate::payload::{ModelPart, Parsed, ToolInput};
@@ -40,18 +40,25 @@ struct Builder {
 pub fn synthesized_text(exit: Exit, reason: Option<&str>) -> String {
     match exit {
         Exit::Ok => "(no output)".to_owned(),
-        Exit::Err(Cause::Denied) => "The user denied this tool call.".to_owned(),
-        Exit::Err(Cause::Interrupted) => {
-            "Interrupted: the user stopped the turn before this call finished.".to_owned()
+        Exit::Failed => "The tool call failed.".to_owned(),
+        Exit::NotStarted(Unstarted::Denied) => {
+            "Not started: the user denied this tool call.".to_owned()
         }
-        Exit::Err(Cause::Unknown) => "Unknown outcome: the agent restarted while this call was running; it may or may not have taken effect.".to_owned(),
-        Exit::Err(Cause::Failed(Fault::TooManyCalls)) => {
-            "Not run: the response proposed more tool calls than one step or turn may make.".to_owned()
+        Exit::NotStarted(Unstarted::Cancelled) => {
+            "Not started: the user stopped the turn before this call ran.".to_owned()
         }
-        Exit::Err(Cause::Failed(Fault::Overloaded | Fault::Network | Fault::Other | Fault::TooLarge)) => reason.map_or_else(
-            || "The tool call failed.".to_owned(),
+        Exit::NotStarted(Unstarted::Limit) => {
+            "Not started: the response proposed more tool calls than one step or turn may make."
+                .to_owned()
+        }
+        Exit::NotStarted(Unstarted::Invalid) => reason.map_or_else(
+            || "Not started: the tool call is invalid.".to_owned(),
             |reason| format!("Invalid tool call: {reason}"),
         ),
+        Exit::Unknown => {
+            "Unknown outcome: it may or may not have taken effect; look before redoing it."
+                .to_owned()
+        }
     }
 }
 
@@ -101,7 +108,7 @@ impl Builder {
                 .unwrap_or_else(|| synthesized_text(*exit, call.reason.as_deref()));
             let kind = match exit {
                 Exit::Ok => ResultKind::Success,
-                Exit::Err(_) => ResultKind::Error,
+                Exit::Failed | Exit::NotStarted(_) | Exit::Unknown => ResultKind::Error,
             };
             results.push(Content::ToolResult {
                 id: tool_call_id.clone(),

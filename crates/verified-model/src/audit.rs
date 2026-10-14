@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use verified_domain::{
-    Abstract, CallId, CallIx, Cause, Exit, Fault, Limits, Proposal, Record, Request, Rerun, TurnId,
+    Abstract, CallId, CallIx, Exit, Limits, Proposal, Record, Request, Rerun, TurnId, Unstarted,
     named,
 };
 
@@ -75,12 +75,12 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 }
             }
             Record::ToolResult { exit, .. } => {
-                if *exit == Exit::Err(Cause::Failed(Fault::TooManyCalls)) {
+                if *exit == Exit::NotStarted(Unstarted::Limit) {
                     audit.limited = audit.limited.saturating_add(1);
                 }
                 if let Some((number, _)) = target {
                     unsafe_live.remove(&number);
-                    if crossed.remove(&number) && *exit != Exit::Err(Cause::Unknown) {
+                    if crossed.remove(&number) && *exit != Exit::Unknown {
                         audit.breaches.insert(Breach::UnsafeKnownAfterCrash);
                     }
                 }

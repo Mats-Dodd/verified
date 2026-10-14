@@ -6,7 +6,7 @@ use stateright::{Checker as _, Expectation, Model as _};
 use verified_core::{Event, ModelExit, Verdict};
 use verified_domain::{
     Abstract, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId, Proposal,
-    Record, Request, Rerun, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
+    Record, Request, Rerun, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::Divergence;
@@ -116,7 +116,7 @@ fn rerunning_an_unsafe_call_after_a_crash_is_caught() {
 fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
     for tool in [Tool::Edit, Tool::Bash] {
         let checker = Harness {
-            bug: Some(Bug::UnsafeResolvedInterrupted),
+            bug: Some(Bug::UnsafeResolvedNotStarted),
             ..suite::with_crashes(vec![vec![tool]], 1)
         }
         .checker()
@@ -128,16 +128,16 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
                 .is_some(),
             "the checker sees the {tool:?} call resolved as if it never ran"
         );
-        for name in [
-            "an Unsafe call is dispatched at most once across crashes",
-            "every durable prefix recovers",
-        ] {
-            assert_eq!(
-                checker.discovery(name).map(stateright::Path::into_actions),
-                None,
-                "only the Unknown audit fires for {tool:?}: {name}"
-            );
-        }
+        // The log refuses it too ("every durable prefix recovers"): a
+        // synthesized `NotStarted` for a dispatched call claims more than v
+        // knows (H4).
+        assert_eq!(
+            checker
+                .discovery("an Unsafe call is dispatched at most once across crashes")
+                .map(stateright::Path::into_actions),
+            None,
+            "the {tool:?} run is never repeated"
+        );
     }
 }
 
@@ -904,8 +904,9 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
 }
 
 /// A run stopped before it acted did not act: its return, observed
-/// `stopped`, takes no `Execute`, so the call resolves `Interrupted` while
-/// still `Dispatched`. The same return not stopped is the run acting.
+/// `stopped`, takes no `Execute`, so the call resolves `NotStarted` while
+/// still `Dispatched`. The same report from a run that acted claims more
+/// than v knows (H4), and the replay refuses it.
 #[test]
 fn a_stopped_run_did_not_act() {
     let harness = Harness::bounded(
@@ -919,7 +920,7 @@ fn a_stopped_run_did_not_act() {
         class: Class::Safe,
         phase: Phase::Dispatched,
         crossed: false,
-        resolved: Resolved::Interrupted,
+        resolved: Resolved::NotStarted(Unstarted::Cancelled),
     };
     let path = explore(&harness)
         .witnesses
@@ -931,20 +932,18 @@ fn a_stopped_run_did_not_act() {
         None
     }
     .expect("the witness ends at the read's report");
-    for stopped in [true, false] {
-        let mut taken = path.clone();
-        if !stopped {
-            taken.insert(taken.len().saturating_sub(1), Action::Execute(id));
-        }
-        let mut trace = observations(&harness, &path);
-        let done = trace.len().saturating_sub(1);
-        trace.insert(done, Observed::Ran { id, stopped });
-        let replayed = replay(&trace_mode(&harness, &trace), &trace).expect("the run replays");
-        assert_eq!(
-            replayed.keys,
-            path_keys(&harness, &taken),
-            "stopped {stopped}: the replay takes {taken:?}"
-        );
-        assert_eq!(replayed.keys.contains(&key), stopped, "stopped {stopped}");
-    }
+    let mut trace = observations(&harness, &path);
+    let done = trace.len().saturating_sub(1);
+    trace.insert(done, Observed::Ran { id, stopped: true });
+    let replayed = replay(&trace_mode(&harness, &trace), &trace).expect("the run replays");
+    assert_eq!(replayed.keys, path_keys(&harness, &path), "no act is taken");
+    assert!(replayed.keys.contains(&key), "the read never started");
+    let mut acted = observations(&harness, &path);
+    acted.insert(done, Observed::Ran { id, stopped: false });
+    let found = divergence(&trace_mode(&harness, &acted), &acted);
+    assert_eq!(
+        found.index,
+        done.saturating_add(1),
+        "the report is refused: {found:?}"
+    );
 }

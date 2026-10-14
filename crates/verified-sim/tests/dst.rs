@@ -13,7 +13,7 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use verified_domain::{Cause, Exit, Record, Reset, TurnOutcome};
+use verified_domain::{Exit, ModelFault, Record, Reset, TurnOutcome, Unstarted};
 use verified_model::coverage::{Class, Key, Phase, Resolved};
 use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
@@ -138,7 +138,7 @@ fn retried_over_the_network(outcome: &Outcome) -> bool {
                 record,
                 Record::StepReset {
                     reason: Reset::Retry {
-                        fault: verified_domain::Fault::Network,
+                        fault: ModelFault::Network,
                         ..
                     },
                     ..
@@ -309,17 +309,17 @@ fn a_crash_while_a_command_runs_is_after_it_acted() {
 }
 
 /// What the shell makes durable is what the core decided, as a mutation
-/// test: a shell that persists an `Unknown` result as `Interrupted` (U4,
+/// test: a shell that persists an `Unknown` result as `NotStarted` (H1,
 /// broken below the core) leaves the model where a group commit becomes
 /// durable holding other records than the model's.
 #[test]
-fn persisting_unknown_as_interrupted_fails_the_replay() {
-    let outcome = once(37, Planted::UnknownAsInterrupted);
+fn persisting_unknown_as_not_started_fails_the_replay() {
+    let outcome = once(37, Planted::UnknownAsNotStarted);
     let interrupted = |record: &Record<_>| {
         matches!(
             record,
             Record::ToolResult {
-                exit: Exit::Err(Cause::Interrupted),
+                exit: Exit::NotStarted(Unstarted::Cancelled),
                 ..
             }
         )
@@ -332,6 +332,35 @@ fn persisting_unknown_as_interrupted_fails_the_replay() {
         ),
         "seed 37 (a command resolves Unknown) diverges at its commit: {:?}",
         outcome.replayed
+    );
+}
+
+/// H4, as a mutation test: a shell whose stopped command reports
+/// `NotStarted`, as `Interrupted` did, claims a run that acted never began.
+/// The replay refuses the report: the model admits `NotStarted` only from a
+/// cancelled run that never acted.
+#[test]
+fn reporting_a_command_stopped_mid_run_as_not_started_fails_the_replay() {
+    let caught = (0..16u64).any(|seed| {
+        let outcome = once(seed, Planted::StoppedAsNotStarted);
+        let Err(Mismatch::Diverged(divergence)) = &outcome.replayed else {
+            return false;
+        };
+        matches!(
+            &divergence.observed,
+            Observed::Decided(_, records) if records.iter().any(|record| matches!(
+                record,
+                Record::ToolResult {
+                    exit: Exit::NotStarted(_),
+                    output: Some(_),
+                    ..
+                }
+            ))
+        )
+    });
+    assert!(
+        caught,
+        "no seed's replay caught a stopped command reported as never started"
     );
 }
 

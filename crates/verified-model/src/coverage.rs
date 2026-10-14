@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use stateright::Model as _;
 use verified_core::Event;
 use verified_domain::{
-    Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome, named,
+    Exit, Failure, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome, Unstarted, named,
 };
 
 use crate::harness::{Action, Harness, Kind};
@@ -50,29 +50,23 @@ pub enum Phase {
     Ran,
 }
 
-/// How a call was resolved.
+/// How a call was resolved: the outcome vocabulary, with why it never
+/// started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Resolved {
     Ok,
     Failed,
-    /// Failed by a bound from `Limits`, before it ran.
-    Limited,
-    Interrupted,
+    NotStarted(Unstarted),
     Unknown,
-    Denied,
 }
 
 impl Resolved {
     const fn of(exit: Exit) -> Self {
         match exit {
             Exit::Ok => Self::Ok,
-            Exit::Err(Cause::Failed(Fault::TooManyCalls)) => Self::Limited,
-            Exit::Err(Cause::Failed(
-                Fault::Overloaded | Fault::Network | Fault::Other | Fault::TooLarge,
-            )) => Self::Failed,
-            Exit::Err(Cause::Interrupted) => Self::Interrupted,
-            Exit::Err(Cause::Unknown) => Self::Unknown,
-            Exit::Err(Cause::Denied) => Self::Denied,
+            Exit::Failed => Self::Failed,
+            Exit::NotStarted(why) => Self::NotStarted(why),
+            Exit::Unknown => Self::Unknown,
         }
     }
 }

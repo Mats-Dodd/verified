@@ -4,8 +4,9 @@
 use stateright::{Model, Property};
 use verified_core::{Core, Decision, Event, ModelExit, Outcome, Verdict};
 use verified_domain::{
-    Abstract, Approver, CallId, Cause, EffectId, Epoch, Exit, Fault, Limits, Measured, MessageId,
+    Abstract, Approver, CallId, EffectId, Epoch, Exit, Limits, Measured, MessageId, ModelFault,
     Proposal, Record, Request, Rerun, Reset, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
+    Unstarted,
 };
 
 use crate::alpha::{self, Work};
@@ -140,9 +141,9 @@ pub struct Bounded {
 pub enum Bug {
     /// After a crash, rerun dispatched `Unsafe` calls as if they were `Safe`.
     RerunUnsafe,
-    /// After a crash, resolve dispatched `Unsafe` calls `Interrupted`, as
+    /// After a crash, resolve dispatched `Unsafe` calls `NotStarted`, as
     /// if the shell knew they never ran.
-    UnsafeResolvedInterrupted,
+    UnsafeResolvedNotStarted,
     /// The stream serves records that are decided but not yet durable.
     ServePending,
     /// A reconnecting client resumes one record past its offset.
@@ -195,24 +196,27 @@ const fn size(bytes: u64) -> Measured<Unit> {
 }
 
 /// Whether `flight`, effect `id`, may reply `event`: a reply of its own
-/// job's kind, an interrupted one only once it was asked to stop, and a
-/// tool's other reports only once it ran.
+/// job's kind, a cancelled one only once it was asked to stop, and a tool's
+/// other reports only once it ran. A cancelled run reports `NotStarted`
+/// only if it never acted (H4); a run that acted and was stopped (a cancel,
+/// or its own timeout) reports `Unknown`.
 fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
     let (of, admitted) = match event {
         Event::ModelParts { id, .. } => (id, matches!(flight.job, Job::Model { .. })),
         Event::ModelDone { id, result } => (
             id,
             matches!(flight.job, Job::Model { .. })
-                && (flight.cancelled || !matches!(result, ModelExit::Failed(Cause::Interrupted))),
+                && (flight.cancelled
+                    || !matches!(result, ModelExit::Failed(ModelFault::Cancelled))),
         ),
         Event::ToolDone { id, exit, .. } => (
             id,
             matches!(flight.job, Job::Tool { .. })
                 && match exit {
-                    Exit::Err(Cause::Interrupted) => flight.cancelled,
-                    Exit::Ok | Exit::Err(Cause::Failed(_) | Cause::Unknown | Cause::Denied) => {
-                        flight.executed
-                    }
+                    Exit::NotStarted(_) => flight.cancelled && !flight.executed,
+                    // `Unknown`: a run stopped mid-way (a cancel, or its own
+                    // timeout).
+                    Exit::Ok | Exit::Failed | Exit::Unknown => flight.executed,
                 },
         ),
         Event::Woke { id } => (id, matches!(flight.job, Job::Sleep)),
@@ -235,9 +239,9 @@ fn replies(bounded: &Bounded, id: EffectId, job: &Job) -> Vec<Event<Abstract>> {
             }));
             replies.extend(
                 [
-                    Cause::Failed(Fault::Overloaded),
-                    Cause::Failed(Fault::Other),
-                    Cause::Interrupted,
+                    ModelFault::Overloaded,
+                    ModelFault::Other,
+                    ModelFault::Cancelled,
                 ]
                 .map(|cause| Event::ModelDone {
                     id,
@@ -248,8 +252,9 @@ fn replies(bounded: &Bounded, id: EffectId, job: &Job) -> Vec<Event<Abstract>> {
         }
         Job::Tool { .. } => [
             Exit::Ok,
-            Exit::Err(Cause::Failed(Fault::Other)),
-            Exit::Err(Cause::Interrupted),
+            Exit::Failed,
+            Exit::NotStarted(Unstarted::Cancelled),
+            Exit::Unknown,
         ]
         .map(|exit| Event::ToolDone {
             id,
@@ -643,7 +648,7 @@ impl Model for Harness {
                         matches!(
                             record,
                             Record::ToolResult {
-                                exit: Exit::Err(Cause::Unknown),
+                                exit: Exit::Unknown,
                                 ..
                             }
                         )
@@ -653,12 +658,12 @@ impl Model for Harness {
                     resumed.effects.clear();
                 }
                 self.stage(&mut world, &resumed);
-                if self.bug == Some(Bug::UnsafeResolvedInterrupted) {
+                if self.bug == Some(Bug::UnsafeResolvedNotStarted) {
                     for record in &mut world.pending {
                         if let Record::ToolResult { exit, .. } = record
-                            && *exit == Exit::Err(Cause::Unknown)
+                            && *exit == Exit::Unknown
                         {
-                            *exit = Exit::Err(Cause::Interrupted);
+                            *exit = Exit::NotStarted(Unstarted::Cancelled);
                         }
                     }
                 }
@@ -832,12 +837,14 @@ impl Model for Harness {
                     )
                 })
             }),
+            // v resolves it `Unknown` (a crash), not a run's report.
             Property::sometimes("an outcome is unknown", |_, world: &World| {
                 world.log.iter().any(|record| {
                     matches!(
                         record,
                         Record::ToolResult {
-                            exit: Exit::Err(Cause::Unknown),
+                            exit: Exit::Unknown,
+                            output: None,
                             ..
                         }
                     )

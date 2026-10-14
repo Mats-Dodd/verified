@@ -194,7 +194,7 @@ impl Faults {
             hold,
             barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
                 Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
-                Hold::InterruptedFirst => matches!(point, Barrier::Dispatched(_)),
+                Hold::CancelledFirst => matches!(point, Barrier::Dispatched(_)),
             }),
             waiting: Vec::new(),
         });
@@ -315,7 +315,7 @@ impl Faults {
         }
         let kept = match held.hold {
             Hold::RanTogether => (held.waiting.len() >= 2).then_some("two runs acted together"),
-            Hold::InterruptedFirst => (!held.waiting.is_empty() && ledger.with(interrupted))
+            Hold::CancelledFirst => (!held.waiting.is_empty() && ledger.with(interrupted))
                 .then_some("the interrupt is durable before the run starts"),
         };
         if let Some(kept) = kept {

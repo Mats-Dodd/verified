@@ -17,7 +17,7 @@
 //! `Limits::batch_window`, on the Clock seam), and every batch reaches the
 //! inbox before the call's `ModelDone`. A response whose single part, or
 //! whose tool calls together, would not fit one log line fails the call
-//! (`Fault::TooLarge`): no record the shell makes is one the log refuses.
+//! (`ModelFault::TooLarge`): no record the shell makes is one the log refuses.
 //! Effects are cancelled with tokens at safe points, never by dropping them.
 //!
 //! Should the log refuse an append anyway (its file is full), nothing was
@@ -52,7 +52,7 @@ use verified_core::{
 };
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
 use verified_domain::{
-    Approver, Cause, EffectId, Exit, Fault, Measured, Proposal, Record, TurnOutcome, named,
+    Approver, EffectId, Exit, Measured, ModelFault, Proposal, Record, TurnOutcome, Unstarted, named,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -110,11 +110,16 @@ pub enum Planted {
     /// dispatch). The replay must catch the second act.
     #[cfg(feature = "sim")]
     RunTwice,
-    /// Persist an `Unknown` result as `Interrupted` (breaks U4 in the shell,
+    /// Persist an `Unknown` result as `NotStarted` (breaks H1 in the shell,
     /// below the core). The replay must catch the durable records differing
     /// from the decided ones.
     #[cfg(feature = "sim")]
-    UnknownAsInterrupted,
+    UnknownAsNotStarted,
+    /// Report a command stopped mid-run as `NotStarted`, as `Interrupted`
+    /// did before H4: a run that may have acted claims it never began. The
+    /// replay must catch the report of a run that acted.
+    #[cfg(feature = "sim")]
+    StoppedAsNotStarted,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -513,8 +518,8 @@ impl Session {
             outcome,
         } = decision;
         #[cfg(feature = "sim")]
-        let records = if self.config.planted == Planted::UnknownAsInterrupted {
-            unknown_as_interrupted(records)
+        let records = if self.config.planted == Planted::UnknownAsNotStarted {
+            unknown_as_not_started(records)
         } else {
             records
         };
@@ -1001,7 +1006,7 @@ fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
         Event::ModelDone { id, result } => Some(Event::ModelDone {
             id: *id,
             result: match result {
-                ModelExit::Finished(_) => ModelExit::Failed(Cause::Interrupted),
+                ModelExit::Finished(_) => ModelExit::Failed(ModelFault::Cancelled),
                 ModelExit::Failed(cause) => ModelExit::Failed(*cause),
             },
         }),
@@ -1013,15 +1018,19 @@ fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
     }
 }
 
-/// The planted defect: `records` with every `Unknown` result made
-/// `Interrupted`, as if the shell knew the call never ran.
+/// The planted defect: `records` with every `Unknown` result made a
+/// `NotStarted` report, as if the shell knew the call never ran. It invents
+/// the report (an empty output): the core refuses a synthesized `NotStarted`
+/// for a dispatched call (H4), so a shell can only lie past it this way.
 #[cfg(feature = "sim")]
-fn unknown_as_interrupted(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
+fn unknown_as_not_started(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
     for record in &mut records {
-        if let Record::ToolResult { exit, .. } = record
-            && *exit == Exit::Err(Cause::Unknown)
+        if let Record::ToolResult { exit, output, .. } = record
+            && *exit == Exit::Unknown
+            && output.is_none()
         {
-            *exit = Exit::Err(Cause::Interrupted);
+            *exit = Exit::NotStarted(Unstarted::Cancelled);
+            *output = Some(measure(ToolOutput::complete(String::new())));
         }
     }
     records
@@ -1048,9 +1057,17 @@ async fn run_tool(
         let (_, _) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
     }
     let (exit, output) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
+    // The planted defect: a run stopped mid-way (`Unknown`) says it never
+    // began.
+    #[cfg(feature = "sim")]
+    let exit = if config.planted == Planted::StoppedAsNotStarted && exit == Exit::Unknown {
+        Exit::NotStarted(Unstarted::Cancelled)
+    } else {
+        exit
+    };
     barrier(Barrier::ToolRan {
         id,
-        stopped: exit == Exit::Err(Cause::Interrupted),
+        stopped: matches!(exit, Exit::NotStarted(_)),
     })
     .await;
     let output = measure(output);
@@ -1190,9 +1207,9 @@ impl ModelTask {
             self.batch(receiver, &stop),
         );
         let result = match (batched, streamed) {
-            (Err(TooLarge), _) => ModelExit::Failed(Cause::Failed(Fault::TooLarge)),
+            (Err(TooLarge), _) => ModelExit::Failed(ModelFault::TooLarge),
             (Ok(proposals), Ok(())) => ModelExit::Finished(proposals),
-            (Ok(_), Err(error)) => ModelExit::Failed(error.core_cause()),
+            (Ok(_), Err(error)) => ModelExit::Failed(error.core_fault()),
         };
         report(
             &self.inbox,
@@ -1298,7 +1315,7 @@ fn verdict_of(records: &[Record<Parsed>], call: &CallId) -> Option<WireVerdict> 
                 by: Approver::User, ..
             } => Some(WireVerdict::Grant),
             Record::ToolResult {
-                exit: Exit::Err(Cause::Denied),
+                exit: Exit::NotStarted(Unstarted::Denied),
                 ..
             } => Some(WireVerdict::Deny),
             Record::Approved { .. }

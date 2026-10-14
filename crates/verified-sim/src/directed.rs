@@ -13,6 +13,7 @@
 use core::time::Duration;
 use std::collections::BTreeSet;
 
+use verified_domain::Unstarted;
 use verified_model::Replayed;
 use verified_model::coverage::{Class, Key, Phase, Resolved, Situation};
 use verified_wire::command::Verdict;
@@ -62,7 +63,7 @@ pub fn all() -> Vec<Directed> {
                 Some(Hold::RanTogether),
             ),
         },
-        // A `Safe` run interrupted before it acts: it reports `Interrupted`
+        // A `Safe` run interrupted before it acts: it reports `NotStarted`
         // and the replay counts no act (its `stopped`). Seeds 0..500 never
         // do: a read starts as soon as it is dispatched, before any
         // interrupt can cancel it.
@@ -72,7 +73,7 @@ pub fn all() -> Vec<Directed> {
                 class: Class::Safe,
                 phase: Phase::Dispatched,
                 crossed: false,
-                resolved: Resolved::Interrupted,
+                resolved: Resolved::NotStarted(Unstarted::Cancelled),
             },
             scenario: one_turn(
                 TurnPlan {
@@ -80,7 +81,7 @@ pub fn all() -> Vec<Directed> {
                     verdicts: Vec::new(),
                     cancel: Some(CancelAt::ToolRunning),
                 },
-                Some(Hold::InterruptedFirst),
+                Some(Hold::CancelledFirst),
             ),
         },
         // A call past v0's 16 calls a step fails by the limit and never
@@ -91,7 +92,7 @@ pub fn all() -> Vec<Directed> {
                 class: Class::Unsafe,
                 phase: Phase::Proposed,
                 crossed: false,
-                resolved: Resolved::Limited,
+                resolved: Resolved::NotStarted(Unstarted::Limit),
             },
             scenario: one_turn(
                 TurnPlan {

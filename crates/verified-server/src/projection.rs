@@ -8,7 +8,7 @@
 use serde_json::json;
 use verified_domain::id::{ApprovalId, CallId, PartId, TurnId};
 use verified_domain::{
-    Approver, Cause, Exit, Failure, Fault, Limit, Record, Request, Rerun, TurnOutcome,
+    Approver, Exit, Failure, Limit, ModelFault, Record, Request, Rerun, TurnOutcome, Unstarted,
 };
 use verified_wire::chunk::{
     FinishReason, TurnEndReason, TurnEndedData, TurnStartedData, UiChunk, UserMessageData,
@@ -59,25 +59,18 @@ fn approval_id(call: &CallId) -> ApprovalId {
 fn failure_text(failure: Failure) -> String {
     match failure {
         Failure::Limit(Limit::Steps) => "The turn used every model step it may take.".to_owned(),
-        Failure::Model(Cause::Failed(Fault::TooLarge)) => {
+        Failure::Model(ModelFault::TooLarge) => {
             "The model's response is too large to record.".to_owned()
-        }
-        Failure::Model(Cause::Failed(Fault::TooManyCalls)) => {
-            "The model proposed more tool calls than allowed.".to_owned()
         }
         Failure::Limit(Limit::Context) => {
             "The conversation is larger than the context limit.".to_owned()
         }
-        Failure::Model(Cause::Failed(Fault::Overloaded)) => {
+        Failure::Model(ModelFault::Overloaded) => {
             "The model is overloaded; retries ran out.".to_owned()
         }
-        Failure::Model(Cause::Failed(Fault::Network)) => {
-            "The network failed; retries ran out.".to_owned()
-        }
-        Failure::Model(Cause::Failed(Fault::Other)) => "The model call failed.".to_owned(),
-        Failure::Model(Cause::Interrupted) => "The model call was interrupted.".to_owned(),
-        Failure::Model(Cause::Unknown) => "The model call's outcome is unknown.".to_owned(),
-        Failure::Model(Cause::Denied) => "The model call was refused.".to_owned(),
+        Failure::Model(ModelFault::Network) => "The network failed; retries ran out.".to_owned(),
+        Failure::Model(ModelFault::Other) => "The model call failed.".to_owned(),
+        Failure::Model(ModelFault::Cancelled) => "The model call was interrupted.".to_owned(),
     }
 }
 
@@ -289,14 +282,16 @@ fn result_chunks(call: &Call, exit: Exit, text: Option<String>, chunks: &mut Vec
             tool_call_id: id,
             output: json!({"text": text.unwrap_or_default()}),
         }),
-        Exit::Err(Cause::Denied) => {
+        Exit::NotStarted(Unstarted::Denied) => {
             chunks.push(UiChunk::ToolApprovalResponse {
                 approval_id: approval_id(&id),
                 approved: false,
             });
             chunks.push(UiChunk::ToolOutputDenied { tool_call_id: id });
         }
-        Exit::Err(Cause::Failed(_) | Cause::Interrupted | Cause::Unknown) => {
+        Exit::Failed
+        | Exit::NotStarted(Unstarted::Cancelled | Unstarted::Limit | Unstarted::Invalid)
+        | Exit::Unknown => {
             let error_text = text
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| synthesized_text(exit, call.reason.as_deref()));

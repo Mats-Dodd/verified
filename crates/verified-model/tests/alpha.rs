@@ -8,8 +8,8 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use proptest::prelude::*;
 use verified_core::{Core, Decision, Effect, Event, ModelExit, Verdict};
 use verified_domain::{
-    CallId, Cause, EffectId, Epoch, Exit, Fault, Limits, LimitsConfig, MessageId, Millis, Record,
-    ToolName, TurnId, UnixMillis,
+    CallId, EffectId, Epoch, Exit, Limits, LimitsConfig, MessageId, Millis, ModelFault, Record,
+    ToolName, TurnId, UnixMillis, Unstarted,
 };
 use verified_model::alpha;
 use verified_model::alpha::record;
@@ -111,12 +111,12 @@ fn text(size: u16) -> String {
     "é ".repeat(usize::from(size))
 }
 
-const fn cause(number: u8) -> Cause {
+const fn cause(number: u8) -> ModelFault {
     match number {
-        0 => Cause::Failed(Fault::Overloaded),
-        1 => Cause::Failed(Fault::Network),
-        2 => Cause::Interrupted,
-        _ => Cause::Failed(Fault::Other),
+        0 => ModelFault::Overloaded,
+        1 => ModelFault::Network,
+        2 => ModelFault::Cancelled,
+        _ => ModelFault::Other,
     }
 }
 
@@ -226,8 +226,9 @@ impl Seen {
                 id: pick(&self.tools, *index)?,
                 exit: match exit {
                     0 => Exit::Ok,
-                    1 => Exit::Err(Cause::Interrupted),
-                    _ => Exit::Err(Cause::Failed(Fault::Other)),
+                    1 => Exit::NotStarted(Unstarted::Cancelled),
+                    2 => Exit::Unknown,
+                    _ => Exit::Failed,
                 },
                 output: measure(ToolOutput::complete(text(*size))),
             },

@@ -489,7 +489,7 @@ pub enum Barrier {
     Dispatched(verified_domain::EffectId),
     /// A tool's run returned, its side effect (if any) done; its `ToolDone`
     /// has not been sent. `stopped`: the run reports it was stopped
-    /// (`Interrupted`), so it acted only if it mutated before that.
+    /// (`NotStarted`), so it acted only if it mutated before that.
     ToolRan {
         id: verified_domain::EffectId,
         stopped: bool,

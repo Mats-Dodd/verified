@@ -82,7 +82,7 @@ pub enum Hold {
     RanTogether,
     /// A tool run waits, before it starts, until the user's interrupt is
     /// durable (and so its run is cancelled): it is stopped before it acts.
-    InterruptedFirst,
+    CancelledFirst,
 }
 
 /// Everything one simulated run does.

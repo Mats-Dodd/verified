@@ -79,44 +79,51 @@ pub struct Proposal<P: Payload> {
     pub request: Request<P>,
 }
 
-/// Why an attempt did not succeed.
+/// Why a model call failed. A model call is not an effect (PRINCIPLES):
+/// this is not an [`Exit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
-pub enum Fault {
+pub enum ModelFault {
     /// The model provider is overloaded: retried on schedule.
     Overloaded,
     /// The connection failed: retried on schedule.
     Network,
     /// Anything else: not retried.
     Other,
-    /// A call past `calls_per_step` or `calls_per_turn`: it fails without
-    /// running.
-    TooManyCalls,
     /// The model's response (or a batch of it) is longer than the log's line
     /// bound: it is too large to record.
     TooLarge,
+    /// The call was stopped (an interrupt, or a full log ending the turn).
+    Cancelled,
 }
 
-/// Why something did not run to success.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// Why an effect provably never acted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
-pub enum Cause {
-    Failed(Fault),
-    /// Stopped by an interrupt, or never started because of one.
-    Interrupted,
-    /// It may or may not have happened: a crash came between dispatch and
-    /// result for a call that cannot be safely rerun.
-    Unknown,
-    /// The user refused the call.
+pub enum Unstarted {
+    /// The user refused it.
     Denied,
+    /// Cancelled before it acted: the turn was interrupted before dispatch,
+    /// or its run saw the cancel before any side effect.
+    Cancelled,
+    /// Past `calls_per_step` or `calls_per_turn`.
+    Limit,
+    /// The request did not parse into a known tool's arguments.
+    Invalid,
 }
 
-/// How an effect ended.
+/// How an effect ended, claiming no more than v knows (H4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Exit {
+    /// It ran to completion and reported success.
     Ok,
-    Err(Cause),
+    /// It ran to completion and reported failure.
+    Failed,
+    /// It provably never acted.
+    NotStarted(Unstarted),
+    /// It may have acted: a crash, a cancel or a deadline came while it ran.
+    Unknown,
 }
 
 /// Who approved a call.
@@ -134,7 +141,7 @@ pub enum Approver {
 #[verifier::external_derive]
 pub enum Reset {
     /// The call failed with a retryable fault; it is retried after `delay`.
-    Retry { fault: Fault, delay: Millis },
+    Retry { fault: ModelFault, delay: Millis },
     /// The daemon restarted while the call was in flight.
     Restart,
 }
@@ -154,7 +161,7 @@ pub enum Limit {
 #[verifier::external_derive]
 pub enum Failure {
     Limit(Limit),
-    Model(Cause),
+    Model(ModelFault),
 }
 
 /// How a turn ended.
@@ -188,10 +195,11 @@ pub enum Record<P: Payload> {
     Approved { call: CallIx, by: Approver },
     /// A call is about to run. At most one per call.
     Dispatched { call: CallIx },
-    /// What a call actually did. At most one per call (U8); one for every
+    /// What a call actually did. At most one per call (H2); one for every
     /// call once the turn is quiescent is held, not promised. `output` is
-    /// absent when the core synthesized the result (denied, interrupted
-    /// before it ran, unknown after a crash, invalid request, past a limit).
+    /// absent when the core synthesized the result: `NotStarted` for a call
+    /// never dispatched (denied, cancelled, invalid, past a limit), and
+    /// `Unknown` for a dispatched one (a crash, a deadline).
     ToolResult { call: CallIx, exit: Exit, output: Option<Measured<P::Output>> },
     /// The user asked to stop the turn.
     CancelRequested { turn: TurnId },

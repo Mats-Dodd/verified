@@ -3,8 +3,9 @@
 //! A tool runs an approved call against the [`Env`] and reports what
 //! actually happened as an [`Exit`] and a bounded [`ToolOutput`]. The
 //! cancel token is checked at safe points: before any side effect a
-//! cancelled call is `Interrupted`; file operations that started finish;
-//! `bash` has its process group killed.
+//! cancelled call is `NotStarted`; file operations that started finish;
+//! `bash` has its process group killed, and a command it stopped
+//! (cancelled or timed out) is `Unknown`: it may have acted (H4).
 //!
 //! `edit` is a compare-and-swap of `old` for `new` in memory: `old` must
 //! appear exactly once in the text read, and the result is written
@@ -22,7 +23,7 @@ use core::fmt::Write as _;
 use tokio_util::sync::CancellationToken;
 use verified_core::{Approved, ToolCall};
 use verified_domain::id::SessionId;
-use verified_domain::{Cause, Exit, Fault};
+use verified_domain::{Exit, Unstarted};
 
 use crate::env::{
     BashGrant, EditGrant, Env, EnvError, ExecOptions, ExitStatus, Grant, Stopped, Written,
@@ -33,12 +34,8 @@ use crate::payload::{Parsed, ProjectPath, ToolOutput, Truncation};
 /// The environment variable `bash` commands see their call id in.
 pub const CALL_ID_VAR: &str = "VERIFIED_CALL_ID";
 
-const fn failed() -> Exit {
-    Exit::Err(Cause::Failed(Fault::Other))
-}
-
 const fn failure(text: String) -> (Exit, ToolOutput) {
-    (failed(), ToolOutput::complete(text))
+    (Exit::Failed, ToolOutput::complete(text))
 }
 
 /// Keeps the first `limit` bytes of `text`, cut at a char boundary.
@@ -73,8 +70,8 @@ pub async fn run(
 ) -> (Exit, ToolOutput) {
     if cancel.is_cancelled() {
         return (
-            Exit::Err(Cause::Interrupted),
-            ToolOutput::complete("Interrupted before it started.".to_owned()),
+            Exit::NotStarted(Unstarted::Cancelled),
+            ToolOutput::complete("Not started: cancelled.".to_owned()),
         );
     }
     match Grant::of(call, session) {
@@ -177,15 +174,9 @@ async fn bash(
     text.push_str(&String::from_utf8_lossy(&contiguous));
     let (exit, trailer) = match status {
         ExitStatus::Code(0i32) => (Exit::Ok, "[exit status 0]".to_owned()),
-        ExitStatus::Code(code) => (failed(), format!("[exit status {code}]")),
-        ExitStatus::Signal(signal) => (failed(), format!("[killed by signal {signal}]")),
-        ExitStatus::Stopped(why) => (
-            match why {
-                Stopped::Cancelled => Exit::Err(Cause::Interrupted),
-                Stopped::TimedOut => failed(),
-            },
-            format!("[{}]", stopped(why)),
-        ),
+        ExitStatus::Code(code) => (Exit::Failed, format!("[exit status {code}]")),
+        ExitStatus::Signal(signal) => (Exit::Failed, format!("[killed by signal {signal}]")),
+        ExitStatus::Stopped(why) => (Exit::Unknown, format!("[{}]", stopped(why))),
     };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');

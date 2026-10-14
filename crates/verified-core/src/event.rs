@@ -5,7 +5,7 @@
 use vstd::prelude::*;
 
 use verified_domain::{
-    CallId, Cause, EffectId, Exit, Measured, MessageId, Payload, Proposal, TurnId,
+    CallId, EffectId, Exit, Measured, MessageId, ModelFault, Payload, Proposal, TurnId,
 };
 
 verus! {
@@ -25,7 +25,7 @@ pub enum ModelExit<P: Payload> {
     /// The response finished, proposing these calls (possibly none). The
     /// core refuses a response that reuses a call id.
     Finished(Vec<Proposal<P>>),
-    Failed(Cause),
+    Failed(ModelFault),
 }
 
 /// One input to `Core::decide`.

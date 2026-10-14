@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::id::{CallId, IdEntropy, MessageId, SessionId, TurnId, UnixMillis};
-use verified_domain::{Cause, Exit, Limits, LimitsConfig, Millis, Record, TurnOutcome};
+use verified_domain::{Exit, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
     BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Kept,
@@ -521,7 +521,7 @@ async fn denied_bash_never_runs() {
     );
     let transcript = fold(&handle).await;
     assert!(
-        reply_text(&transcript, 0).contains("Error: The user denied this tool call."),
+        reply_text(&transcript, 0).contains("Error: Not started: the user denied this tool call."),
         "the model heard the refusal: {}",
         reply_text(&transcript, 0)
     );
@@ -629,9 +629,9 @@ async fn overloaded_retries_then_fails() {
         log.iter().any(|record| matches!(
             record,
             Record::TurnEnded {
-                outcome: TurnOutcome::Failed(verified_domain::Failure::Model(Cause::Failed(
-                    verified_domain::Fault::Overloaded
-                ))),
+                outcome: TurnOutcome::Failed(verified_domain::Failure::Model(
+                    ModelFault::Overloaded
+                )),
                 ..
             }
         )),
@@ -723,7 +723,7 @@ async fn restart_mid_bash_resolves_unknown_and_never_reruns() {
         log.iter().any(|record| matches!(
             record,
             Record::ToolResult {
-                exit: Exit::Err(Cause::Unknown),
+                exit: Exit::Unknown,
                 output: None,
                 ..
             }
@@ -881,7 +881,7 @@ async fn a_crash_during_an_edit_leaves_unknown_and_never_reruns() {
         log.iter().any(|record| matches!(
             record,
             Record::ToolResult {
-                exit: Exit::Err(Cause::Unknown),
+                exit: Exit::Unknown,
                 output: None,
                 ..
             }
@@ -977,7 +977,7 @@ async fn cancelling_bash_reports_the_honest_message() {
     let log = records(&handle).await;
     let output = log.iter().find_map(|record| {
         if let Record::ToolResult {
-            exit: Exit::Err(Cause::Interrupted),
+            exit: Exit::Unknown,
             output: Some(output),
             ..
         } = record

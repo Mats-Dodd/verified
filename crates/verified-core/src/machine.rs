@@ -32,6 +32,10 @@
 //!   (`resumed`).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
+//! - a result claims no more than v knows (H4, `result_fits`): one the core
+//!   synthesizes is `NotStarted` only for a call never dispatched and
+//!   `Unknown` for one that was, and a run reports only for a dispatched
+//!   call.
 //!
 //! Model-checked, not proved (Stateright, `verified-model`, and the scenario
 //! tests in `tests/turns.rs`):
@@ -61,9 +65,9 @@ use vstd::prelude::*;
 #[cfg(verus_only)]
 use verified_domain::record::rerun_of;
 use verified_domain::{
-    Approver, CallId, CallIx, Cause, EffectId, Epoch, Exit, Failure, Fault, Limit, Limits,
-    Measured, MessageId, Millis, Payload, Proposal, Record, Request, Rerun, Reset, StepId, TurnId,
-    TurnOutcome,
+    Approver, CallId, CallIx, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId,
+    Millis, ModelFault, Payload, Proposal, Record, Request, Rerun, Reset, StepId, TurnId,
+    TurnOutcome, Unstarted,
 };
 
 use crate::effect::{self, Decision, Effect, Outcome, Rejection};
@@ -229,6 +233,20 @@ pub open spec fn request_rerun<P: Payload>(request: Request<P>) -> Option<Rerun>
 /// The calls a `StepFinished` adds.
 pub open spec fn proposed<P: Payload>(calls: Seq<Proposal<P>>) -> Seq<CallView> {
     Seq::new(calls.len(), |index: int| fresh_call(request_rerun(calls[index].request)))
+}
+
+/// H4: a result claims no more than v knows. One the core synthesizes
+/// (`reported` false) is `NotStarted` only for a call never dispatched, and
+/// `Unknown` for one that was: a dispatched call may have acted. A run's
+/// own report (`reported`) comes only for a dispatched call; whether a run
+/// that says it never began really did not act is the world's to tell, and
+/// the replay checks it.
+pub open spec fn result_fits(phase: Phase, exit: Exit, reported: bool) -> bool {
+    match phase {
+        Phase::Proposed | Phase::Approved => !reported && exit is NotStarted,
+        Phase::Dispatched { .. } => reported || exit is Unknown,
+        Phase::Resolved => false,
+    }
 }
 
 /// A turn ends `Cancelled` exactly when the user asked it to stop.
@@ -420,11 +438,15 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
             },
             Turn::Idle => None,
         },
-        Record::ToolResult { call, .. } => match view.turn {
+        Record::ToolResult { call, exit, output } => match view.turn {
             Turn::Open(open) => {
                 let index = call.0 as int;
                 if open.stage is Tools && open.first_call <= index < view.calls.len()
-                    && !(view.calls[index].phase is Resolved) {
+                    && !(view.calls[index].phase is Resolved) && result_fits(
+                    view.calls[index].phase,
+                    exit,
+                    output is Some,
+                ) {
                     Some(
                         CoreView {
                             seq,
@@ -660,6 +682,10 @@ pub enum Violation {
     DuplicateMessage,
     /// Policy approved a call that only the user may approve.
     WrongApprover,
+    /// A result claims more than v knows (H4): a synthesized `NotStarted`
+    /// for a dispatched call, anything but `NotStarted` for an undispatched
+    /// one, or a run's report for a call never dispatched.
+    WrongResult,
 }
 
 /// A record `apply` refused, and its position in the log.
@@ -712,13 +738,11 @@ const fn bump(value: u64) -> (next: u64)
     value.checked_add(1).expect("a log holds fewer than 2^64 records")
 }
 
-/// The fault to retry on, if `cause` is retryable.
-const fn retryable(cause: Cause) -> Option<Fault> {
-    match cause {
-        Cause::Failed(Fault::Overloaded) => Some(Fault::Overloaded),
-        Cause::Failed(Fault::Network) => Some(Fault::Network),
-        Cause::Failed(Fault::Other | Fault::TooManyCalls | Fault::TooLarge)
-        | Cause::Interrupted | Cause::Unknown | Cause::Denied => None,
+/// Whether a model call that failed with `fault` is retried.
+const fn retryable(fault: ModelFault) -> bool {
+    match fault {
+        ModelFault::Overloaded | ModelFault::Network => true,
+        ModelFault::Other | ModelFault::TooLarge | ModelFault::Cancelled => false,
     }
 }
 
@@ -835,7 +859,7 @@ impl<P: Payload> Plan<P> {
             old(self).scratch@.turn is Open,
             old(self).scratch@.turn->Open_0.stage is Tools,
             old(self).scratch@.turn->Open_0.first_call <= index < old(self).scratch@.calls.len(),
-            !(old(self).scratch@.calls[index as int].phase is Resolved),
+            result_fits(old(self).scratch@.calls[index as int].phase, exit, false),
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
@@ -1389,14 +1413,19 @@ impl<P: Payload> Core<P> {
                 assert(call_ok(self.ledger@[index as int]));
                 Ok(())
             },
-            Record::ToolResult { call, exit: _, output } => {
+            Record::ToolResult { call, exit, output } => {
                 let open = self.open()?;
                 if !(matches!(open.stage, Stage::Tools)) {
                     return self.refuse(Violation::WrongStage);
                 }
                 let index = self.current_call(open, *call)?;
-                if matches!(self.calls[index].phase, Phase::Resolved) {
-                    return self.refuse(Violation::WrongPhase);
+                let fits = match self.calls[index].phase {
+                    Phase::Proposed | Phase::Approved => output.is_none() && matches!(exit, Exit::NotStarted(_)),
+                    Phase::Dispatched { .. } => output.is_some() || matches!(exit, Exit::Unknown),
+                    Phase::Resolved => return self.refuse(Violation::WrongPhase),
+                };
+                if !fits {
+                    return self.refuse(Violation::WrongResult);
                 }
                 let ghost was = self.ledger@[index as int];
                 self.calls[index].phase = Phase::Resolved;
@@ -1603,14 +1632,14 @@ impl<P: Payload> Core<P> {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             match plan.scratch.calls[index].phase {
                 Phase::Proposed => match open.intent {
-                    Intent::Cancel => plan.resolve(index, Exit::Err(Cause::Interrupted)),
+                    Intent::Cancel => plan.resolve(index, Exit::NotStarted(Unstarted::Cancelled)),
                     Intent::Proceed => {
                         if index - open.first_call >= self.limits.calls_per_step() || index
                             >= self.limits.calls_per_turn() {
-                            plan.resolve(index, Exit::Err(Cause::Failed(Fault::TooManyCalls)));
+                            plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
                         } else {
                             match plan.scratch.calls[index].rerun {
-                                None => plan.resolve(index, Exit::Err(Cause::Failed(Fault::Other))),
+                                None => plan.resolve(index, Exit::NotStarted(Unstarted::Invalid)),
                                 Some(Rerun::Safe) => {
                                     plan.emit(
                                         Record::Approved { call: CallIx(index), by: Approver::Policy },
@@ -1622,7 +1651,7 @@ impl<P: Payload> Core<P> {
                     },
                 },
                 Phase::Approved => match open.intent {
-                    Intent::Cancel => plan.resolve(index, Exit::Err(Cause::Interrupted)),
+                    Intent::Cancel => plan.resolve(index, Exit::NotStarted(Unstarted::Cancelled)),
                     Intent::Proceed => {},
                 },
                 Phase::Dispatched { .. } | Phase::Resolved => {},
@@ -1764,7 +1793,7 @@ impl<P: Payload> Core<P> {
             Verdict::Approve => {
                 plan.emit(Record::Approved { call: CallIx(index), by: Approver::User });
             },
-            Verdict::Deny => plan.resolve(index, Exit::Err(Cause::Denied)),
+            Verdict::Deny => plan.resolve(index, Exit::NotStarted(Unstarted::Denied)),
         }
         self.settle(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
@@ -1890,7 +1919,7 @@ impl<P: Payload> Core<P> {
         };
         let mut plan = self.plan();
         let failed = match open.intent {
-            Intent::Proceed => TurnOutcome::Failed(Failure::Model(Cause::Failed(Fault::Other))),
+            Intent::Proceed => TurnOutcome::Failed(Failure::Model(ModelFault::Other)),
             Intent::Cancel => TurnOutcome::Cancelled,
         };
         match result {
@@ -1904,17 +1933,18 @@ impl<P: Payload> Core<P> {
                     self.settle(&mut plan);
                 }
             },
-            ModelExit::Failed(cause) => match open.intent {
+            ModelExit::Failed(fault) => match open.intent {
                 Intent::Cancel => {
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
                 },
                 Intent::Proceed => {
-                    let retry = match retryable(cause) {
-                        Some(fault) => match self.limits.retry_delay(open.retries) {
+                    let retry = if retryable(fault) {
+                        match self.limits.retry_delay(open.retries) {
                             Some(delay) => Some(Reset::Retry { fault, delay }),
                             None => None,
-                        },
-                        None => None,
+                        }
+                    } else {
+                        None
                     };
                     match retry {
                         Some(reason) => {
@@ -1926,7 +1956,7 @@ impl<P: Payload> Core<P> {
                             plan.emit(
                                 Record::TurnEnded {
                                     turn: open.turn,
-                                    outcome: TurnOutcome::Failed(Failure::Model(cause)),
+                                    outcome: TurnOutcome::Failed(Failure::Model(fault)),
                                 },
                             );
                         },
@@ -2053,9 +2083,9 @@ impl<P: Payload> Core<P> {
         plan.finish(Outcome::Accepted, Runs::All)
     }
 
-    /// Resolves each dispatched call with no result that cannot be rerun:
-    /// `Unsafe` calls become `Unknown`; when the turn is being cancelled,
-    /// `Safe` ones become `Interrupted`.
+    /// Resolves each dispatched call with no result that cannot be rerun
+    /// `Unknown`: every `Unsafe` one, and when the turn is being cancelled,
+    /// the `Safe` ones too.
     #[verifier::loop_isolation(false)]
     fn resume_tools(plan: &mut Plan<P>)
         requires
@@ -2094,12 +2124,14 @@ impl<P: Payload> Core<P> {
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
+                // It was dispatched, so it may have acted: `NotStarted` would
+                // claim more than v knows (H4). A `Safe` call is rerun only
+                // while the turn proceeds: rerunning it under a cancel would
+                // start something after the cancel is durable (A5).
                 match (plan.scratch.calls[index].rerun, open.intent) {
-                    (None | Some(Rerun::Unsafe), Intent::Proceed | Intent::Cancel) => {
-                        plan.resolve(index, Exit::Err(Cause::Unknown));
-                    },
-                    (Some(Rerun::Safe), Intent::Cancel) => {
-                        plan.resolve(index, Exit::Err(Cause::Interrupted));
+                    (None | Some(Rerun::Unsafe), Intent::Proceed | Intent::Cancel)
+                    | (Some(Rerun::Safe), Intent::Cancel) => {
+                        plan.resolve(index, Exit::Unknown);
                     },
                     (Some(Rerun::Safe), Intent::Proceed) => {},
                 }
@@ -2199,6 +2231,7 @@ impl fmt::Display for Violation {
             Self::Overflow => "a counter would overflow",
             Self::DuplicateMessage => "the message already started a turn",
             Self::WrongApprover => "policy approved a call only the user may approve",
+            Self::WrongResult => "the result claims more than v knows of the call",
         })
     }
 }

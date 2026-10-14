@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use verified_domain::ModelFault;
 use verified_domain::id::{CallId, ToolName};
-use verified_domain::{Cause, Fault};
 
 use crate::payload::ModelPart;
 
@@ -86,12 +86,12 @@ pub enum ModelError {
 impl ModelError {
     /// The core's view of this failure.
     #[must_use]
-    pub const fn core_cause(&self) -> Cause {
+    pub const fn core_fault(&self) -> ModelFault {
         match self {
-            Self::Overloaded(_) => Cause::Failed(Fault::Overloaded),
-            Self::Network(_) => Cause::Failed(Fault::Network),
-            Self::Other(_) => Cause::Failed(Fault::Other),
-            Self::Interrupted => Cause::Interrupted,
+            Self::Overloaded(_) => ModelFault::Overloaded,
+            Self::Network(_) => ModelFault::Network,
+            Self::Other(_) => ModelFault::Other,
+            Self::Interrupted => ModelFault::Cancelled,
         }
     }
 }
