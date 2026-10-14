@@ -36,6 +36,12 @@
 //!   synthesizes is `NotStarted` only for a call never dispatched and
 //!   `Unknown` for one that was, and a run reports only for a dispatched
 //!   call.
+//! - cancel is revocation (A5): once a turn's cancel is durable, no step,
+//!   retry, approval or dispatch applies until the turn ends
+//!   (`lemma_nothing_starts_after_a_cancel`).
+//! - a known outcome is never overwritten (H6): no record gives a resolved
+//!   call another result (`lemma_known_outcome_stays`), so of a run's report
+//!   and its deadline (`Expired`), the first to reach the core wins.
 //!
 //! Model-checked, not proved (Stateright, `verified-model`, and the scenario
 //! tests in `tests/turns.rs`):
@@ -573,6 +579,82 @@ pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> 
         Some(end) => state_ok(end) && runs_ok(start, end, decision.effects@, true),
         None => false,
     }
+}
+
+/// The running turn is `turn`, and the user asked it to stop.
+pub open spec fn cancelled(view: CoreView, turn: TurnId) -> bool {
+    match view.turn {
+        Turn::Open(open) => open.turn == turn && open.intent is Cancel,
+        Turn::Idle => false,
+    }
+}
+
+/// A record that starts something: a model call, a retry, an approval, a
+/// dispatch.
+pub open spec fn starts<P: Payload>(record: Record<P>) -> bool {
+    ||| record is StepStarted
+    ||| record is StepReset
+    ||| record is Approved
+    ||| record is Dispatched
+}
+
+/// A5, one record: once a cancel of the running turn is durable, nothing
+/// that starts something applies, and the turn stays cancelled until it
+/// ends.
+pub proof fn lemma_cancel_revokes<P: Payload>(view: CoreView, turn: TurnId, record: Record<P>)
+    requires
+        cancelled(view, turn),
+        spec_apply(view, record) is Some,
+    ensures
+        !starts(record),
+        !(record is TurnEnded) ==> cancelled(spec_apply(view, record)->0, turn),
+{
+}
+
+/// A5, a log: after a durable cancel, no record up to the turn's end starts
+/// anything, and the turn is still cancelled.
+pub proof fn lemma_nothing_starts_after_a_cancel<P: Payload>(
+    view: CoreView,
+    turn: TurnId,
+    records: Seq<Record<P>>,
+)
+    requires
+        cancelled(view, turn),
+        applies(view, records) is Some,
+        forall|at: int| 0 <= at < records.len() ==> !(#[trigger] records[at] is TurnEnded),
+    ensures
+        forall|at: int| 0 <= at < records.len() ==> !starts(#[trigger] records[at]),
+        cancelled(applies(view, records)->0, turn),
+    decreases records.len(),
+{
+    if records.len() > 0 {
+        let before = records.drop_last();
+        assert forall|at: int| 0 <= at < before.len() implies !(#[trigger] before[at] is TurnEnded) by {
+            assert(before[at] == records[at]);
+        }
+        lemma_nothing_starts_after_a_cancel(view, turn, before);
+        lemma_cancel_revokes(applies(view, before)->0, turn, records.last());
+        assert forall|at: int| 0 <= at < records.len() implies !starts(#[trigger] records[at]) by {
+            if at < before.len() {
+                assert(before[at] == records[at]);
+            }
+        }
+    }
+}
+
+/// H6: a known outcome is never overwritten. Within its turn, no record
+/// gives a resolved call another result, and none changes it.
+pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, record: Record<P>)
+    requires
+        0 <= index < view.calls.len(),
+        view.calls[index].phase is Resolved,
+        spec_apply(view, record) is Some,
+        !(record is TurnStarted),
+    ensures
+        !(record is ToolResult && record->ToolResult_call.0 == index),
+        index < spec_apply(view, record)->0.calls.len(),
+        spec_apply(view, record)->0.calls[index] == view.calls[index],
+{
 }
 
 proof fn lemma_refusal_sticks<P: Payload>(view: CoreView, log: Seq<Record<P>>, at: int)
@@ -1723,6 +1805,7 @@ impl<P: Payload> Core<P> {
             Event::ModelDone { id, result } => self.on_model_done(id, result),
             Event::ToolDone { id, exit, output } => self.on_tool_done(id, exit, output),
             Event::Woke { id } => self.on_woke(id),
+            Event::Expired { id } => self.on_expired(id),
         }
     }
 
@@ -1968,32 +2051,41 @@ impl<P: Payload> Core<P> {
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
-    fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
+    /// The current step's dispatched, unresolved call that tool run `id`
+    /// runs, if `id` is the live one.
+    fn running_call(plan: &Plan<P>, id: EffectId) -> (found: Option<usize>)
         requires
-            self.wf(),
+            plan.inv(),
         ensures
-            decided(self@, decision),
+            match found {
+                Some(index) => {
+                    &&& plan.scratch@.turn is Open
+                    &&& plan.scratch@.turn->Open_0.stage is Tools
+                    &&& plan.scratch@.turn->Open_0.first_call <= index < plan.scratch@.calls.len()
+                    &&& plan.scratch@.calls[index as int].phase is Dispatched
+                },
+                None => true,
+            },
     {
-        let mut plan = self.plan();
-        let Some(open) = plan.open() else {
-            return quiet(Outcome::Stale);
-        };
-        if !(matches!(open.stage, Stage::Tools)) || id.epoch.0 != self.epoch.0 {
-            return quiet(Outcome::Stale);
+        let open = plan.open()?;
+        if !(matches!(open.stage, Stage::Tools)) || id.epoch.0 != plan.scratch.epoch.0 {
+            return None;
         }
         let count = plan.scratch.calls.len();
         let mut found: Option<usize> = None;
         let mut index = open.first_call;
         while index < count
             invariant
+                plan.inv(),
                 count == plan.scratch.calls@.len(),
                 open.first_call <= index,
                 match found {
-                    Some(at) => open.first_call <= at < count && plan.scratch.calls@[at as int].phase is Dispatched,
+                    Some(at) => open.first_call <= at < count && plan.scratch@.calls[at as int].phase is Dispatched,
                     None => true,
                 },
             decreases count - index,
         {
+            assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             let named = match plan.scratch.calls[index].phase {
                 Phase::Dispatched { seq } => seq == id.seq,
                 Phase::Proposed | Phase::Approved | Phase::Resolved => false,
@@ -2003,11 +2095,42 @@ impl<P: Payload> Core<P> {
             }
             index += 1;
         }
-        let Some(index) = found else {
+        found
+    }
+
+    /// A run reported. Whichever of this report and the run's deadline
+    /// reaches the core first resolves the call; the other finds it
+    /// resolved and is stale (H6).
+    fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+    {
+        let mut plan = self.plan();
+        let Some(index) = Self::running_call(&plan, id) else {
             return quiet(Outcome::Stale);
         };
-        assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
         plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
+        self.settle(&mut plan);
+        plan.finish(Outcome::Accepted, Runs::New)
+    }
+
+    /// A run's deadline passed: v stops waiting, records `Unknown` (it may
+    /// have acted) and signals the run to stop. A run that reported first
+    /// keeps its outcome: the deadline is stale (H6).
+    fn on_expired(&self, id: EffectId) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+    {
+        let mut plan = self.plan();
+        let Some(index) = Self::running_call(&plan, id) else {
+            return quiet(Outcome::Stale);
+        };
+        plan.resolve(index, Exit::Unknown);
+        plan.effect(Effect::CancelTool { id });
         self.settle(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }

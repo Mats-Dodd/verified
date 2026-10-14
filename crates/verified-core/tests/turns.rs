@@ -634,6 +634,95 @@ fn interrupt_during_tools() {
     );
 }
 
+/// A5, signal once: a second interrupt of a turn already stopping is a
+/// repeat, and asks no run to stop again.
+#[test]
+fn a_second_interrupt_signals_nothing() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+    let read = single_run(&effects, "read");
+    let (_, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    assert_eq!(
+        effects,
+        vec![Effect::CancelTool { id: read }],
+        "signalled once"
+    );
+    let from = driver.log.len();
+    let (outcome, effects) = driver.send(Event::Interrupt { turn: turn(1) });
+    assert_eq!(outcome, Outcome::Exists, "a repeat");
+    assert!(effects.is_empty(), "no second signal");
+    assert_eq!(driver.since(from), Vec::new(), "nothing recorded");
+}
+
+/// H6, the deadline first: v stops waiting, records `Unknown` and asks the
+/// run to stop; the run's late report changes nothing.
+#[test]
+fn a_deadline_before_the_report_resolves_unknown() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    driver.finish(call, vec![propose("bash", Tool::Bash)]);
+    let (_, effects) = driver.approve("bash", Verdict::Approve);
+    let bash = single_run(&effects, "bash");
+    let from = driver.log.len();
+    let (outcome, effects) = driver.send(Event::Expired { id: bash });
+    assert_eq!(outcome, Outcome::Accepted, "the deadline is live");
+    assert!(
+        effects.contains(&Effect::CancelTool { id: bash }),
+        "the run is asked to stop: {effects:?}"
+    );
+    assert_eq!(
+        driver.since(from),
+        vec![
+            result(0, Exit::Unknown, None),
+            Record::StepStarted { step: step(1) },
+        ],
+        "it may have acted: Unknown"
+    );
+    let (outcome, _) = driver.tool_done(bash, Exit::Ok);
+    assert_eq!(outcome, Outcome::Stale, "the known outcome stays");
+    let (outcome, _) = driver.send(Event::Expired { id: bash });
+    assert_eq!(outcome, Outcome::Stale, "and so does a repeated deadline");
+}
+
+/// H6, the report first: its outcome stands, and the deadline is stale.
+#[test]
+fn a_report_before_the_deadline_wins() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    driver.finish(call, vec![propose("bash", Tool::Bash)]);
+    let (_, effects) = driver.approve("bash", Verdict::Approve);
+    let bash = single_run(&effects, "bash");
+    driver.tool_done(bash, Exit::Failed);
+    let from = driver.log.len();
+    let (outcome, effects) = driver.send(Event::Expired { id: bash });
+    assert_eq!(outcome, Outcome::Stale, "nothing is running");
+    assert!(effects.is_empty(), "no signal");
+    assert_eq!(driver.since(from), Vec::new(), "the Failed result stands");
+}
+
+/// A5: a deadline during a cancel resolves the run and ends the turn; no
+/// step starts.
+#[test]
+fn a_deadline_under_a_cancel_starts_nothing() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+    let read = single_run(&effects, "read");
+    driver.send(Event::Interrupt { turn: turn(1) });
+    let from = driver.log.len();
+    let (_, effects) = driver.send(Event::Expired { id: read });
+    assert!(tool_runs(&effects).is_empty(), "nothing runs");
+    assert_eq!(
+        driver.since(from),
+        vec![
+            result(0, Exit::Unknown, None),
+            ended(TurnOutcome::Cancelled)
+        ],
+        "the turn ends cancelled"
+    );
+}
+
 #[test]
 fn interrupt_during_backoff_ends_at_once() {
     let mut driver = Driver::new(small_limits());
@@ -1395,6 +1484,7 @@ enum Choice {
     ModelFail(u8, u8),
     ToolDone(u8, bool),
     Woke(u8),
+    Expire(u8),
     Crash,
 }
 
@@ -1408,6 +1498,7 @@ fn choice() -> impl Strategy<Value = Choice> {
         (any::<u8>(), 0u8..4).prop_map(|(pick, cause)| Choice::ModelFail(pick, cause)),
         (any::<u8>(), any::<bool>()).prop_map(|(pick, ok)| Choice::ToolDone(pick, ok)),
         any::<u8>().prop_map(Choice::Woke),
+        any::<u8>().prop_map(Choice::Expire),
         Just(Choice::Crash),
     ]
 }
@@ -1507,6 +1598,9 @@ fn event_for(choice: &Choice, seen: &Seen, driver: &Driver) -> Option<Event<Abst
         },
         Choice::Woke(index) => Event::Woke {
             id: pick(&seen.sleeps, *index)?,
+        },
+        Choice::Expire(index) => Event::Expired {
+            id: pick(&seen.tools, *index)?,
         },
         Choice::Crash => return None,
     })

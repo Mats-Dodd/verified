@@ -50,6 +50,8 @@ pub enum Kind {
     Fail,
     ToolDone,
     Woke,
+    /// The shell's deadline for a run passed.
+    Expire,
     OrphanExecute,
     OrphanComplete,
     Duplicate,
@@ -77,6 +79,7 @@ impl Action {
             }) => Kind::Fail,
             Self::Deliver(Event::ToolDone { .. }) => Kind::ToolDone,
             Self::Deliver(Event::Woke { .. }) => Kind::Woke,
+            Self::Deliver(Event::Expired { .. }) => Kind::Expire,
             Self::Execute(_) => Kind::Execute,
             Self::OrphanExecute(_) => Kind::OrphanExecute,
             Self::OrphanComplete(_) => Kind::OrphanComplete,
@@ -220,7 +223,10 @@ fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
                 },
         ),
         Event::Woke { id } => (id, matches!(flight.job, Job::Sleep)),
-        Event::Message { .. } | Event::Approve { .. } | Event::Interrupt { .. } => return false,
+        Event::Message { .. }
+        | Event::Approve { .. }
+        | Event::Interrupt { .. }
+        | Event::Expired { .. } => return false,
     };
     *of == id && admitted
 }
@@ -695,6 +701,8 @@ impl Model for Harness {
                     Event::Interrupt { .. } => {
                         world.interrupts = world.interrupts.saturating_add(1);
                     }
+                    // The run may still report: its flight stays.
+                    Event::Expired { .. } => {}
                     Event::ModelParts { id, .. } => {
                         let Job::Model { batches } = &mut world.flights.get_mut(id)?.job else {
                             return None;

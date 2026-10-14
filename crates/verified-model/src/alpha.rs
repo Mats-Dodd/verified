@@ -126,6 +126,7 @@ pub fn event<P: Payload>(event: &Event<P>) -> Event<Abstract> {
             output: measured(output),
         },
         Event::Woke { id } => Event::Woke { id: *id },
+        Event::Expired { id } => Event::Expired { id: *id },
     }
 }
 

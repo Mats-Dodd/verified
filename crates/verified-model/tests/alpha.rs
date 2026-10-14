@@ -56,6 +56,8 @@ enum Choice {
     Fail(u8, u8),
     ToolDone(u8, u8, u16),
     Woke(u8),
+    /// A run's deadline passes.
+    Expire(u8),
     /// A completion for an effect that never was.
     Stale(u8, u16),
     Crash,
@@ -81,9 +83,10 @@ fn choice() -> impl Strategy<Value = Choice> {
         (any::<u8>(), proptest::collection::vec(call(), 0..4))
             .prop_map(|(pick, calls)| Choice::Finish(pick, calls)),
         (any::<u8>(), 0u8..4).prop_map(|(pick, cause)| Choice::Fail(pick, cause)),
-        (any::<u8>(), 0u8..3, 0u16..900)
+        (any::<u8>(), 0u8..4, 0u16..900)
             .prop_map(|(pick, exit, size)| Choice::ToolDone(pick, exit, size)),
         any::<u8>().prop_map(Choice::Woke),
+        any::<u8>().prop_map(Choice::Expire),
         (0u8..2, any::<u16>()).prop_map(|(kind, seq)| Choice::Stale(kind, seq)),
         Just(Choice::Crash),
     ]
@@ -234,6 +237,9 @@ impl Seen {
             },
             Choice::Woke(index) => Event::Woke {
                 id: pick(&self.sleeps, *index)?,
+            },
+            Choice::Expire(index) => Event::Expired {
+                id: pick(&self.tools, *index)?,
             },
             Choice::Stale(kind, seq) => {
                 let id = EffectId {

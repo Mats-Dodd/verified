@@ -622,7 +622,9 @@ impl Session {
         match input {
             Input::Done(event) => {
                 match &event {
-                    Event::ModelDone { id, .. } | Event::ToolDone { id, .. } => {
+                    Event::ModelDone { id, .. }
+                    | Event::ToolDone { id, .. }
+                    | Event::Expired { id } => {
                         self.cancels.remove(id);
                     }
                     Event::Message { .. }
@@ -1010,6 +1012,7 @@ fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
                 ModelExit::Failed(cause) => ModelExit::Failed(*cause),
             },
         }),
+        Event::Expired { id } => Some(Event::Expired { id: *id }),
         Event::Message { .. }
         | Event::Approve { .. }
         | Event::Interrupt { .. }

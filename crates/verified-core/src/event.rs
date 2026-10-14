@@ -48,6 +48,10 @@ pub enum Event<P: Payload> {
     ToolDone { id: EffectId, exit: Exit, output: Measured<P::Output> },
     /// A `Sleep` effect ended.
     Woke { id: EffectId },
+    /// The deadline of tool run `id` passed: v stops waiting. A timeout is
+    /// v cancelling at a deadline, so a run still unresolved is `Unknown`
+    /// and asked to stop; one that already reported keeps its outcome.
+    Expired { id: EffectId },
 }
 
 } // verus!

@@ -337,7 +337,8 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                 Event::Message { .. }
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
-                | Event::Woke { .. } => {}
+                | Event::Woke { .. }
+                | Event::Expired { .. } => {}
             }
             decided(after, &mut keys);
         }
@@ -466,6 +467,7 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
             | Kind::Fail
             | Kind::ToolDone
             | Kind::Woke
+            | Kind::Expire
             | Kind::Sync
             | Kind::Crash
             | Kind::Read
