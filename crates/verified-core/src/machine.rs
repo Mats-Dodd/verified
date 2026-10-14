@@ -182,8 +182,9 @@ pub enum Turn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
 pub enum Origin {
-    /// A background call (`bash` in the background, `wake`).
-    Call,
+    /// A background call (`bash` in the background, `wake`): its index in
+    /// its turn, so the task runs exactly that call's request.
+    Call { call: CallIx },
     /// A `StopSent`: the stop of a child.
     Stop { child: ActorId },
 }
@@ -198,6 +199,9 @@ pub struct Task {
     pub class: Class,
     pub origin: Origin,
     pub ended: bool,
+    /// A cancel of it was dispatched: it has been signalled (A3), and is
+    /// signalled at most once.
+    pub cancelled: bool,
 }
 
 /// One call as the spec sees it, with how many `Approved` and `Dispatched`
@@ -510,22 +514,42 @@ pub open spec fn carries_fit(stage: Stage, mailbox: Seq<Waiting>, carries: Seq<E
     }
 }
 
+/// `tasks` with every task started by record `seq` marked cancelled.
+pub open spec fn mark_cancelled(tasks: Seq<Task>, seq: u64) -> Seq<Task> {
+    Seq::new(
+        tasks.len(),
+        |at: int| if tasks[at].seq == seq {
+            Task { cancelled: true, ..tasks[at] }
+        } else {
+            tasks[at]
+        },
+    )
+}
+
 /// What a `Dispatched` of call `index` does besides its phase: a background
-/// call starts a task, and a `spawn` names a child.
+/// call starts a task, a `cancel` marks the task it names cancelled, and a
+/// `spawn` names a child.
 pub open spec fn dispatch(view: CoreView, index: int) -> CoreView {
     let shape = view.calls[index].shape;
     CoreView {
-        tasks: if background(shape) {
-            view.tasks.push(
-                Task {
-                    seq: view.seq,
-                    class: class_of(shape->Some_0.tool),
-                    origin: Origin::Call,
-                    ended: false,
-                },
-            )
-        } else {
-            view.tasks
+        tasks: match shape {
+            Some(shape) => if shape.background {
+                view.tasks.push(
+                    Task {
+                        seq: view.seq,
+                        class: class_of(shape.tool),
+                        origin: Origin::Call { call: CallIx(index as usize) },
+                        ended: false,
+                        cancelled: false,
+                    },
+                )
+            } else {
+                match shape.task {
+                    Some(task) => mark_cancelled(view.tasks, task.0),
+                    None => view.tasks,
+                }
+            },
+            None => view.tasks,
         },
         children: match shape {
             Some(shape) => match shape.child {
@@ -808,7 +832,13 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                 CoreView {
                     seq,
                     tasks: view.tasks.push(
-                        Task { seq: view.seq, class: Class::Keyed, origin: Origin::Stop { child }, ended: false },
+                        Task {
+                            seq: view.seq,
+                            class: Class::Keyed,
+                            origin: Origin::Stop { child },
+                            ended: false,
+                            cancelled: false,
+                        },
                     ),
                     ..view
                 },
@@ -882,33 +912,44 @@ pub open spec fn fresh<P: Payload>(start: CoreView, call: ToolCall<Approved, P>)
     call.spec_effect().seq >= start.seq
 }
 
+/// The running turn proceeds and the actor is live: no cancel or stop
+/// revoked what it holds.
+pub open spec fn proceeding(view: CoreView) -> bool {
+    &&& view.turn is Open
+    &&& view.turn->Open_0.intent is Proceed
+    &&& !view.stopped
+}
+
 /// A rerun after recovery: the call was dispatched before the decision, it
-/// is `Safe` (no side effect) or `Keyed` (its target deduplicates it), and
-/// it runs in a new epoch, so its effect id differs from the run it
-/// repeats. An `Unsafe` call never reruns.
+/// is `Safe` (no side effect) or `Keyed` (its target deduplicates it), it
+/// runs in a new epoch, so its effect id differs from the run it repeats,
+/// and its turn still proceeds: nothing reruns under a durable cancel or
+/// stop (A3). An `Unsafe` call never reruns.
 pub open spec fn rerun<P: Payload>(start: CoreView, end: CoreView, call: ToolCall<Approved, P>) -> bool {
     let index = call.spec_call().0 as int;
     &&& call.spec_effect().seq < start.seq
     &&& end.epoch > start.epoch
     &&& end.calls[index].class is Some
     &&& end.calls[index].class != Some(Class::Unsafe)
+    &&& proceeding(end)
 }
 
-/// Task `at` of `end` may run as effect `id`: it is running, started by a
-/// call, and `id` names its starting record in the current epoch; and that
-/// record is one of the decision's own, or (only if `reruns`) the task is
-/// not `Unsafe` and runs again in a new epoch.
+/// Task `at` of `end` may run as effect `id`: it is running and `id`
+/// names its starting record in the current epoch; and that record is one
+/// of the decision's own, or (only if `reruns`) the task is not `Unsafe`,
+/// runs again in a new epoch, and is a stop or belongs to an actor not
+/// stopped (A3).
 pub open spec fn task_runs(start: CoreView, end: CoreView, at: int, id: EffectId, reruns: bool) -> bool {
     &&& 0 <= at < end.tasks.len()
     &&& end.tasks[at].seq == id.seq
     &&& !end.tasks[at].ended
     &&& id.epoch.0 == end.epoch
     &&& (id.seq >= start.seq || (reruns && end.epoch > start.epoch && end.tasks[at].class
-        != Class::Unsafe))
+        != Class::Unsafe && (end.tasks[at].origin is Stop || !end.stopped)))
 }
 
 /// A1 for a tool run: licensed by its call's `Dispatched`, or by a running
-/// task's.
+/// task's, started by that very call.
 pub open spec fn run_ok<P: Payload>(
     start: CoreView,
     end: CoreView,
@@ -917,7 +958,7 @@ pub open spec fn run_ok<P: Payload>(
 ) -> bool {
     ||| (licensed(end, call) && (fresh(start, call) || (reruns && rerun(start, end, call))))
     ||| exists|at: int| #[trigger] task_runs(start, end, at, call.spec_effect(), reruns)
-        && end.tasks[at].origin is Call
+        && end.tasks[at].origin == Origin::Call { call: call.spec_call() }
 }
 
 /// A1 for a stop: licensed by a running stop task for `child`, whose
@@ -1258,7 +1299,7 @@ pub proof fn lemma_actor_keeps<P: Payload>(view: CoreView, record: Record<P>)
                 if let EnvelopeId::Task(task) = ids[at] {
                     assert forall|t: int| 0 <= t < next.tasks.len() && (#[trigger] next.tasks[t]).seq == task.0 implies next.tasks[t].ended by {
                         if t < view.tasks.len() {
-                            assert(view.tasks[t] == next.tasks[t]);
+                            assert(view.tasks[t].seq == next.tasks[t].seq && view.tasks[t].ended == next.tasks[t].ended);
                         }
                     }
                 }
@@ -1437,9 +1478,9 @@ pub struct Corrupt {
 }
 
 /// What a call-started task runs: its call's arguments, kept past its turn
-/// (a `Safe` one reruns after a crash).
+/// (a `Safe` one reruns after a crash). Its call's index is the task's
+/// `Origin`.
 struct TaskRun<P: Payload> {
-    call: CallIx,
     id: CallId,
     args: P::Args,
 }
@@ -1853,6 +1894,13 @@ impl<P: Payload> Plan<P> {
         let ghost tasks = self.scratch.tasks@;
         let ghost task_runs = self.scratch.runs@;
         let ghost from = self.from;
+        // A3: nothing reruns under a durable cancel or stop. `resume`
+        // resolves every call dispatched before the crash when its turn is
+        // cancelled (`resume_tools`), so this only states it.
+        let proceeds = match self.scratch.turn {
+            Turn::Open(open) => matches!(open.intent, Intent::Proceed),
+            Turn::Idle => false,
+        } && !self.scratch.stopped;
         let count = self.scratch.calls.len();
         let mut index: usize = 0;
         while index < count
@@ -1864,10 +1912,11 @@ impl<P: Payload> Plan<P> {
                 self.scratch.runs@ == task_runs,
                 self.from == from,
                 count == self.scratch.calls@.len(),
+                proceeds == proceeding(self.scratch@),
             decreases count - index,
         {
             if let Phase::Dispatched { seq } = self.scratch.calls[index].phase {
-                let run = seq >= self.from || (matches!(runs, Runs::All) && matches!(
+                let run = seq >= self.from || (matches!(runs, Runs::All) && proceeds && matches!(
                     self.scratch.calls[index].class,
                     Some(Class::Safe | Class::Keyed),
                 ));
@@ -1923,17 +1972,19 @@ impl<P: Payload> Plan<P> {
             decreases count - at,
         {
             let task = self.scratch.tasks[at];
+            // A3: a stopped actor's own tasks never rerun; its stops do.
             let run = !task.ended && (task.seq >= self.from || (matches!(runs, Runs::All)
-                && !matches!(task.class, Class::Unsafe)));
+                && !matches!(task.class, Class::Unsafe) && (matches!(task.origin, Origin::Stop { .. })
+                || !self.scratch.stopped)));
             if run {
                 let id = EffectId { epoch: self.scratch.epoch, seq: task.seq };
                 proof {
                     assert(task_runs(self.start@, self.scratch@, at as int, id, reruns));
                 };
                 match task.origin {
-                    Origin::Call => {
+                    Origin::Call { call } => {
                         if let Some(run) = &self.scratch.runs[at] {
-                            let call = effect::approved(run.call, run.id.clone(), run.args.clone(), id);
+                            let call = effect::approved(call, run.id.clone(), run.args.clone(), id);
                             self.start(Effect::RunTool { call }, Ghost(reruns));
                         }
                     },
@@ -1966,6 +2017,28 @@ fn copy_of<T: Copy>(source: &[T]) -> (copy: Vec<T>)
     }
     assert(source@.take(source@.len() as int) =~= source@);
     copy
+}
+
+/// `tasks` with every task started by record `seq` marked cancelled.
+fn marked(tasks: &[Task], seq: u64) -> (marked: Vec<Task>)
+    ensures
+        marked@ == mark_cancelled(tasks@, seq),
+{
+    let mut marked: Vec<Task> = Vec::with_capacity(tasks.len());
+    let mut at: usize = 0;
+    while at < tasks.len()
+        invariant
+            at <= tasks@.len(),
+            marked@ == mark_cancelled(tasks@, seq).take(at as int),
+        decreases tasks@.len() - at,
+    {
+        let task = tasks[at];
+        marked.push(if task.seq == seq { Task { cancelled: true, ..task } } else { task });
+        at += 1;
+        assert(marked@ =~= mark_cancelled(tasks@, seq).take(at as int));
+    }
+    assert(mark_cancelled(tasks@, seq).take(tasks@.len() as int) =~= mark_cancelled(tasks@, seq));
+    marked
 }
 
 /// `source` without its first `count`.
@@ -2131,7 +2204,7 @@ impl<P: Payload> Core<P> {
             decreases self.runs@.len() - at,
         {
             let run = match &self.runs[at] {
-                Some(run) => Some(TaskRun { call: run.call, id: run.id.clone(), args: run.args.clone() }),
+                Some(run) => Some(TaskRun { id: run.id.clone(), args: run.args.clone() }),
                 None => None,
             };
             runs.push(run);
@@ -2381,6 +2454,18 @@ impl<P: Payload> Core<P> {
             at += 1;
         }
         None
+    }
+
+    /// Whether the running task record `seq` started was signalled: a
+    /// cancel of it was dispatched.
+    fn signalled(&self, seq: u64) -> (signalled: bool)
+        requires
+            self.wf(),
+    {
+        match self.running_task(seq) {
+            Some(at) => self.tasks[at].cancelled,
+            None => false,
+        }
     }
 
     /// Whether a stop task for `child` exists.
@@ -2731,7 +2816,6 @@ impl<P: Payload> Core<P> {
     }
 
     /// `apply` of `Dispatched { call }`.
-    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
     fn apply_dispatched(&mut self, call: CallIx) -> (applied: Result<(), Corrupt>)
         requires
             old(self).wf(),
@@ -2766,10 +2850,18 @@ impl<P: Payload> Core<P> {
             if shape.background() {
                 if let Some(args) = &self.calls[index].args {
                     self.tasks.push(
-                        Task { seq: self.seq, class: shape.tool().class(), origin: Origin::Call, ended: false },
+                        Task {
+                            seq: self.seq,
+                            class: shape.tool().class(),
+                            origin: Origin::Call { call },
+                            ended: false,
+                            cancelled: false,
+                        },
                     );
-                    self.runs.push(Some(TaskRun { call, id: self.calls[index].id.clone(), args: args.clone() }));
+                    self.runs.push(Some(TaskRun { id: self.calls[index].id.clone(), args: args.clone() }));
                 }
+            } else if let Some(task) = shape.task() {
+                self.tasks = marked(self.tasks.as_slice(), task.0);
             }
             if let Some(child) = shape.child() {
                 self.children.push(child);
@@ -2901,7 +2993,9 @@ impl<P: Payload> Core<P> {
         proof {
             lemma_actor_keeps(self@, Record::<P>::StopSent { child });
         };
-        self.tasks.push(Task { seq: self.seq, class: Class::Keyed, origin: Origin::Stop { child }, ended: false });
+        self.tasks.push(
+            Task { seq: self.seq, class: Class::Keyed, origin: Origin::Stop { child }, ended: false, cancelled: false },
+        );
         self.runs.push(None);
         self.seq = next;
         Ok(())
@@ -3203,6 +3297,9 @@ impl<P: Payload> Core<P> {
         } else {
             Unstarted::Cancelled
         };
+        // Steering: while a user's message waits, no call waits for the
+        // user; each is denied, and the message lands at the boundary.
+        let steered = mailbox::steers(plan.scratch.mailbox.as_slice());
         let depth = match &plan.scratch.born {
             Some(born) => born.depth,
             None => 0,
@@ -3235,7 +3332,11 @@ impl<P: Payload> Core<P> {
                             Granted::Rule(by) => {
                                 plan.emit(Record::Approved { call: CallIx(index), by });
                             },
-                            Granted::Ask => {},
+                            Granted::Ask => {
+                                if steered {
+                                    plan.resolve(index, Exit::NotStarted(Unstarted::Steered));
+                                }
+                            },
                         }
                     }
                 },
@@ -3333,20 +3434,26 @@ impl<P: Payload> Core<P> {
             plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
             return;
         }
+        // Whether an earlier cancel signalled the task: this `Dispatched`
+        // marks it so.
+        let signalled = match cancel {
+            Some(task) => plan.scratch.signalled(task.0),
+            None => false,
+        };
         plan.emit(Record::Dispatched { call: CallIx(index) });
         if background {
             plan.resolve(index, Exit::Ok);
         } else if let Some(task) = cancel {
-            let hit = Self::cancel_task(plan, task);
+            let hit = Self::cancel_task(plan, task, signalled);
             plan.resolve(index, if hit { Exit::Ok } else { Exit::Failed });
         }
     }
 
     /// The cancel primitive on task `task`: a running `Safe` one (a timer
     /// that has not fired) ends `NotStarted`; a running `Unsafe` one is
-    /// signalled once, and records what comes back. A stop is not
-    /// cancelled. Whether anything was cancelled.
-    fn cancel_task(plan: &mut Plan<P>, task: TaskId) -> (hit: bool)
+    /// signalled, unless it was (`signalled`), and records what comes back.
+    /// A stop is not cancelled. Whether anything was cancelled.
+    fn cancel_task(plan: &mut Plan<P>, task: TaskId, signalled: bool) -> (hit: bool)
         requires
             old(plan).inv(),
         ensures
@@ -3367,19 +3474,20 @@ impl<P: Payload> Core<P> {
                 true
             },
             Class::Unsafe => {
-                let id = plan.id(task.0);
-                plan.effect(Effect::CancelTool { id });
+                if !signalled {
+                    let id = plan.id(task.0);
+                    plan.effect(Effect::CancelTool { id });
+                }
                 true
             },
             Class::Keyed => false,
         }
     }
 
-    /// Steering: a user message arrived while the step waits for approvals.
-    /// Each call still awaiting the user is denied ("the user steered"),
-    /// and the message lands at the step's boundary, once every call has
-    /// resolved.
-    #[verifier::loop_isolation(false)]
+    /// Steering: a user message arrived while the step may wait for
+    /// approvals. `settle` denies each call still awaiting the user ("the
+    /// user steered"), and the message lands at the step's boundary, once
+    /// every call has resolved.
     fn steer(&self, plan: &mut Plan<P>)
         requires
             old(plan).inv(),
@@ -3392,29 +3500,9 @@ impl<P: Payload> Core<P> {
         let Some(open) = plan.open() else {
             return;
         };
-        if !matches!(open.stage, Stage::Tools) || matches!(open.intent, Intent::Cancel) || plan.scratch.stopped {
-            return;
+        if matches!(open.stage, Stage::Tools) && matches!(open.intent, Intent::Proceed) && !plan.scratch.stopped {
+            self.settle(plan);
         }
-        let count = plan.scratch.calls.len();
-        let mut index = open.first_call;
-        while index < count
-            invariant
-                plan.inv(),
-                plan.start == old(plan).start,
-                plan.from == old(plan).from,
-                plan.scratch@.epoch == old(plan).scratch@.epoch,
-                plan.scratch@.turn == Turn::Open(open),
-                plan.scratch@.calls.len() == count,
-                open.first_call <= index,
-            decreases count - index,
-        {
-            assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
-            if matches!(plan.scratch.calls[index].phase, Phase::Proposed) {
-                plan.resolve(index, Exit::NotStarted(Unstarted::Steered));
-            }
-            index += 1;
-        }
-        self.settle(plan);
     }
 
     /// Revokes the running turn `turn`, whose cancel was just recorded:
@@ -3469,8 +3557,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// A stop's part for the actor's tasks: a running `Safe` one (a timer)
-    /// ends `NotStarted`, a running `Unsafe` one is signalled once, and a
-    /// stop already on its way is left to arrive.
+    /// ends `NotStarted`, a running `Unsafe` one is signalled unless a
+    /// cancel signalled it, and a stop already on its way is left to arrive.
     #[verifier::loop_isolation(false)]
     fn stop_tasks(plan: &mut Plan<P>)
         requires
@@ -3499,8 +3587,10 @@ impl<P: Payload> Core<P> {
                 match task.class {
                     Class::Safe => plan.end_task(at, Exit::NotStarted(Unstarted::Stopped)),
                     Class::Unsafe => {
-                        let id = plan.id(task.seq);
-                        plan.effect(Effect::CancelTool { id });
+                        if !task.cancelled {
+                            let id = plan.id(task.seq);
+                            plan.effect(Effect::CancelTool { id });
+                        }
                     },
                     Class::Keyed => {},
                 }
@@ -3649,10 +3739,12 @@ impl<P: Payload> Core<P> {
         if self.stopped {
             return quiet(Outcome::Rejected(Rejection::Stopped));
         }
-        if self.envelopes.len() >= self.limits.messages_per_actor() {
+        // The limit bounds mail, never the stop that ends a runaway actor
+        // (A3): only one stop ever lands.
+        let stop = matches!(envelope.body, Body::Stop);
+        if !stop && self.envelopes.len() >= self.limits.messages_per_actor() {
             return quiet(Outcome::Rejected(Rejection::Limit));
         }
-        let stop = matches!(envelope.body, Body::Stop);
         let user = matches!(envelope.from, Address::User);
         let mut plan = self.plan();
         plan.emit(Record::Delivered { envelope });
@@ -3954,7 +4046,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// A run's deadline passed: v stops waiting, records `Unknown` (it may
-    /// have acted) and signals the run to stop. A run that reported first
+    /// have acted) and signals the run to stop, unless a cancel already did
+    /// (Esc on its turn, a `cancel` of its task). A run that reported first
     /// keeps its outcome: the deadline is stale (H1).
     fn on_expired(&self, id: EffectId) -> (decision: Decision<P>)
         requires
@@ -3964,12 +4057,21 @@ impl<P: Payload> Core<P> {
     {
         let mut plan = self.plan();
         if let Some(index) = Self::running_call(&plan, id) {
+            let signalled = match plan.open() {
+                Some(open) => matches!(open.intent, Intent::Cancel),
+                None => false,
+            };
             plan.resolve(index, Exit::Unknown);
-            plan.effect(Effect::CancelTool { id });
+            if !signalled {
+                plan.effect(Effect::CancelTool { id });
+            }
             self.settle(&mut plan);
         } else if let Some(at) = Self::task_of(&plan, id) {
+            let signalled = plan.scratch.tasks[at].cancelled;
             plan.end_task(at, Exit::Unknown);
-            plan.effect(Effect::CancelTool { id });
+            if !signalled {
+                plan.effect(Effect::CancelTool { id });
+            }
         } else {
             return quiet(Outcome::Stale);
         }
@@ -4075,7 +4177,8 @@ impl<P: Payload> Core<P> {
     /// background call's start (`Ok`: its task is running) and a `cancel`
     /// are the core's own and are done again; every `Unsafe` one is
     /// `Unknown`, and when the turn is being cancelled, the `Safe` and
-    /// `Keyed` ones too.
+    /// `Keyed` ones too, so no call is left dispatched under a cancel (A3:
+    /// nothing reruns under it, and the turn still ends).
     #[verifier::loop_isolation(false)]
     fn resume_tools(plan: &mut Plan<P>)
         requires
@@ -4089,6 +4192,9 @@ impl<P: Payload> Core<P> {
             final(plan).scratch@.turn == old(plan).scratch@.turn,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+            final(plan).scratch@.turn->Open_0.intent is Cancel ==> forall|index: int|
+                0 <= index < final(plan).scratch@.calls.len() ==> !((
+                #[trigger] final(plan).scratch@.calls[index]).phase is Dispatched),
     {
         let Some(open) = plan.open() else {
             return;
@@ -4105,6 +4211,9 @@ impl<P: Payload> Core<P> {
                 plan.scratch@.stopped == old(plan).scratch@.stopped,
                 plan.scratch@.calls.len() == count,
                 open.first_call <= index,
+                resolved(plan.scratch@.calls, 0, open.first_call as int),
+                open.intent is Cancel ==> forall|at: int|
+                    open.first_call <= at < index ==> !((#[trigger] plan.scratch@.calls[at]).phase is Dispatched),
             decreases count - index,
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
@@ -4116,7 +4225,9 @@ impl<P: Payload> Core<P> {
                 if background {
                     plan.resolve(index, Exit::Ok);
                 } else if let Some(task) = cancel {
-                    let hit = Self::cancel_task(plan, task);
+                    // Its durable `Dispatched` marked the task: a run in
+                    // the old epoch is not signalled again.
+                    let hit = Self::cancel_task(plan, task, true);
                     plan.resolve(index, if hit { Exit::Ok } else { Exit::Failed });
                 } else {
                     // It was dispatched, so it may have acted: `NotStarted`
@@ -4139,8 +4250,9 @@ impl<P: Payload> Core<P> {
 
     /// Ends each running task that is not rerun: an `Unsafe` one is
     /// `Unknown` (it may have acted, and never starts again, O1), and a
-    /// `Safe` one of a stopped actor never acts again. The others run again
-    /// (`finish` under `Runs::All`).
+    /// stopped actor's own ones never act again (A3: a timer `NotStarted`).
+    /// The others run again (`finish` under `Runs::All`): a live actor's
+    /// timers, and a stopped one's stops.
     #[verifier::loop_isolation(false)]
     fn resume_tasks(plan: &mut Plan<P>)
         requires
@@ -4151,6 +4263,9 @@ impl<P: Payload> Core<P> {
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
+            final(plan).scratch@.stopped ==> forall|at: int|
+                0 <= at < final(plan).scratch@.tasks.len() && (#[trigger] final(plan).scratch@.tasks[at]).origin is Call
+                    ==> final(plan).scratch@.tasks[at].ended,
     {
         let stopped = plan.scratch.stopped;
         let count = plan.scratch.tasks.len();
@@ -4163,18 +4278,27 @@ impl<P: Payload> Core<P> {
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.stopped == stopped,
                 plan.scratch@.tasks.len() == count,
+                at <= count,
+                stopped ==> forall|other: int|
+                    0 <= other < at && (#[trigger] plan.scratch@.tasks[other]).origin is Call
+                        ==> plan.scratch@.tasks[other].ended,
             decreases count - at,
         {
             let task = plan.scratch.tasks[at];
+            let own = matches!(task.origin, Origin::Call { .. });
             if !task.ended {
                 match task.class {
                     Class::Unsafe => plan.end_task(at, Exit::Unknown),
                     Class::Safe => {
-                        if stopped {
+                        if stopped && own {
                             plan.end_task(at, Exit::NotStarted(Unstarted::Stopped));
                         }
                     },
-                    Class::Keyed => {},
+                    Class::Keyed => {
+                        if stopped && own {
+                            plan.end_task(at, Exit::Unknown);
+                        }
+                    },
                 }
             }
             at += 1;
@@ -4230,7 +4354,6 @@ impl<P: Payload> PartialEq for Call<P> {
 impl<P: Payload> fmt::Debug for TaskRun<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskRun")
-            .field("call", &self.call)
             .field("id", &self.id)
             .field("args", &self.args)
             .finish()
@@ -4239,7 +4362,7 @@ impl<P: Payload> fmt::Debug for TaskRun<P> {
 
 impl<P: Payload> PartialEq for TaskRun<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.call == other.call && self.id == other.id && self.args == other.args
+        self.id == other.id && self.args == other.args
     }
 }
 

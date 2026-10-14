@@ -84,6 +84,22 @@ pub const fn batch(mailbox: &[Waiting]) -> (n: usize)
     n
 }
 
+/// Whether a user's message waits in `mailbox`: it steers a step that
+/// would otherwise wait for approvals.
+#[must_use]
+pub const fn steers(mailbox: &[Waiting]) -> bool {
+    let mut index: usize = 0;
+    while index < mailbox.len()
+        decreases mailbox@.len() - index,
+    {
+        if mailbox[index].user {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// The ids of the first `n` envelopes of `mailbox`, and what they add to
 /// the conversation (saturating: past `u64` is past any context bound).
 #[must_use]

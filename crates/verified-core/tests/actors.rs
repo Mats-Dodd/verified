@@ -508,6 +508,73 @@ fn cancel_revokes_a_task() {
     );
 }
 
+/// A3: a running task is signalled once: a repeated `cancel` of it, a stop
+/// or its deadline after the cancel signal nothing more.
+#[test]
+fn a_task_is_signalled_once() {
+    let mut driver = Driver::new();
+    let effects = proposing(&mut driver, vec![background("bg")]);
+    let bash = run_of(&effects, "bg");
+    let cancel = |name: &str| {
+        call(
+            name,
+            Shape::Cancel {
+                task: TaskId(bash.seq),
+            },
+        )
+    };
+    driver.finish(
+        model_call(&effects),
+        vec![cancel("first"), cancel("second")],
+    );
+    let signal = Effect::CancelTool { id: bash };
+    assert!(
+        driver.approve("first").contains(&signal),
+        "the first cancel signals the command"
+    );
+    let effects = driver.approve("second");
+    assert!(
+        !effects.contains(&signal),
+        "a repeated cancel signals nothing: {effects:?}"
+    );
+    assert!(
+        driver.log.contains(&Record::ToolResult {
+            call: CallIx(2),
+            exit: Exit::Ok,
+            output: None
+        }),
+        "the command is being cancelled"
+    );
+    let (_, effects) = driver.send(stop(9));
+    assert!(!effects.contains(&signal), "nor does a stop: {effects:?}");
+    let (_, effects) = driver.send(Event::Expired { id: bash });
+    assert!(!effects.contains(&signal), "nor its deadline: {effects:?}");
+}
+
+/// A3: a call is signalled once: its deadline after Esc signalled it
+/// records `Unknown` and signals nothing more.
+#[test]
+fn a_deadline_after_esc_signals_nothing_more() {
+    let mut driver = Driver::new();
+    let call = driver.start();
+    let effects = driver.finish(call, vec![read("read")]);
+    let read = run_of(&effects, "read");
+    let (_, effects) = driver.send(Event::Interrupt { turn: TurnId(3) });
+    let signal = Effect::CancelTool { id: read };
+    assert!(effects.contains(&signal), "Esc signals the read");
+    let (outcome, effects) = driver.send(Event::Expired { id: read });
+    assert_eq!(outcome, Outcome::Accepted, "the deadline is live");
+    assert!(!effects.contains(&signal), "signalled once: {effects:?}");
+    assert!(
+        driver.log.contains(&Record::ToolResult {
+            call: CallIx(0),
+            exit: Exit::Unknown,
+            output: None
+        }),
+        "it may have acted"
+    );
+}
+
 /// O1, H1: after a crash a running `Unsafe` task ends `Unknown` and never
 /// runs again; a `Safe` one (a timer) runs again under the same seq.
 #[test]
@@ -666,6 +733,66 @@ fn a_user_message_denies_waiting_approvals() {
         ],
         "the message lands after every result of the step"
     );
+}
+
+/// Steering survives a crash: one torn after the message's `Delivered` is
+/// finished on resume, so the approval it denies is not asked again.
+#[test]
+fn a_torn_steer_is_finished_on_resume() {
+    let mut driver = Driver::new();
+    let call = driver.start();
+    driver.finish(call, vec![edit("edit")]);
+    let decision = driver.core.decide(user(2));
+    let delivered = decision
+        .records
+        .first()
+        .cloned()
+        .expect("the message's record");
+    driver.core.apply(&delivered).expect("applies");
+    driver.log.push(delivered);
+    let from = driver.log.len();
+    let effects = driver.crash();
+    assert!(
+        driver.since(from).contains(&Record::ToolResult {
+            call: CallIx(0),
+            exit: Exit::NotStarted(Unstarted::Steered),
+            output: None
+        }),
+        "the edit is denied: the user steered"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::AskApproval { .. })),
+        "and not asked again: {effects:?}"
+    );
+    assert!(has_model_call(&effects), "the message lands at once");
+}
+
+/// Steering: a user message that arrives during the model call denies the
+/// approvals its step then waits for, as one arriving during the wait does.
+#[test]
+fn a_message_during_the_model_call_steers_its_step() {
+    let mut driver = Driver::new();
+    let call = driver.start();
+    driver.send(user(2));
+    let from = driver.log.len();
+    let effects = driver.finish(call, vec![edit("edit")]);
+    assert!(
+        driver.since(from).contains(&Record::ToolResult {
+            call: CallIx(0),
+            exit: Exit::NotStarted(Unstarted::Steered),
+            output: None
+        }),
+        "the edit is denied: the user steered"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::AskApproval { .. })),
+        "nothing waits on the user: {effects:?}"
+    );
+    assert!(has_model_call(&effects), "and the message is carried next");
 }
 
 /// L4: an envelope is consumed when a model call carrying it starts, not
@@ -861,6 +988,59 @@ fn a_torn_stop_is_finished_on_resume() {
     assert!(runs(&effects).is_empty(), "nothing reruns under a stop");
 }
 
+/// A3: a stop lands whatever the actor holds: the message limit bounds
+/// mail, never the stop that ends a runaway actor.
+#[test]
+fn a_stop_lands_at_the_message_limit() {
+    let mut driver = Driver::new();
+    for seq in 1..=8u64 {
+        assert_eq!(
+            driver.send(agent(seq)).0,
+            Outcome::Accepted,
+            "message {seq}"
+        );
+    }
+    assert_eq!(
+        driver.send(agent(9)).0,
+        Outcome::Rejected(Rejection::Limit),
+        "mail past the limit is refused"
+    );
+    assert_eq!(
+        driver.send(stop(100)).0,
+        Outcome::Accepted,
+        "the stop lands"
+    );
+    assert!(driver.core.stopped(), "and the actor is stopped");
+}
+
+/// A3: after a crash a stopped actor starts nothing of its own again: a
+/// timer it held ends `NotStarted` and never reruns.
+#[test]
+fn a_crash_after_a_stop_reruns_no_timer() {
+    let mut driver = Driver::new();
+    let effects = proposing(&mut driver, vec![call("wake", Shape::Wake)]);
+    let wake = run_of(&effects, "wake");
+    let decision = driver.core.decide(stop(9));
+    let delivered = decision
+        .records
+        .first()
+        .cloned()
+        .expect("the stop's record");
+    driver.core.apply(&delivered).expect("applies");
+    driver.log.push(delivered);
+    let from = driver.log.len();
+    let effects = driver.crash();
+    assert!(
+        driver.since(from).contains(&Record::TaskEnded {
+            task: TaskId(wake.seq),
+            exit: Exit::NotStarted(Unstarted::Stopped),
+            output: None
+        }),
+        "the timer never fires"
+    );
+    assert!(runs(&effects).is_empty(), "nothing reruns: {effects:?}");
+}
+
 /// Limits: a spawn past `depth` does not start.
 #[test]
 fn spawns_are_bounded_by_depth() {
@@ -909,6 +1089,35 @@ fn a_keyed_call_reruns_with_its_key() {
     let (after, _, rekey) = runs(&effects).into_iter().next().expect("it runs again");
     assert_eq!(after.epoch, Epoch(1), "in the new epoch");
     assert_eq!(rekey, key, "under the same key");
+}
+
+/// O2 and A3: a `Keyed` call whose turn was cancelled before a crash is
+/// not sent again: it resolves `Unknown` (it may have taken effect once).
+#[test]
+fn a_keyed_call_cancelled_before_a_crash_resolves_unknown() {
+    let mut driver = Driver::new();
+    let send = call(
+        "send",
+        Shape::Send {
+            subject: b"peer".to_vec(),
+        },
+    );
+    proposing(&mut driver, vec![send]);
+    driver.send(Event::Interrupt { turn: TurnId(3) });
+    let from = driver.log.len();
+    let effects = driver.crash();
+    assert!(
+        driver.since(from).contains(&Record::ToolResult {
+            call: CallIx(0),
+            exit: Exit::Unknown,
+            output: None
+        }),
+        "it may have been delivered"
+    );
+    assert!(
+        runs(&effects).is_empty(),
+        "and is not sent again: {effects:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
