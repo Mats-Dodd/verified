@@ -1425,19 +1425,13 @@ impl Session {
                     reply_to: None,
                     body: Body::Stop,
                 };
-                let (registry, actor) = (self.registry.clone(), self.id);
-                let inbox = self.inbox.clone();
-                let spawn = self.spawning.get(&child).cloned();
-                self.seams.tasks.spawn(async move {
-                    if let Some(spawn) = spawn {
-                        spawn.cancelled().await;
-                    }
-                    barrier(Barrier::Delivering { actor, id }).await;
-                    let (exit, said) = outbox::stop(&registry, envelope).await;
-                    barrier(Barrier::Delivered { actor, id }).await;
-                    let output = measure(ToolOutput::complete(said));
-                    report(&inbox, Event::ToolDone { id, exit, output }).await;
-                });
+                let after = self.spawning.get(&child).cloned();
+                self.send_out(
+                    id,
+                    Outbound::Send { envelope },
+                    after,
+                    CancellationToken::new(),
+                );
             }
         }
     }
@@ -1511,22 +1505,39 @@ impl Session {
                 if let ToolArgs::Spawn { child, .. } = call.args() {
                     self.spawning.insert(*child, done.clone());
                 }
-                let (registry, actor) = (self.registry.clone(), self.id);
-                let inbox = self.inbox.clone();
-                self.seams.tasks.spawn(async move {
-                    barrier(Barrier::Delivering { actor, id }).await;
-                    let (exit, said) = outbox::deliver(&registry, work).await;
-                    done.cancel();
-                    barrier(Barrier::Delivered { actor, id }).await;
-                    let output = measure(ToolOutput::complete(said));
-                    report(&inbox, Event::ToolDone { id, exit, output }).await;
-                });
+                self.send_out(id, work, None, done);
             }
             ToolArgs::Cancel { .. } => defect("the core does a `cancel` itself"),
         }
         if let Some(after) = deadline {
             self.arm(id, after);
         }
+    }
+
+    /// Runs delivery `work` for effect `id` as its own task: once `after`
+    /// (a spawn of the same child in flight) is done, between the two
+    /// barriers, cancelling `done` once it has landed. A session's loop
+    /// never awaits it (B1).
+    fn send_out(
+        &self,
+        id: EffectId,
+        work: Outbound,
+        after: Option<CancellationToken>,
+        done: CancellationToken,
+    ) {
+        let (registry, actor) = (self.registry.clone(), self.id);
+        let inbox = self.inbox.clone();
+        self.seams.tasks.spawn(async move {
+            if let Some(after) = after {
+                after.cancelled().await;
+            }
+            barrier(Barrier::Delivering { actor, id }).await;
+            let (exit, said) = outbox::deliver(&registry, work).await;
+            done.cancel();
+            barrier(Barrier::Delivered { actor, id }).await;
+            let output = measure(ToolOutput::complete(said));
+            report(&inbox, Event::ToolDone { id, exit, output }).await;
+        });
     }
 
     /// What a `send` or `spawn` call delivers. The envelope's id is minted

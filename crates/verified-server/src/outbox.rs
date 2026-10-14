@@ -20,15 +20,16 @@
 //! meets, it is never `NotStarted` (H2).
 
 use verified_core::{Outcome, Rejection};
-use verified_domain::{Address, Born, Envelope, Exit, Unstarted};
+use verified_domain::{Address, Body, Born, Envelope, Exit, Unstarted};
 
 use crate::daemon::{CreateError, Registry};
 use crate::payload::Parsed;
 
-/// A `send` or `spawn` to deliver.
+/// A `send`, a `spawn` or a stop to deliver.
 #[derive(Debug)]
 pub(crate) enum Outbound {
-    /// A message for an actor's mailbox.
+    /// An envelope for an actor's mailbox: a message, or a stop
+    /// (`Body::Stop`).
     Send { envelope: Envelope<Parsed> },
     /// A message for you: you read it in the sender's own log, where its
     /// call already is.
@@ -75,20 +76,32 @@ fn lost() -> (Exit, String) {
     )
 }
 
-/// Delivers a `send` or a `spawn`.
+/// Delivers a `send`, a `spawn` or a stop. A stop finds its child born:
+/// the shell holds it until its parent's spawn of that child, if one is in
+/// flight, has landed, and a child a crash left unborn can never be born
+/// (its parent, stopped, reruns no spawn) and so never acts.
 pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, String) {
     match work {
         Outbound::ToUser => (Exit::Ok, "delivered to user".to_owned()),
         Outbound::Send { envelope } => {
             let to = envelope.to;
+            let stop = matches!(envelope.body, Body::Stop);
             let Some(handle) = registry.lookup(to).await else {
+                let not = if stop { "not stopped" } else { "not delivered" };
                 return (
                     Exit::NotStarted(Unstarted::Refused),
-                    format!("not delivered: there is no actor {to}"),
+                    format!("{not}: there is no actor {to}"),
                 );
             };
+            let said = if stop {
+                format!("stopped {to}")
+            } else {
+                format!("delivered to {to}")
+            };
             match handle.deliver(envelope).await {
-                Ok(outcome) => landed(outcome, &format!("delivered to {to}")),
+                // A child already stopped is stopped: the stop took effect.
+                Ok(Outcome::Rejected(Rejection::Stopped)) if stop => (Exit::Ok, said),
+                Ok(outcome) => landed(outcome, &said),
                 Err(_gone) => lost(),
             }
         }
@@ -142,26 +155,5 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
                 Err(_gone) => lost(),
             }
         }
-    }
-}
-
-/// Delivers a stop to a child. A child already stopped is stopped: the
-/// stop took effect. The shell holds a stop until its parent's spawn of
-/// that child, if one is in flight, has landed, so a child is never unborn
-/// here while a spawn may still birth it; one a crash left unborn can never
-/// be born (its parent, stopped, reruns no spawn) and so never acts.
-pub(crate) async fn stop(registry: &Registry, envelope: Envelope<Parsed>) -> (Exit, String) {
-    let child = envelope.to;
-    let Some(handle) = registry.lookup(child).await else {
-        return (
-            Exit::NotStarted(Unstarted::Refused),
-            format!("not stopped: there is no actor {child}"),
-        );
-    };
-    let stopped = format!("stopped {child}");
-    match handle.deliver(envelope).await {
-        Ok(Outcome::Rejected(Rejection::Stopped)) => (Exit::Ok, stopped),
-        Ok(outcome) => landed(outcome, &stopped),
-        Err(_gone) => lost(),
     }
 }
