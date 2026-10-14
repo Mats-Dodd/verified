@@ -7,8 +7,8 @@
 //!   (`TigerBeetle`), a conflicting repeat is a 409 rejection. A message is
 //!   answered once it is durably in the actor's mailbox; to a busy actor it
 //!   steers the running turn.
-//! - `GET /actors`: every born actor, with who waits for the user; `GET
-//!   /actors/{id}/tasks`: the actor's tasks. Both read the actors' logs.
+//! - `GET /actors`: every born actor, with who waits for the user and how
+//!   many tasks run, from each actor's live session.
 //! - `GET /actors/{id}/stream?offset=…`: SSE from the offset, then every
 //!   append, each read followed by a `control` event (Durable Streams §5.8);
 //!   closed after `ServerLimits::sse_lifetime` so clients reconnect from the
