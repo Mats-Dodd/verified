@@ -379,7 +379,6 @@ impl futures_core::Stream for Chunks {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -391,7 +390,7 @@ mod tests {
 
     use super::{Slots, follow};
     use crate::daemon;
-    use crate::env::LocalEnv;
+    use crate::env::NoEnv;
     use crate::limits::ServerLimits;
     use crate::log::{MemDisk, MemLogStore};
     use crate::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
@@ -422,11 +421,7 @@ mod tests {
                 )
                 .expect("a client"),
             ),
-            env: Arc::new(LocalEnv::new(
-                PathBuf::from("."),
-                Arc::clone(&clock),
-                tasks.groups().clone(),
-            )),
+            env: Arc::new(NoEnv),
             clock: Arc::clone(&clock),
             entropy: Arc::new(OsEntropy),
             tasks: tasks.clone(),

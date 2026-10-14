@@ -52,8 +52,8 @@ use verified_core::{
 };
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_domain::{
-    ActorName, Address, Body, Born, EffectId, Envelope, EnvelopeId, Exit, Grant, Measured, Millis,
-    ModelFault, Proposal, Record, Tool, TurnOutcome, Unstarted, named,
+    Address, Body, Born, EffectId, Envelope, EnvelopeId, Exit, Grant, Measured, Millis, ModelFault,
+    Proposal, Record, Tool, TurnOutcome, Unstarted, named,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -62,12 +62,14 @@ use verified_wire::command::{
 };
 use verified_wire::stream::{Freshness, Offset, encode_chunks};
 
+use crate::daemon::Registry;
 use crate::defect;
 use crate::env::Env;
 use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
 use crate::model::Model;
+use crate::outbox::{self, Outbound};
 use crate::payload::{Boundary, ModelPart, Parsed, ToolArgs, ToolOutput, measure, proposal};
 use crate::projection::Projector;
 use crate::rules_file;
@@ -130,6 +132,19 @@ pub enum Planted {
     /// for good.
     #[cfg(feature = "sim")]
     NoDeadline,
+    /// Acknowledge a delivery before its `Delivered` is durable (breaks L3
+    /// and O2): a sender may record `Ok` for an envelope its recipient
+    /// never holds.
+    #[cfg(feature = "sim")]
+    AckBeforeAppend,
+    /// Mint a fresh envelope id when a `Keyed` call is run again after a
+    /// crash (breaks O2): the recipient takes it twice.
+    #[cfg(feature = "sim")]
+    FreshKeyOnResume,
+    /// Deliver a `send` or `spawn` before its `Dispatched` is durable
+    /// (breaks A1 between logs).
+    #[cfg(feature = "sim")]
+    DeliverBeforePersist,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -168,6 +183,14 @@ pub struct StreamRead {
 type Reply<T> = oneshot::Sender<Result<T, Rejection>>;
 
 enum Input {
+    Deliver {
+        envelope: Envelope<Parsed>,
+        reply: oneshot::Sender<Outcome>,
+    },
+    Born {
+        born: Born,
+        reply: oneshot::Sender<Outcome>,
+    },
     Message {
         command: SendMessage,
         reply: Reply<SendMessageReply>,
@@ -299,7 +322,7 @@ impl Drop for CommittedWriter {
 
 /// How the rest of the daemon talks to one session.
 #[derive(Clone)]
-pub struct SessionHandle {
+pub struct ActorHandle {
     session: ActorId,
     inbox: mpsc::Sender<Input>,
     committed: Committed,
@@ -307,19 +330,58 @@ pub struct SessionHandle {
     followers: Arc<Semaphore>,
 }
 
-impl fmt::Debug for SessionHandle {
+/// The name the HTTP routes still use for an actor's handle.
+pub type SessionHandle = ActorHandle;
+
+impl fmt::Debug for ActorHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SessionHandle")
+            .debug_struct("ActorHandle")
             .field("session", &self.session)
             .finish_non_exhaustive()
     }
 }
 
-impl SessionHandle {
+impl ActorHandle {
     #[must_use]
     pub const fn session(&self) -> ActorId {
         self.session
+    }
+
+    /// Delivers `envelope` to this actor's mailbox, answered once its
+    /// `Delivered` is durable (L3): `Accepted`, `Exists` for an id it
+    /// already holds (O2), or why it was refused. A full log refuses it as
+    /// `Rejected(Limit)`.
+    ///
+    /// # Errors
+    /// The actor is gone (the daemon is stopping).
+    pub async fn deliver(&self, envelope: Envelope<Parsed>) -> Result<Outcome, Unavailable> {
+        self.ask(|reply| Input::Deliver { envelope, reply }).await
+    }
+
+    /// Records who this actor is, answered once it is durable: `Accepted`,
+    /// `Exists` once it is born, or why not.
+    ///
+    /// # Errors
+    /// The actor is gone (the daemon is stopping).
+    pub async fn born(&self, born: Born) -> Result<Outcome, Unavailable> {
+        self.ask(|reply| Input::Born { born, reply }).await
+    }
+
+    /// Your stop: revokes everything this actor holds, and stops every
+    /// actor it spawned (A3). `Exists` on a repeat of `stop`.
+    ///
+    /// # Errors
+    /// The actor is gone (the daemon is stopping).
+    pub async fn stop(&self, stop: MessageId) -> Result<Outcome, Unavailable> {
+        self.deliver(Envelope {
+            id: EnvelopeId::User(stop),
+            from: Address::User,
+            to: self.session,
+            reply_to: None,
+            body: Body::Stop,
+        })
+        .await
     }
 
     async fn ask<T, F>(&self, make: F) -> Result<T, Unavailable>
@@ -401,6 +463,11 @@ pub struct Session {
     config: Arc<ShellConfig>,
     inbox: mpsc::Sender<Input>,
     committed: CommittedWriter,
+    /// Who the actor is, for its first resume to record (a new log); `None`
+    /// for one recovered at boot.
+    born: Option<Born>,
+    /// Where deliveries to other actors go.
+    registry: Registry,
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// The deadline of each run in flight (B2): cancelled when it reports.
     deadlines: BTreeMap<EffectId, CancellationToken>,
@@ -444,9 +511,11 @@ impl Session {
         session: ActorId,
         log: Box<dyn Log>,
         records: Vec<Record<Parsed>>,
+        born: Option<Born>,
+        registry: Registry,
         seams: Seams,
         config: Arc<ShellConfig>,
-    ) -> Result<(SessionHandle, Running), ShellError> {
+    ) -> Result<(ActorHandle, Running), ShellError> {
         let core =
             Core::recover(config.limits.core.clone(), &records).map_err(ShellError::Corrupt)?;
         let mut projector = Projector::new(config.model.clone());
@@ -461,7 +530,7 @@ impl Session {
         }
         let (inbox, receiver) = mpsc::channel(config.limits.session_inbox);
         let (committed, writer) = Committed::new(core.seq());
-        let handle = SessionHandle {
+        let handle = ActorHandle {
             session,
             inbox: inbox.clone(),
             committed,
@@ -478,6 +547,8 @@ impl Session {
             config,
             inbox,
             committed: writer,
+            born,
+            registry,
             cancels: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             held_bytes,
@@ -505,11 +576,10 @@ impl Session {
     }
 
     async fn resume(&mut self) -> Result<Persisted, ShellError> {
-        // Who the actor is is recorded once, at the first boot: a root
-        // actor named `main`, offered the tools the shell runs. The rules
-        // file is read at every boot.
+        // Who the actor is is recorded at its first resume; the rules file
+        // is read at every boot.
         let load = self.rules_changed().await;
-        let resumed = self.core.resume(Some(born(self.id)), load);
+        let resumed = self.core.resume(self.born.take(), load);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Resumed {
             records: resumed.records.clone(),
@@ -539,6 +609,14 @@ impl Session {
             if self.config.planted == Planted::RunBeforePersist {
                 for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
                 {
+                    self.start_effect(run);
+                }
+            }
+            if self.config.planted == Planted::DeliverBeforePersist {
+                for run in effects.extract_if(.., |effect| {
+                    matches!(effect, Effect::RunTool { call }
+                        if matches!(call.args(), ToolArgs::Send { .. } | ToolArgs::Spawn { .. }))
+                }) {
                     self.start_effect(run);
                 }
             }
@@ -690,6 +768,47 @@ impl Session {
                 if let Persisted::Done(_, effects) = self.decide(event).await? {
                     self.start_effects(effects);
                 }
+            }
+            Input::Deliver { envelope, reply } => {
+                // Your messages are read with the rules file as it is then.
+                let yours = matches!(
+                    (&envelope.from, &envelope.body),
+                    (Address::User, Body::Text(_))
+                );
+                if yours
+                    && let Some(Loaded { rules, file }) = self.rules_changed().await
+                    && let Persisted::Refused = self.decide(Event::Rules { rules, file }).await?
+                {
+                    answer(reply, Outcome::Rejected(CoreRejection::Limit));
+                    return Ok(());
+                }
+                // The planted defect: acknowledge before the append.
+                #[cfg(feature = "sim")]
+                let reply = if self.config.planted == Planted::AckBeforeAppend {
+                    answer(reply, Outcome::Accepted);
+                    None
+                } else {
+                    Some(reply)
+                };
+                #[cfg(not(feature = "sim"))]
+                let reply = Some(reply);
+                let (outcome, effects) = match self.decide(Event::Deliver { envelope }).await? {
+                    Persisted::Done(outcome, effects) => (outcome, effects),
+                    // A full log takes no mail: the sender hears a limit.
+                    Persisted::Refused => (Outcome::Rejected(CoreRejection::Limit), Vec::new()),
+                };
+                if let Some(reply) = reply {
+                    answer(reply, outcome);
+                }
+                self.start_effects(effects);
+            }
+            Input::Born { born, reply } => {
+                let (outcome, effects) = match self.decide(Event::Born { born }).await? {
+                    Persisted::Done(outcome, effects) => (outcome, effects),
+                    Persisted::Refused => (Outcome::Rejected(CoreRejection::Limit), Vec::new()),
+                };
+                answer(reply, outcome);
+                self.start_effects(effects);
             }
             Input::Message { command, reply } => {
                 if self.full.is_some() {
@@ -1032,15 +1151,25 @@ impl Session {
                     report(&inbox, Event::Woke { id }).await;
                 });
             }
-            Effect::Stop { id, .. } => {
-                // No actor spawns another yet, so there is no child to
-                // deliver to: the stop is refused, and says so.
+            Effect::Stop { id, child } => {
+                let envelope = Envelope {
+                    id: EnvelopeId::Minted {
+                        actor: self.id,
+                        seq: id.seq,
+                    },
+                    from: Address::Runtime,
+                    to: child,
+                    reply_to: None,
+                    body: Body::Stop,
+                };
+                let registry = self.registry.clone();
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
-                    let output = measure(ToolOutput::complete("no such actor".to_owned()));
-                    let exit = Exit::NotStarted(Unstarted::Refused);
+                    let (exit, said) = outbox::stop(&registry, envelope).await;
+                    let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
+                self.arm(id, self.config.limits.deliver_deadline);
             }
         }
     }
@@ -1101,11 +1230,12 @@ impl Session {
                 });
             }
             ToolArgs::Spawn { .. } | ToolArgs::Send { .. } => {
-                // No delivery between actors yet: refused, and says so.
+                let work = self.outbound(&call);
+                let registry = self.registry.clone();
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
-                    let output = measure(ToolOutput::complete("no such actor".to_owned()));
-                    let exit = Exit::NotStarted(Unstarted::Refused);
+                    let (exit, said) = outbox::deliver(&registry, work).await;
+                    let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
             }
@@ -1113,6 +1243,75 @@ impl Session {
         }
         if let Some(after) = deadline {
             self.arm(id, after);
+        }
+    }
+
+    /// What a `send` or `spawn` call delivers. The envelope's id is minted
+    /// from the call's key, the seq of its durable `Dispatched`, so a rerun
+    /// after a crash delivers the same id and lands once (O2).
+    fn outbound(&self, call: &ToolCall<Approved, Parsed>) -> Outbound {
+        let key = call.key();
+        // The planted defect: a rerun mints a fresh id, as if the key were
+        // not durable.
+        #[cfg(feature = "sim")]
+        let key = if self.config.planted == Planted::FreshKeyOnResume {
+            key.saturating_add(call.effect().epoch.0.saturating_mul(1 << 32))
+        } else {
+            key
+        };
+        let id = EnvelopeId::Minted {
+            actor: self.id,
+            seq: key,
+        };
+        let from = Address::Actor(self.id);
+        match call.args() {
+            ToolArgs::Send { to, text, reply_to } => match to {
+                // You read what an actor sends you in its own log.
+                Address::User => Outbound::ToUser,
+                Address::Actor(recipient) => Outbound::Send {
+                    envelope: Envelope {
+                        id,
+                        from,
+                        to: *recipient,
+                        reply_to: *reply_to,
+                        body: Body::Text(measure(text.clone())),
+                    },
+                },
+                Address::Runtime => defect("the boundary refuses a send to v"),
+            },
+            ToolArgs::Spawn {
+                name,
+                tools,
+                prompt,
+                child,
+            } => {
+                let depth = self
+                    .core
+                    .born()
+                    .map_or(0, |born| born.depth.saturating_add(1));
+                Outbound::Spawn {
+                    born: Born {
+                        actor: *child,
+                        name: name.clone(),
+                        parent: Some(self.id),
+                        depth,
+                        tools: tools.clone(),
+                    },
+                    prompt: Envelope {
+                        id,
+                        from,
+                        to: *child,
+                        reply_to: Some(from),
+                        body: Body::Text(measure(prompt.clone())),
+                    },
+                }
+            }
+            ToolArgs::Read { .. }
+            | ToolArgs::Edit { .. }
+            | ToolArgs::Bash { .. }
+            | ToolArgs::Wake { .. }
+            | ToolArgs::Tasks
+            | ToolArgs::Cancel { .. } => defect("only a send or a spawn is delivered"),
         }
     }
 
@@ -1200,23 +1399,6 @@ fn tasks(records: &[Record<Parsed>]) -> String {
         .join("\n")
 }
 
-/// Who a session's actor is: a root actor the user made, named `main`,
-/// offered the tools the shell runs.
-fn born(actor: ActorId) -> Born {
-    Born::root(
-        actor,
-        ActorName::parse("main").unwrap_or_else(|_name| defect("`main` is an actor name")),
-        vec![
-            Tool::Read,
-            Tool::Edit,
-            Tool::Bash,
-            Tool::Wake,
-            Tool::Tasks,
-            Tool::Cancel,
-        ],
-    )
-}
-
 /// A decision the log refused, as the simulation sees it too.
 #[cfg_attr(
     not(feature = "sim"),
@@ -1247,6 +1429,12 @@ fn unknown_as_not_started(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed
         }
     }
     records
+}
+
+/// Answers a delivery or a birth. An asker that went away (a stopping
+/// daemon) needs no answer.
+fn answer(reply: oneshot::Sender<Outcome>, outcome: Outcome) {
+    let _gone: Result<(), Outcome> = reply.send(outcome);
 }
 
 /// Sends a completion to the shell. A gone shell means the daemon is

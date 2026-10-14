@@ -1253,52 +1253,116 @@ async fn eventually_refused(handle: &SessionHandle) -> Option<CommandError> {
     None
 }
 
-/// Logs that refuse every group dispatching a call, as a disk filling at
-/// that moment would: the first refusal comes exactly where the next act
-/// would.
-#[derive(Debug)]
-struct RefusingStore(MemLogStore);
+/// What a [`Watched`] log does with a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Act {
+    Append,
+    /// Refuse it, as a full disk would.
+    Refuse,
+    /// Never return: the daemon is stuck there until it crashes.
+    Stall,
+    /// Append it after a while.
+    Slow,
+}
 
-#[derive(Debug)]
-struct RefusingLog(Box<dyn Log>);
+type Rule = Arc<dyn Fn(ActorId, &[Record<Parsed>]) -> Act + Send + Sync>;
 
-#[async_trait]
-impl Log for RefusingLog {
-    fn next_seq(&self) -> u64 {
-        self.0.next_seq()
+/// One durable group, in the order groups became durable across logs.
+type Order = Arc<std::sync::Mutex<Vec<(ActorId, u64, Vec<Record<Parsed>>)>>>;
+
+/// Logs on a [`MemDisk`] whose groups `rule` may refuse, stall or slow,
+/// recording the order every group became durable in, across actors.
+struct Watched {
+    inner: MemLogStore,
+    rule: Rule,
+    order: Order,
+}
+
+impl core::fmt::Debug for Watched {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("Watched").finish_non_exhaustive()
+    }
+}
+
+impl Watched {
+    fn new(disk: &MemDisk, limits: &ServerLimits, rule: Rule) -> (Arc<Self>, Order) {
+        let order = Order::default();
+        let store = Arc::new(Self {
+            inner: MemLogStore::new(disk.clone(), limits.log_line_bytes, limits.log_file_bytes),
+            rule,
+            order: Arc::clone(&order),
+        });
+        (store, order)
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
-        if records
-            .iter()
-            .any(|record| matches!(record, Record::Dispatched { .. }))
-        {
-            return Err(LogError::Full {
-                path: "refusing".to_owned(),
-                length: 0,
-                limit: 0,
-            });
-        }
-        self.0.append(records).await
+    fn wrap(&self, actor: ActorId, log: Box<dyn Log>) -> Box<dyn Log> {
+        Box::new(WatchedLog {
+            actor,
+            inner: log,
+            rule: Arc::clone(&self.rule),
+            order: Arc::clone(&self.order),
+        })
+    }
+}
+
+struct WatchedLog {
+    actor: ActorId,
+    inner: Box<dyn Log>,
+    rule: Rule,
+    order: Order,
+}
+
+impl core::fmt::Debug for WatchedLog {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("WatchedLog").finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl LogStore for RefusingStore {
+impl Log for WatchedLog {
+    fn next_seq(&self) -> u64 {
+        self.inner.next_seq()
+    }
+
+    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
+        match (self.rule)(self.actor, records) {
+            Act::Append => {}
+            Act::Refuse => {
+                return Err(LogError::Full {
+                    path: "watched".to_owned(),
+                    length: 0,
+                    limit: 0,
+                });
+            }
+            Act::Stall => core::future::pending::<()>().await,
+            Act::Slow => SystemClock.sleep(Millis::new(200)).await,
+        }
+        let first = self.inner.next_seq();
+        self.inner.append(records).await?;
+        self.order
+            .lock()
+            .expect("unpoisoned")
+            .push((self.actor, first, records.to_vec()));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LogStore for Watched {
     async fn list(&self) -> Result<Vec<ActorId>, LogError> {
-        self.0.list().await
+        self.inner.list().await
     }
 
     async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
-        Ok(Box::new(RefusingLog(self.0.create(session).await?)))
+        Ok(self.wrap(session, self.inner.create(session).await?))
     }
 
     async fn open(
         &self,
         session: ActorId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
-        let (log, records) = self.0.open(session).await?;
-        Ok((Box::new(RefusingLog(log)), records))
+        let (log, records) = self.inner.open(session).await?;
+        Ok((self.wrap(session, log), records))
     }
 }
 
@@ -1309,11 +1373,21 @@ async fn fail_stop(planted: Planted) -> Result<(), String> {
     let disk = MemDisk::new();
     let env = Arc::new(MemEnv::default());
     let limits = limits();
-    let store = Arc::new(RefusingStore(MemLogStore::new(
-        disk.clone(),
-        limits.log_line_bytes,
-        limits.log_file_bytes,
-    )));
+    // The disk fills exactly where the next act would.
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(|_, records: &[Record<Parsed>]| {
+            if records
+                .iter()
+                .any(|record| matches!(record, Record::Dispatched { .. }))
+            {
+                Act::Refuse
+            } else {
+                Act::Append
+            }
+        }),
+    );
     let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
     let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
     handle
@@ -1702,4 +1776,416 @@ async fn waiting_on_a_run_that_never_reports_is_caught() {
         .await
         .expect_err("the check catches a run waited on for good");
     assert!(broken.contains("past its deadline"), "{broken}");
+}
+
+/// Rules that let every actor spawn and send without asking.
+const MAIL: &str =
+    "[[allow]]\ntool = \"spawn\"\n[[allow]]\ntool = \"send\"\n[[allow]]\ntool = \"bash\"\n";
+
+fn other_id() -> ActorId {
+    ActorId::from_parts(
+        UnixMillis::new(1_700_000_000_000).expect("a time"),
+        &[8; 10],
+    )
+}
+
+/// The envelopes `log` holds from `from`.
+fn delivered_from(log: &[Record<Parsed>], from: ActorId) -> Vec<verified_domain::EnvelopeId> {
+    log.iter()
+        .filter_map(|record| {
+            if let Record::Delivered { envelope } = record
+                && envelope.from == verified_domain::Address::Actor(from)
+            {
+                Some(envelope.id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The first `ToolResult` in `log` whose output starts with `prefix`.
+fn result_saying(log: &[Record<Parsed>], prefix: &str) -> Option<Exit> {
+    log.iter().find_map(|record| {
+        if let Record::ToolResult {
+            exit,
+            output: Some(output),
+            ..
+        } = record
+            && output.body.text.starts_with(prefix)
+        {
+            Some(*exit)
+        } else {
+            None
+        }
+    })
+}
+
+/// Actors are sessions: a spawned child is a new actor with its own log,
+/// born as its parent named it (one deeper, its parent's id kept for
+/// display), whose prompt lands in its mailbox; what it sends its parent
+/// lands in the parent's mailbox once, and starts a turn there.
+#[tokio::test]
+async fn a_spawned_child_runs_and_answers_its_parent() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let parent = session_id();
+    let (_, handle) = daemon.registry.create(parent).await.expect("created");
+    handle
+        .send_message(send(1, &format!("spawn helper send {parent} hello parent")))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        !delivered_from(log, other(log)).is_empty()
+            && log
+                .iter()
+                .filter(|record| matches!(record, Record::TurnEnded { .. }))
+                .count()
+                >= 2
+    })
+    .await;
+    let child = other(&log);
+    assert_eq!(
+        result_saying(&log, "spawned helper at"),
+        Some(Exit::Ok),
+        "the spawn reports where the child is"
+    );
+    assert_eq!(
+        delivered_from(&log, child).len(),
+        1,
+        "the answer landed once"
+    );
+    let listed = daemon.registry.list().await;
+    let born = listed
+        .iter()
+        .find(|listed| listed.actor == child)
+        .map(|listed| listed.born.clone())
+        .expect("the registry hosts the child");
+    assert_eq!(born.name.as_str(), "helper");
+    assert_eq!(born.parent, Some(parent));
+    assert_eq!(born.depth, 1);
+    let child_log = records(&daemon.registry.lookup(child).await.expect("hosted")).await;
+    assert_eq!(
+        delivered_from(&child_log, parent).len(),
+        1,
+        "the prompt landed once in the child's log"
+    );
+    assert_eq!(
+        result_saying(&child_log, &format!("delivered to {parent}")),
+        Some(Exit::Ok)
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// The child a log's spawn made: the actor of its first spawn proposal.
+fn other(log: &[Record<Parsed>]) -> ActorId {
+    log.iter()
+        .find_map(|record| {
+            if let Record::StepFinished { calls, .. } = record {
+                calls.iter().find_map(|call| match &call.request {
+                    verified_domain::Request::Run {
+                        args: verified_server::payload::ToolArgs::Spawn { child, .. },
+                    } => Some(*child),
+                    verified_domain::Request::Run { .. }
+                    | verified_domain::Request::Invalid { .. } => None,
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(other_id)
+}
+
+/// Your stop revokes what the actor holds and stops every actor it
+/// spawned: the cascade. A stop is `Keyed`: a repeat is `Exists`.
+#[tokio::test]
+async fn stopping_an_actor_stops_its_children() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper bg block"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        result_saying(log, "spawned helper").is_some()
+    })
+    .await;
+    let child = other(&log);
+    let child_handle = daemon.registry.lookup(child).await.expect("hosted");
+    until_log(&child_handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::Dispatched { .. }))
+    })
+    .await;
+    let stop = message_id(50);
+    assert_eq!(
+        handle.stop(stop).await.expect("answered"),
+        verified_core::Outcome::Accepted
+    );
+    assert_eq!(
+        handle.stop(stop).await.expect("answered"),
+        verified_core::Outcome::Exists,
+        "a repeated stop is a repeat"
+    );
+    let log = until_log(&handle, |log| {
+        result_saying(log, "stopped").is_some()
+            || log
+                .iter()
+                .any(|record| matches!(record, Record::TaskEnded { exit: Exit::Ok, .. }))
+    })
+    .await;
+    assert!(
+        log.iter().any(
+            |record| matches!(record, Record::StopSent { child: stopped } if *stopped == child)
+        ),
+        "the parent stops its child"
+    );
+    let child_log = until_log(&child_handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::TaskEnded { .. }))
+    })
+    .await;
+    assert!(
+        child_log.iter().any(|record| matches!(
+            record,
+            Record::Delivered { envelope } if envelope.body == verified_domain::Body::Stop
+                && envelope.from == verified_domain::Address::Runtime
+        )),
+        "the child holds a stop from v"
+    );
+    assert!(
+        child_log.iter().any(|record| matches!(
+            record,
+            Record::TaskEnded {
+                exit: Exit::Unknown,
+                ..
+            }
+        )),
+        "the child's running command was signalled and may have acted: {child_log:?}"
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// The actor cap is the registry's (B3): a spawn past it does not start.
+#[tokio::test]
+async fn a_spawn_past_the_actor_limit_does_not_start() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let mut limits = limits();
+    limits.sessions = 1;
+    let daemon = boot_with(&MemDisk::new(), Arc::<MemEnv>::clone(&env), limits).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper bash echo never"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| result_saying(log, "not spawned").is_some()).await;
+    assert_eq!(
+        result_saying(&log, "not spawned"),
+        Some(Exit::NotStarted(verified_domain::Unstarted::Limit))
+    );
+    assert_eq!(daemon.registry.list().await.len(), 1, "no second actor");
+    daemon.tasks.shutdown().cancel();
+}
+
+/// O2 between logs, checked: actor A sends to actor B, and the daemon
+/// crashes after B's `Delivered` is durable and before A's result is. The
+/// restart runs the send again under its key. What broke, if anything:
+/// B holding the envelope other than once, or A's send not resolved `Ok`.
+async fn exactly_once(planted: Planted) -> Result<(), String> {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let disk = MemDisk::new();
+    let limits = limits();
+    let (from, to) = (session_id(), other_id());
+    // A's result never becomes durable: the crash comes first.
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let result = records.iter().any(|record| {
+                matches!(record, Record::ToolResult { output: Some(output), .. }
+                    if output.body.text.starts_with("delivered to"))
+            });
+            if actor == from && result {
+                Act::Stall
+            } else {
+                Act::Append
+            }
+        }),
+    );
+    let first = boot_on(store, Arc::<MemEnv>::clone(&env), limits.clone(), planted).await;
+    let (_, sender) = first.registry.create(from).await.expect("created");
+    let (_, recipient) = first.registry.create(to).await.expect("created");
+    sender
+        .send_message(send(1, &format!("send {to} hello b")))
+        .await
+        .expect("accepted");
+    until_log(&recipient, |log| !delivered_from(log, from).is_empty()).await;
+    first.tasks.shutdown().cancel();
+    drop((sender, recipient));
+
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(|_, _: &[Record<Parsed>]| Act::Append),
+    );
+    let second = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
+    let sender = second.registry.lookup(from).await.expect("recovered");
+    let recipient = second.registry.lookup(to).await.expect("recovered");
+    let sent = within(
+        Duration::from_secs(5),
+        until_log(&sender, |log| {
+            result_saying(log, &format!("delivered to {to}")).is_some()
+        }),
+    )
+    .await;
+    let held = delivered_from(&records(&recipient).await, from);
+    second.tasks.shutdown().cancel();
+    let mut broken = Vec::new();
+    if held.len() != 1 {
+        broken.push(format!(
+            "the recipient holds the envelope {} times: {held:?}",
+            held.len()
+        ));
+    }
+    match sent {
+        Ok(log) if result_saying(&log, "delivered to") == Some(Exit::Ok) => {}
+        Ok(log) => broken.push(format!("the send did not resolve Ok: {log:?}")),
+        Err(_) => broken.push("the send never resolved".to_owned()),
+    }
+    if broken.is_empty() {
+        Ok(())
+    } else {
+        Err(broken.join("; "))
+    }
+}
+
+/// A `Keyed` send takes effect exactly once across a crash: the rerun
+/// carries the same envelope id, and the recipient takes it once (O2).
+#[tokio::test]
+async fn a_send_lands_exactly_once_across_a_crash() {
+    exactly_once(Planted::None)
+        .await
+        .expect("the envelope lands once and the send resolves Ok");
+}
+
+/// The planted bug for O2: a rerun mints a fresh envelope id.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn a_fresh_key_after_a_crash_delivers_twice() {
+    let broken = exactly_once(Planted::FreshKeyOnResume)
+        .await
+        .expect_err("the check catches a second delivery");
+    assert!(broken.contains("2 times"), "{broken}");
+}
+
+/// A1 and L3 between logs, checked: A sends to B, A's `Dispatched` is
+/// slow to become durable, and B's log refuses the envelope (full) if
+/// `full`. What broke, if anything: B's `Delivered` durable before A's
+/// `Dispatched`, or A recording `Ok` for an envelope B does not hold.
+async fn delivery_order(planted: Planted, full: bool) -> Result<(), String> {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let limits = limits();
+    let (from, to) = (session_id(), other_id());
+    let (store, order) = Watched::new(
+        &MemDisk::new(),
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let dispatches = records
+                .iter()
+                .any(|record| matches!(record, Record::Dispatched { .. }));
+            let mail = records
+                .iter()
+                .any(|record| matches!(record, Record::Delivered { envelope } if envelope.from == verified_domain::Address::Actor(from)));
+            match (actor == from && dispatches, actor == to && mail && full) {
+                (true, _) => Act::Slow,
+                (false, true) => Act::Refuse,
+                (false, false) => Act::Append,
+            }
+        }),
+    );
+    let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
+    let (_, sender) = daemon.registry.create(from).await.expect("created");
+    let (_, recipient) = daemon.registry.create(to).await.expect("created");
+    sender
+        .send_message(send(1, &format!("send {to} hello b")))
+        .await
+        .expect("accepted");
+    let log = until_log(&sender, |log| {
+        result_saying(log, "delivered to").is_some()
+            || result_saying(log, "not delivered").is_some()
+    })
+    .await;
+    let held = delivered_from(&records(&recipient).await, from);
+    daemon.tasks.shutdown().cancel();
+    let mut broken = Vec::new();
+    if result_saying(&log, "delivered to") == Some(Exit::Ok) && held.is_empty() {
+        broken
+            .push("the sender recorded Ok for an envelope the recipient does not hold".to_owned());
+    }
+    let order = order.lock().expect("unpoisoned").clone();
+    let durable = |actor: ActorId, seq: u64| {
+        order.iter().position(|(at, first, records)| {
+            *at == actor
+                && (*first..first.saturating_add(u64::try_from(records.len()).unwrap_or(0)))
+                    .contains(&seq)
+        })
+    };
+    for (at, (actor, _, records)) in order.iter().enumerate() {
+        for record in records {
+            if let Record::Delivered { envelope } = record
+                && let verified_domain::EnvelopeId::Minted { actor: from, seq } = envelope.id
+                && *actor == to
+                && durable(from, seq).is_none_or(|dispatched| dispatched > at)
+            {
+                broken.push(format!(
+                    "delivered before its Dispatched (seq {seq}) was durable"
+                ));
+            }
+        }
+    }
+    if broken.is_empty() {
+        Ok(())
+    } else {
+        Err(broken.join("; "))
+    }
+}
+
+/// A delivery starts only after its `Dispatched` is durable (A1), and an
+/// `Ok` send is in its recipient's log (L3: an ack means durable).
+#[tokio::test]
+async fn a_delivery_waits_for_its_dispatch_and_its_recipients_append() {
+    delivery_order(Planted::None, false)
+        .await
+        .expect("delivered after the dispatch");
+    delivery_order(Planted::None, true)
+        .await
+        .expect("a refused delivery is not Ok");
+}
+
+/// The planted bug for A1 between logs: a send delivered before its
+/// `Dispatched` is durable.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn delivering_a_send_before_its_dispatch_is_durable_is_caught() {
+    let broken = delivery_order(Planted::DeliverBeforePersist, false)
+        .await
+        .expect_err("the check catches the early delivery");
+    assert!(broken.contains("before its Dispatched"), "{broken}");
+}
+
+/// The planted bug for L3 between logs: a recipient that acknowledges a
+/// delivery before its append is durable (here the append is refused).
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn acknowledging_before_the_append_loses_the_envelope() {
+    let broken = delivery_order(Planted::AckBeforeAppend, true)
+        .await
+        .expect_err("the check catches the lost envelope");
+    assert!(broken.contains("does not hold"), "{broken}");
 }

@@ -141,11 +141,15 @@ impl Builder {
         match record {
             Record::Delivered { envelope } => {
                 if let Body::Text(text) = &envelope.body {
-                    let said = match envelope.from {
-                        Address::User => text.body.clone(),
-                        Address::Runtime | Address::Actor(_) => {
+                    let said = match (envelope.from, envelope.reply_to) {
+                        (Address::User, _) => text.body.clone(),
+                        (Address::Runtime | Address::Actor(_), None) => {
                             format!("[from {}] {}", envelope.from, text.body)
                         }
+                        (Address::Runtime | Address::Actor(_), Some(reply_to)) => format!(
+                            "[from {}; reply to {reply_to}] {}",
+                            envelope.from, text.body
+                        ),
                     };
                     self.mail.insert(envelope.id, said);
                 }

@@ -1,5 +1,5 @@
 //! Daemon lifecycle: the `.verified/` directory, lock file and port file,
-//! the session registry, and [`run`], the entry point main and the
+//! the actor registry, and [`run`], the entry point main and the
 //! simulation call with their seams.
 //!
 //! Layout, inside the project:
@@ -8,7 +8,8 @@
 //! .verified/
 //!   daemon.lock          held (Lock seam) while a daemon runs
 //!   port                 `127.0.0.1:PORT\n`, written atomically
-//!   sessions/<id>.log    one record log per session
+//!   v.toml               the rules file, yours to write (`rules_file`)
+//!   actors/<id>.log      one record log per actor
 //! ```
 
 use core::fmt;
@@ -20,13 +21,15 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use verified_domain::id::ActorId;
+use verified_domain::{ActorName, Born, Record, Tool};
 use verified_wire::command::Outcome as WireOutcome;
 
 use crate::limits::ServerLimits;
 use crate::log::{FileLogStore, LogError, LogStore};
+use crate::payload::Parsed;
 use crate::routes;
 use crate::seam::{Lock, LockError, LockGuard};
-use crate::shell::{Seams, Session, SessionHandle, ShellConfig, ShellError};
+use crate::shell::{ActorHandle, Seams, Session, ShellConfig, ShellError};
 use crate::shim::fs;
 
 /// The daemon's directory inside a project.
@@ -35,8 +38,8 @@ pub const DIR: &str = ".verified";
 pub const LOCK_FILE: &str = "daemon.lock";
 /// The port file, under [`DIR`].
 pub const PORT_FILE: &str = "port";
-/// The session logs' directory, under [`DIR`].
-pub const SESSIONS_DIR: &str = "sessions";
+/// The actors' logs' directory, under [`DIR`].
+pub const ACTORS_DIR: &str = "actors";
 
 /// Why the daemon stopped.
 #[derive(Debug, thiserror::Error)]
@@ -73,10 +76,10 @@ fn io_error(what: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Daemon
     move |source| DaemonError::Io { what, path, source }
 }
 
-/// Why a session was not created.
+/// Why an actor was not created.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
-    #[error("the daemon hosts its limit of {limit} sessions")]
+    #[error("the daemon hosts its limit of {limit} actors")]
     Full { limit: usize },
     #[error(transparent)]
     Log(#[from] LogError),
@@ -84,18 +87,40 @@ pub enum CreateError {
     Unavailable,
 }
 
+/// One actor the daemon hosts: its handle, and who it is once its `Born`
+/// is in its log (`None`: a log a spawn made before its birth was
+/// durable; it is hosted, and born when the spawn is run again).
+#[derive(Clone)]
+struct Entry {
+    handle: ActorHandle,
+    born: Option<Born>,
+}
+
+/// One actor, as the registry lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub actor: ActorId,
+    pub born: Born,
+}
+
+type Created = Result<(WireOutcome, ActorHandle, bool), CreateError>;
+
 enum RegistryInput {
     Create {
-        session: ActorId,
-        reply: oneshot::Sender<Result<(WireOutcome, SessionHandle), CreateError>>,
+        born: Born,
+        reply: oneshot::Sender<Created>,
     },
     Lookup {
-        session: ActorId,
-        reply: oneshot::Sender<Option<SessionHandle>>,
+        actor: ActorId,
+        reply: oneshot::Sender<Option<ActorHandle>>,
+    },
+    List {
+        reply: oneshot::Sender<Vec<Listed>>,
     },
 }
 
-/// The sessions a daemon hosts. A handle to the registry task.
+/// The actors a daemon hosts: actors are sessions, one log each. A handle
+/// to the registry task, which never awaits a session.
 #[derive(Clone)]
 pub struct Registry {
     inbox: mpsc::Sender<RegistryInput>,
@@ -108,84 +133,184 @@ impl fmt::Debug for Registry {
 }
 
 impl Registry {
-    /// Creates `session` (durably) or finds it: `Exists` on a repeat.
+    /// Creates the root actor `actor` (durably, born as `main`, offered
+    /// every tool the shell runs) or finds it: `Exists` on a repeat.
     ///
     /// # Errors
-    /// Too many sessions, a log that could not be created, or shutdown.
-    pub async fn create(
-        &self,
-        session: ActorId,
-    ) -> Result<(WireOutcome, SessionHandle), CreateError> {
-        let (reply, answer) = oneshot::channel();
-        self.inbox
-            .send(RegistryInput::Create { session, reply })
-            .await
-            .map_err(|_closed| CreateError::Unavailable)?;
-        answer.await.map_err(|_dropped| CreateError::Unavailable)?
+    /// Too many actors, a log that could not be created, or shutdown.
+    pub async fn create(&self, actor: ActorId) -> Result<(WireOutcome, ActorHandle), CreateError> {
+        self.make(root(actor)).await
     }
 
-    /// The session, if the daemon hosts it.
-    pub async fn lookup(&self, session: ActorId) -> Option<SessionHandle> {
+    /// Creates the actor `born` names (durably; its first resume records
+    /// its birth before it takes any input) or finds it: `Exists` on a
+    /// repeat, as a `Keyed` spawn run again after a crash finds it. One a
+    /// crash left unborn is born before this returns.
+    ///
+    /// # Errors
+    /// Too many actors, a log that could not be created, or shutdown.
+    pub async fn spawn(&self, born: Born) -> Result<(WireOutcome, ActorHandle), CreateError> {
+        self.make(born).await
+    }
+
+    async fn make(&self, born: Born) -> Result<(WireOutcome, ActorHandle), CreateError> {
         let (reply, answer) = oneshot::channel();
         self.inbox
-            .send(RegistryInput::Lookup { session, reply })
+            .send(RegistryInput::Create {
+                born: born.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_closed| CreateError::Unavailable)?;
+        let (outcome, handle, unborn) = answer
+            .await
+            .map_err(|_dropped| CreateError::Unavailable)??;
+        // An actor whose log a crash left unborn is born now. The caller
+        // waits on the actor, never the registry.
+        if unborn {
+            handle
+                .born(born)
+                .await
+                .map_err(|_gone| CreateError::Unavailable)?;
+        }
+        Ok((outcome, handle))
+    }
+
+    /// The actor, if the daemon hosts it.
+    pub async fn lookup(&self, actor: ActorId) -> Option<ActorHandle> {
+        let (reply, answer) = oneshot::channel();
+        self.inbox
+            .send(RegistryInput::Lookup { actor, reply })
             .await
             .ok()?;
         answer.await.ok().flatten()
     }
+
+    /// Every born actor the daemon hosts, as it was born. An empty list
+    /// when the daemon is stopping.
+    pub async fn list(&self) -> Vec<Listed> {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .inbox
+            .send(RegistryInput::List { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+}
+
+/// A root actor the user made: named `main`, offered every tool the shell
+/// runs.
+#[must_use]
+pub fn root(actor: ActorId) -> Born {
+    Born::root(
+        actor,
+        ActorName::parse("main").unwrap_or_else(|_name| crate::defect("`main` is an actor name")),
+        vec![
+            Tool::Read,
+            Tool::Edit,
+            Tool::Bash,
+            Tool::Spawn,
+            Tool::Send,
+            Tool::Wake,
+            Tool::Tasks,
+            Tool::Cancel,
+        ],
+    )
 }
 
 struct RegistryTask {
-    sessions: BTreeMap<ActorId, SessionHandle>,
+    actors: BTreeMap<ActorId, Entry>,
     store: Arc<dyn LogStore>,
     seams: Seams,
     config: Arc<ShellConfig>,
     fatal: mpsc::Sender<DaemonError>,
+    /// This registry, for the actors' deliveries.
+    registry: Registry,
 }
 
 impl RegistryTask {
     fn spawn_session(
         &mut self,
-        session: ActorId,
+        actor: ActorId,
         log: Box<dyn crate::log::Log>,
-        records: Vec<verified_domain::Record<crate::payload::Parsed>>,
-    ) -> Result<SessionHandle, DaemonError> {
+        records: Vec<Record<Parsed>>,
+        born: Option<Born>,
+    ) -> Result<ActorHandle, DaemonError> {
+        let known = records.iter().find_map(|record| match record {
+            Record::Born { born } => Some(born.clone()),
+            Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. } => None,
+        });
         let (handle, running) = Session::start(
-            session,
+            actor,
             log,
             records,
+            born.clone(),
+            self.registry.clone(),
             self.seams.clone(),
             Arc::clone(&self.config),
         )
-        .map_err(|source| DaemonError::Shell { session, source })?;
+        .map_err(|source| DaemonError::Shell {
+            session: actor,
+            source,
+        })?;
         let fatal = self.fatal.clone();
         self.seams.tasks.spawn(async move {
             if let Err(source) = running.await {
-                drop(fatal.try_send(DaemonError::Shell { session, source }));
+                drop(fatal.try_send(DaemonError::Shell {
+                    session: actor,
+                    source,
+                }));
             }
         });
-        self.sessions.insert(session, handle.clone());
+        self.actors.insert(
+            actor,
+            Entry {
+                handle: handle.clone(),
+                born: known.or(born),
+            },
+        );
         Ok(handle)
     }
 
-    async fn create(
-        &mut self,
-        session: ActorId,
-    ) -> Result<(WireOutcome, SessionHandle), CreateError> {
-        if let Some(handle) = self.sessions.get(&session) {
-            return Ok((WireOutcome::Exists, handle.clone()));
+    async fn create(&mut self, born: Born) -> Created {
+        let actor = born.actor;
+        if let Some(entry) = self.actors.get(&actor) {
+            return Ok((
+                WireOutcome::Exists,
+                entry.handle.clone(),
+                entry.born.is_none(),
+            ));
         }
         let limit = self.config.limits.sessions;
-        if self.sessions.len() >= limit {
+        if self.actors.len() >= limit {
             return Err(CreateError::Full { limit });
         }
-        let log = self.store.create(session).await?;
+        let log = self.store.create(actor).await?;
         let handle = self
-            .spawn_session(session, log, Vec::new())
+            .spawn_session(actor, log, Vec::new(), Some(born))
             .unwrap_or_else(|error| {
                 crate::defect(&format!("an empty log always replays: {error}"))
             });
-        Ok((WireOutcome::Created, handle))
+        // Its first resume records the birth, before it takes any input.
+        Ok((WireOutcome::Created, handle, false))
     }
 
     async fn run(mut self, mut inbox: mpsc::Receiver<RegistryInput>) {
@@ -198,19 +323,32 @@ impl RegistryTask {
             };
             match input {
                 None => return,
-                Some(RegistryInput::Create { session, reply }) => {
-                    let created = self.create(session).await;
+                Some(RegistryInput::Create { born, reply }) => {
+                    let created = self.create(born).await;
                     drop(reply.send(created));
                 }
-                Some(RegistryInput::Lookup { session, reply }) => {
-                    drop(reply.send(self.sessions.get(&session).cloned()));
+                Some(RegistryInput::Lookup { actor, reply }) => {
+                    drop(reply.send(self.actors.get(&actor).map(|entry| entry.handle.clone())));
+                }
+                Some(RegistryInput::List { reply }) => {
+                    let listed = self
+                        .actors
+                        .iter()
+                        .filter_map(|(actor, entry)| {
+                            Some(Listed {
+                                actor: *actor,
+                                born: entry.born.clone()?,
+                            })
+                        })
+                        .collect();
+                    drop(reply.send(listed));
                 }
             }
         }
     }
 }
 
-/// Recovers every session in `store` and starts the registry.
+/// Recovers every actor in `store` and starts the registry.
 ///
 /// # Errors
 /// Limits under which some record would not fit the log, more session
@@ -223,19 +361,21 @@ pub async fn boot(
 ) -> Result<Registry, DaemonError> {
     config.limits.check()?;
     let (inbox, receiver) = mpsc::channel(config.limits.registry_inbox);
+    let registry = Registry { inbox };
     let mut task = RegistryTask {
-        sessions: BTreeMap::new(),
+        actors: BTreeMap::new(),
         store: Arc::clone(&store),
         seams: seams.clone(),
         config,
         fatal,
+        registry: registry.clone(),
     };
-    for session in store.list().await? {
-        let (log, records) = store.open(session).await?;
-        task.spawn_session(session, log, records)?;
+    for actor in store.list().await? {
+        let (log, records) = store.open(actor).await?;
+        task.spawn_session(actor, log, records, None)?;
     }
     seams.tasks.spawn(task.run(receiver));
-    Ok(Registry { inbox })
+    Ok(registry)
 }
 
 /// Serves the daemon on `listener` with sessions from `store` until the
@@ -304,8 +444,8 @@ impl Layout {
     }
 
     #[must_use]
-    pub fn sessions(&self) -> PathBuf {
-        self.dir().join(SESSIONS_DIR)
+    pub fn actors(&self) -> PathBuf {
+        self.dir().join(ACTORS_DIR)
     }
 }
 
@@ -374,10 +514,10 @@ pub async fn prepare(
 ) -> Result<(LockGuard, FileLogStore), DaemonError> {
     durable_dir(&layout.dir()).await?;
     let held = lock.lock(&layout.lock_file()).await?;
-    durable_dir(&layout.sessions()).await?;
+    durable_dir(&layout.actors()).await?;
     write_port_file(layout, addr).await?;
     let store = FileLogStore::new(
-        layout.sessions(),
+        layout.actors(),
         limits.log_line_bytes,
         limits.log_file_bytes,
         limits.sessions,

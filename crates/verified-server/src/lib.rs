@@ -16,6 +16,7 @@ pub mod history;
 pub mod limits;
 pub mod log;
 pub mod model;
+mod outbox;
 pub mod payload;
 pub mod projection;
 pub mod routes;

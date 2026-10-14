@@ -1025,7 +1025,7 @@ async fn a_real_background_command_runs_on_and_times_out_honestly() {
     let project = scratch("background").await;
     write_rules(&project, "[[allow]]\ntool = \"bash\"\n").await;
     let mut limits = ServerLimits::v0();
-    limits.task_timeout = Millis::new(300);
+    limits.task_timeout = Millis::new(2_000);
     let (registry, tasks) = real_daemon_with(&project, limits).await;
     let (_, handle) = registry.create(session()).await.expect("created");
     handle
@@ -1053,5 +1053,76 @@ async fn a_real_background_command_runs_on_and_times_out_honestly() {
         "a killed command may have acted: {output}"
     );
     assert!(output.contains("timed out"), "{output}");
+    tasks.shutdown().cancel();
+}
+
+/// Actors on a real disk: the root spawns a child, whose real shell runs
+/// its prompt; each has its own log under `.verified/actors/`, and a
+/// restart recovers both, as they were born.
+#[tokio::test]
+async fn a_spawned_actor_runs_and_is_recovered_from_disk() {
+    let project = scratch("actors").await;
+    write_rules(
+        &project,
+        "[[allow]]\ntool = \"spawn\"\n[[allow]]\ntool = \"bash\"\n",
+    )
+    .await;
+    let (registry, tasks) = real_daemon(&project).await;
+    let (_, handle) = registry.create(session()).await.expect("created");
+    handle
+        .send_message(message(1, "spawn helper bash echo child-ran"))
+        .await
+        .expect("accepted");
+    let child = within(Duration::from_secs(20), async {
+        loop {
+            if let Some(listed) = registry
+                .list()
+                .await
+                .into_iter()
+                .find(|listed| listed.actor != session())
+            {
+                return listed.actor;
+            }
+            SystemClock.sleep(Millis::new(10)).await;
+        }
+    })
+    .await
+    .expect("the child appears");
+    let child_handle = registry.lookup(child).await.expect("hosted");
+    records_until(&child_handle, |log| {
+        log.iter().any(|record| {
+            matches!(
+                record,
+                Record::ToolResult { exit: Exit::Ok, output: Some(output), .. }
+                    if output.body.text.contains("child-ran")
+            )
+        })
+    })
+    .await;
+    tasks.shutdown().cancel();
+    drop((handle, child_handle, registry));
+    let logs = fs::list(&project.join(".verified/actors"), 16)
+        .await
+        .expect("the actors' logs");
+    assert_eq!(logs.len(), 2, "one log per actor: {logs:?}");
+
+    let (registry, tasks) = real_daemon(&project).await;
+    let mut listed = registry.list().await;
+    listed.sort_by_key(|listed| listed.born.depth);
+    let names: Vec<(&str, u32, Option<ActorId>)> = listed
+        .iter()
+        .map(|listed| {
+            (
+                listed.born.name.as_str(),
+                listed.born.depth,
+                listed.born.parent,
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![("main", 0, None), ("helper", 1, Some(session()))],
+        "both recovered as they were born"
+    );
     tasks.shutdown().cancel();
 }
