@@ -15,10 +15,10 @@ pub struct ServerLimits {
     pub core: Limits,
     /// What the wire codecs enforce: bodies, SSE lines and events.
     pub wire: WireLimits,
-    /// Sessions one daemon hosts.
-    pub sessions: usize,
-    /// Capacity of each session's inbox (commands, reads and completions).
-    pub session_inbox: usize,
+    /// Actors one daemon hosts.
+    pub actors: usize,
+    /// Capacity of each actor's inbox (commands, reads and completions).
+    pub actor_inbox: usize,
     /// Capacity of the registry's inbox.
     pub registry_inbox: usize,
     /// Capacity of the queue from a model stream to its group-commit batcher.
@@ -66,15 +66,15 @@ pub struct ServerLimits {
     pub sse_keep_alive: Millis,
     /// Capacity of the queue feeding one live SSE response.
     pub sse_queue: usize,
-    /// Live SSE responses one session serves at once.
-    pub sse_followers_per_session: usize,
+    /// Live SSE responses one actor serves at once.
+    pub sse_followers_per_actor: usize,
     /// Live SSE responses the daemon serves at once, across sessions.
     pub sse_followers: usize,
-    /// Bytes of records and projected chunks (as JSON) one session holds in
+    /// Bytes of records and projected chunks (as JSON) one actor holds in
     /// memory. Checked when a message would start a turn: past it the
     /// session is full. A turn already running may finish past it, by at
     /// most one turn, which the core's per-turn bounds cap.
-    pub session_bytes: usize,
+    pub actor_bytes: usize,
     /// Largest rules file (`.verified/v.toml`) read; a larger one grants
     /// nothing.
     pub rules_file_bytes: u64,
@@ -217,8 +217,8 @@ impl ServerLimits {
         Self {
             core: Limits::v0(),
             wire: WireLimits::DEFAULT,
-            sessions: 256,
-            session_inbox: 256,
+            actors: 256,
+            actor_inbox: 256,
             registry_inbox: 64,
             model_parts_queue: 256,
             model_parts_per_call: 65_536,
@@ -238,9 +238,9 @@ impl ServerLimits {
             sse_lifetime: Millis::new(60_000),
             sse_keep_alive: Millis::new(15_000),
             sse_queue: 16,
-            sse_followers_per_session: 8,
+            sse_followers_per_actor: 8,
             sse_followers: 64,
-            session_bytes: 64 << 20,
+            actor_bytes: 64 << 20,
             rules_file_bytes: 64 << 10,
             rules_count: 256,
             deadline_slack: Millis::new(30_000),

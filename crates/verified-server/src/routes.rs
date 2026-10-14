@@ -292,13 +292,13 @@ struct Slots {
 fn live(app: &App, handle: ActorHandle, from: Offset) -> Response {
     let Some(session_slot) = handle.follower() else {
         return rejection(&Rejection::TooManyFollowers {
-            actor_id: handle.session(),
-            limit: app.limits.sse_followers_per_session,
+            actor_id: handle.actor(),
+            limit: app.limits.sse_followers_per_actor,
         });
     };
     let Ok(daemon_slot) = Arc::clone(&app.followers).try_acquire_owned() else {
         return rejection(&Rejection::TooManyFollowers {
-            actor_id: handle.session(),
+            actor_id: handle.actor(),
             limit: app.limits.sse_followers,
         });
     };

@@ -2092,7 +2092,7 @@ async fn a_spawn_past_the_actor_limit_does_not_start() {
     let env = Arc::new(MemEnv::default());
     env.set_rules(Some(MAIL));
     let mut limits = limits();
-    limits.sessions = 1;
+    limits.actors = 1;
     let daemon = boot_with(&MemDisk::new(), Arc::<MemEnv>::clone(&env), limits).await;
     let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
     handle

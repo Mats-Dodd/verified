@@ -305,12 +305,12 @@ async fn body_of(response: hyper::Response<hyper::body::Incoming>) -> Vec<u8> {
 #[tokio::test]
 async fn capacity_limits_answer_typed_rejections() {
     let mut limits = ServerLimits::v0();
-    limits.sessions = 2;
-    limits.sse_followers_per_session = 1;
+    limits.actors = 2;
+    limits.sse_followers_per_actor = 1;
     limits.sse_followers = 1;
     limits.sse_keep_alive = Millis::new(20);
     // Room for a new session's first records (its epoch), not for a turn.
-    limits.session_bytes = 512;
+    limits.actor_bytes = 512;
     let (addr, tasks) = start_with(limits).await;
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let base = format!("http://{addr}");

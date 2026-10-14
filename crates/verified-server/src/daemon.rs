@@ -350,7 +350,7 @@ impl RegistryTask {
                 entry.born.is_none(),
             ));
         }
-        let limit = self.config.limits.sessions;
+        let limit = self.config.limits.actors;
         if self.actors.len() >= limit {
             return Err(CreateError::Full { limit });
         }
@@ -597,7 +597,7 @@ pub async fn prepare(
         layout.actors(),
         limits.log_line_bytes,
         limits.log_file_bytes,
-        limits.sessions,
+        limits.actors,
     );
     Ok((held, store))
 }

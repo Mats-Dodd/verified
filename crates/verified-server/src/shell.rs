@@ -352,7 +352,7 @@ pub struct ActorHandle {
     session: ActorId,
     inbox: mpsc::Sender<Input>,
     committed: Committed,
-    /// One permit per live stream follower (`sse_followers_per_session`).
+    /// One permit per live stream follower (`sse_followers_per_actor`).
     followers: Arc<Semaphore>,
 }
 
@@ -367,7 +367,7 @@ impl fmt::Debug for ActorHandle {
 
 impl ActorHandle {
     #[must_use]
-    pub const fn session(&self) -> ActorId {
+    pub const fn actor(&self) -> ActorId {
         self.session
     }
 
@@ -545,7 +545,7 @@ pub struct Session {
     /// it, so it never finds the child unborn while the spawn may still
     /// birth it.
     spawning: BTreeMap<ActorId, CancellationToken>,
-    /// JSON bytes of `records` and `chunks`, against `session_bytes`.
+    /// JSON bytes of `records` and `chunks`, against `actor_bytes`.
     held_bytes: usize,
     /// Why the log stopped taking records, once it has: from then on the
     /// session fails stop (L3).
@@ -602,13 +602,13 @@ impl Session {
                 .unwrap_or_else(|| defect("a session's bytes fit in usize"));
             chunks.push(projected);
         }
-        let (inbox, receiver) = mpsc::channel(config.limits.session_inbox);
+        let (inbox, receiver) = mpsc::channel(config.limits.actor_inbox);
         let (committed, writer) = Committed::new(core.seq());
         let handle = ActorHandle {
             session,
             inbox: inbox.clone(),
             committed,
-            followers: Arc::new(Semaphore::new(config.limits.sse_followers_per_session)),
+            followers: Arc::new(Semaphore::new(config.limits.sse_followers_per_actor)),
         };
         let shell = Self {
             id: session,
@@ -1037,10 +1037,10 @@ impl Session {
             return Ok((Err(self.full()), Vec::new()));
         }
         if self.delivered(command.message_id).is_none() {
-            if self.held_bytes >= self.config.limits.session_bytes {
+            if self.held_bytes >= self.config.limits.actor_bytes {
                 let reason = format!(
                     "it holds {} bytes, its limit is {}",
-                    self.held_bytes, self.config.limits.session_bytes
+                    self.held_bytes, self.config.limits.actor_bytes
                 );
                 return Ok((Err(self.actor_full(reason)), Vec::new()));
             }
