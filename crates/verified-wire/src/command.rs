@@ -17,6 +17,8 @@
 //!   running turn: it enters at the next step boundary;
 //! - `POST /actors/{id}/approvals` [`Approve`], for that actor's calls;
 //! - `POST /actors/{id}/cancel` [`Cancel`] (Esc);
+//! - `POST /actors/{id}/stop` [`StopActor`]: a 200 means the stop is durably
+//!   in the actor's mailbox; the actor and every actor it spawned stop;
 //! - `GET /actors/{id}/tasks` answers [`TaskList`];
 //! - `GET /actors/{id}/stream?offset=…`, the actor's stream.
 
@@ -211,6 +213,27 @@ impl Cancel {
     }
 }
 
+/// Stops an actor: it revokes everything it holds and stops every actor it
+/// spawned. The stop id is the `TigerBeetle` id: a repeat is "exists".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopActor {
+    pub stop_id: MessageId,
+}
+
+impl StopActor {
+    /// # Errors
+    /// An oversized or malformed body.
+    pub fn decode(body: &[u8], limits: &WireLimits) -> Result<Self, DecodeError> {
+        json_body(body, limits)
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        json_of(self)
+    }
+}
+
 /// Whether a command did something new or repeated one already done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -254,6 +277,13 @@ pub struct ApproveReply {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CancelReply {
     pub turn_id: TurnId,
+    pub outcome: Outcome,
+}
+
+/// Reply to [`StopActor`]: the stop is durably in the actor's mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopReply {
     pub outcome: Outcome,
 }
 
@@ -358,6 +388,9 @@ pub enum Rejection {
     ApprovalExistsWithDifferentVerdict { call_id: CallId, verdict: Verdict },
     #[error("turn {turn_id} is not running")]
     TurnNotRunning { turn_id: TurnId },
+    /// The actor was stopped: it takes nothing more.
+    #[error("actor {actor_id} is stopped")]
+    ActorStopped { actor_id: ActorId },
     /// The actor holds all it may (messages, turns or bytes), or its log is
     /// full; it takes no new message.
     #[error("actor {actor_id} is full: {reason}")]
@@ -382,6 +415,7 @@ impl Rejection {
             | Self::NoPendingApproval { .. }
             | Self::ApprovalExistsWithDifferentVerdict { .. }
             | Self::TurnNotRunning { .. }
+            | Self::ActorStopped { .. }
             | Self::ActorFull { .. } => 409,
             Self::TooManyActors { .. } | Self::TooManyFollowers { .. } => 503,
         }

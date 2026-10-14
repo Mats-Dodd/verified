@@ -24,7 +24,7 @@ use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    ActorSummary, Approve, CreateActor, MessageText, Rejection, SendMessage, Verdict,
+    ActorSummary, Approve, CreateActor, MessageText, Rejection, SendMessage, StopActor, Verdict,
 };
 use verified_wire::stream::{Freshness, Offset};
 use verified_wire::transcript::{Part, ToolPart, ToolState, Transcript};
@@ -65,6 +65,10 @@ pub enum Msg {
     /// Send the draft, or resend the message whose delivery failed.
     Submit(Stamp),
     CancelTurn,
+    /// Ask to stop the actor followed (Ctrl-K): `y` confirms it.
+    AskStop(Stamp),
+    /// Confirm the stop asked for (`true`), or drop it.
+    ConfirmStop(bool),
     /// Answer the approval prompt.
     Decide(Verdict),
     /// Follow the next actor in the tree (Tab), or the previous (Shift-Tab).
@@ -98,6 +102,15 @@ struct Pending {
     message_id: MessageId,
     text: MessageText,
     delivery: Delivery,
+}
+
+/// A stop of an actor: asked for and awaiting the user's `y`, or on its
+/// way. Its id is reused on retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stopping {
+    actor: ActorId,
+    stop_id: MessageId,
+    confirmed: bool,
 }
 
 /// Each turn's rendered lines, keyed by revision.
@@ -151,6 +164,8 @@ pub struct App {
     approving: Option<CallId>,
     /// The turn whose cancellation is being sent.
     cancelling: Option<TurnId>,
+    /// The stop being confirmed or sent.
+    stopping: Option<Stopping>,
     /// The last thing worth telling the user.
     notice: Option<String>,
     /// The first line shown, or `None` to follow the end.
@@ -205,7 +220,16 @@ impl App {
     /// No message waits for the daemon's acknowledgement.
     #[must_use]
     pub const fn settled(&self) -> bool {
-        self.pending.is_none() && self.approving.is_none() && self.cancelling.is_none()
+        self.pending.is_none()
+            && self.approving.is_none()
+            && self.cancelling.is_none()
+            && self.stopping.is_none()
+    }
+
+    /// A stop awaits the user's `y`.
+    #[must_use]
+    pub fn confirming_stop(&self) -> bool {
+        self.stopping.is_some_and(|stopping| !stopping.confirmed)
     }
 
     /// The daemon has not acknowledged the actor yet.
@@ -408,6 +432,41 @@ impl App {
         })
     }
 
+    /// Asks to stop the actor followed; nothing is sent until `y`.
+    fn ask_stop(&mut self, stamp: Stamp) -> Cmd {
+        if self.creating() || self.stopping.is_some() {
+            return Cmd::None;
+        }
+        self.stopping = Some(Stopping {
+            actor: self.actor,
+            stop_id: MessageId::from_parts(stamp.at, &stamp.entropy),
+            confirmed: false,
+        });
+        self.notice = Some("stop this actor and every actor it spawned? (y/n)".to_owned());
+        Cmd::None
+    }
+
+    fn confirm_stop(&mut self, confirmed: bool) -> Cmd {
+        let Some(stopping) = self.stopping.filter(|stopping| !stopping.confirmed) else {
+            return Cmd::None;
+        };
+        self.notice = None;
+        if !confirmed {
+            self.stopping = None;
+            return Cmd::None;
+        }
+        self.stopping = Some(Stopping {
+            confirmed: true,
+            ..stopping
+        });
+        Cmd::Send(Command::Stop {
+            actor: stopping.actor,
+            body: StopActor {
+                stop_id: stopping.stop_id,
+            },
+        })
+    }
+
     fn decide(&mut self, verdict: Verdict) -> Cmd {
         if self.approving.is_some() {
             return Cmd::None;
@@ -540,6 +599,17 @@ impl App {
                 }
                 Cmd::None
             }
+            Answer::Stopped { stop_id, result } => {
+                if self
+                    .stopping
+                    .take_if(|stopping| stopping.confirmed && stopping.stop_id == stop_id)
+                    .is_some()
+                    && let Err(error) = result
+                {
+                    self.notice = Some(format!("cannot stop: {}", explain(&error)));
+                }
+                Cmd::None
+            }
         }
     }
 
@@ -649,6 +719,7 @@ impl App {
             pending: None,
             approving: None,
             cancelling: None,
+            stopping: None,
             notice: None,
             scroll: None,
             rendered: Vec::new(),
@@ -679,6 +750,16 @@ impl App {
         }
         if is_ctrl(&key, 'r') {
             return Some(Msg::Reconnect);
+        }
+        if is_ctrl(&key, 'k') {
+            return Some(Msg::AskStop(stamp));
+        }
+        // A stop awaiting its `y` takes the next key.
+        if self.confirming_stop() {
+            return Some(Msg::ConfirmStop(matches!(
+                key.code,
+                KeyCode::Char('y' | 'Y')
+            )));
         }
         let prompt = self.awaiting_approval().is_some();
         match key.code {
@@ -741,6 +822,8 @@ impl App {
             }
             Msg::Submit(stamp) => self.submit(stamp),
             Msg::CancelTurn => self.cancel_turn(),
+            Msg::AskStop(stamp) => self.ask_stop(stamp),
+            Msg::ConfirmStop(confirmed) => self.confirm_stop(confirmed),
             Msg::Decide(verdict) => self.decide(verdict),
             Msg::Switch(direction) => self.switch(direction),
             Msg::Scroll(scroll) => {
@@ -858,9 +941,9 @@ impl App {
 /// purpose: each new kind of refusal gets its own thought here.
 fn refusal(rejection: &Rejection) -> String {
     let hint = match rejection {
-        Rejection::UnknownActor { .. } | Rejection::ActorFull { .. } => {
-            Some("restart verified for a new session")
-        }
+        Rejection::UnknownActor { .. }
+        | Rejection::ActorFull { .. }
+        | Rejection::ActorStopped { .. } => Some("restart verified for a new session"),
         Rejection::TooManyActors { .. } => Some("close another session's client"),
         Rejection::TooManyFollowers { .. } => Some("close another client of this actor"),
         Rejection::Malformed { .. }

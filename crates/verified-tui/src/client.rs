@@ -42,7 +42,7 @@ use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
     ActorList, Approve, ApproveReply, Cancel, CancelReply, CreateActor, CreateActorReply,
-    DecodeError, Rejection, SendMessage, SendMessageReply, decode_reply,
+    DecodeError, Rejection, SendMessage, SendMessageReply, StopActor, StopReply, decode_reply,
 };
 use verified_wire::sse::{SseDecoder, SseError};
 use verified_wire::stream::{Control, Offset, StreamError, StreamEvent, query};
@@ -116,6 +116,7 @@ impl ClientError {
                 | Rejection::NoPendingApproval { .. }
                 | Rejection::ApprovalExistsWithDifferentVerdict { .. }
                 | Rejection::TurnNotRunning { .. }
+                | Rejection::ActorStopped { .. }
                 | Rejection::ActorFull { .. } => Recovery::GiveUp,
             },
             Self::Status { .. }
@@ -150,6 +151,11 @@ pub enum Command {
         actor: ActorId,
         turn: TurnId,
     },
+    /// Stops `actor` and every actor it spawned.
+    Stop {
+        actor: ActorId,
+        body: StopActor,
+    },
 }
 
 /// The daemon's answer to a [`Command`], after any retries.
@@ -171,6 +177,10 @@ pub enum Answer {
     Cancelled {
         turn_id: TurnId,
         result: Result<CancelReply, ClientError>,
+    },
+    Stopped {
+        stop_id: MessageId,
+        result: Result<StopReply, ClientError>,
     },
 }
 
@@ -261,6 +271,12 @@ impl Client {
                         format!("/actors/{actor}/cancel"),
                         Cancel { turn_id: turn }.encode(),
                     )
+                    .await,
+            },
+            Command::Stop { actor, body } => Answer::Stopped {
+                stop_id: body.stop_id,
+                result: self
+                    .post(format!("/actors/{actor}/stop"), body.encode())
                     .await,
             },
         }

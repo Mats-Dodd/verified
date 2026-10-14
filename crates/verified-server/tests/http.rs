@@ -32,7 +32,7 @@ use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
     ActorList, ActorState, CreateActor, CreateActorReply, MessageText, Outcome, Rejection,
-    SendMessage, SendMessageReply, TaskList, decode_reply,
+    SendMessage, SendMessageReply, StopActor, StopReply, TaskList, decode_reply,
 };
 use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
@@ -650,6 +650,73 @@ async fn a_message_to_a_busy_actor_steers_its_running_turn() {
             StatusCode::NOT_FOUND,
             Rejection::UnknownActor { actor_id: unknown }
         )
+    );
+    tasks.shutdown().cancel();
+}
+
+/// Your stop over HTTP: durable before it is answered, a repeat is
+/// `exists`, and a stopped actor takes no other stop and no message.
+#[tokio::test]
+async fn a_stop_over_http_stops_the_actor() {
+    let (addr, tasks) = start().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let base = format!("http://{addr}");
+    let wire = WireLimits::DEFAULT;
+    let actor = session_at(8);
+    let create = CreateActor { actor_id: actor }.encode();
+    let (status, _) = call(&client, Method::POST, format!("{base}/actors"), create).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let at = UnixMillis::new(1_700_000_000_001).expect("t");
+    let stop = |byte: u8| {
+        StopActor {
+            stop_id: MessageId::from_parts(at, &[byte; 10]),
+        }
+        .encode()
+    };
+    let route = format!("{base}/actors/{actor}/stop");
+    let (status, body) = call(&client, Method::POST, route.clone(), stop(1)).await;
+    assert_eq!(status, StatusCode::CREATED, "the stop");
+    let reply: StopReply = decode_reply(&body, &wire).expect("a reply");
+    assert_eq!(reply.outcome, Outcome::Created);
+    let (status, body) = call(&client, Method::POST, route.clone(), stop(1)).await;
+    assert_eq!(status, StatusCode::OK, "a repeat");
+    let reply: StopReply = decode_reply(&body, &wire).expect("a reply");
+    assert_eq!(reply.outcome, Outcome::Exists);
+    let (status, body) = call(&client, Method::POST, route, stop(2)).await;
+    assert_eq!(
+        rejected(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Rejection::ActorStopped { actor_id: actor }
+        ),
+        "another stop"
+    );
+    let message = SendMessage {
+        message_id: MessageId::from_parts(at, &[3; 10]),
+        text: MessageText::parse("hello".to_owned(), &wire).expect("text"),
+    };
+    let (status, body) = call(
+        &client,
+        Method::POST,
+        format!("{base}/actors/{actor}/messages"),
+        message.encode(),
+    )
+    .await;
+    assert_eq!(
+        rejected(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Rejection::ActorStopped { actor_id: actor }
+        ),
+        "a message"
+    );
+    let listed = actors(&client, &base).await;
+    assert!(
+        listed
+            .actors
+            .iter()
+            .any(|summary| summary.actor_id == actor && summary.state == ActorState::Stopped),
+        "{listed:?}"
     );
     tasks.shutdown().cancel();
 }

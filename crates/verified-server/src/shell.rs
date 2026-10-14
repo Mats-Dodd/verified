@@ -58,7 +58,7 @@ use verified_domain::{
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
     Approve, ApproveReply, Cancel, CancelReply, Outcome as WireOutcome, Rejection, SendMessage,
-    SendMessageReply, Verdict as WireVerdict,
+    SendMessageReply, StopActor, StopReply, Verdict as WireVerdict,
 };
 use verified_wire::stream::{Freshness, Offset, encode_chunks};
 
@@ -379,6 +379,43 @@ impl ActorHandle {
             body: Body::Stop,
         })
         .await
+    }
+
+    /// Your stop, as a command: answered once it is durably in the
+    /// mailbox (`Created`, or `Exists` on a repeat of `command`).
+    ///
+    /// # Errors
+    /// The actor is stopped already (by another stop), its log is full, or
+    /// the actor is gone.
+    pub async fn stop_actor(&self, command: StopActor) -> Result<StopReply, CommandError> {
+        let outcome = match self.stop(command.stop_id).await? {
+            Outcome::Accepted => WireOutcome::Created,
+            Outcome::Exists => WireOutcome::Exists,
+            Outcome::Rejected(CoreRejection::Stopped) => {
+                return Err(Rejection::ActorStopped {
+                    actor_id: self.session,
+                }
+                .into());
+            }
+            Outcome::Rejected(CoreRejection::Limit) => {
+                return Err(Rejection::ActorFull {
+                    actor_id: self.session,
+                    reason: "its log takes no more records".to_owned(),
+                }
+                .into());
+            }
+            Outcome::Rejected(CoreRejection::Unborn) => {
+                return Err(Rejection::UnknownActor {
+                    actor_id: self.session,
+                }
+                .into());
+            }
+            Outcome::Rejected(
+                CoreRejection::Mismatch | CoreRejection::UnknownCall | CoreRejection::NotRunning,
+            )
+            | Outcome::Stale => defect("a stop is accepted, a repeat, or refused"),
+        };
+        Ok(StopReply { outcome })
     }
 
     async fn ask<T, F>(&self, make: F) -> Result<T, Unavailable>
@@ -905,14 +942,18 @@ impl Session {
                     ),
                 });
             }
+            Outcome::Rejected(CoreRejection::Stopped) => {
+                return Err(Rejection::ActorStopped { actor_id: self.id });
+            }
             Outcome::Rejected(
-                CoreRejection::Stopped
-                | CoreRejection::Unborn
+                CoreRejection::Unborn
                 | CoreRejection::Mismatch
                 | CoreRejection::UnknownCall
                 | CoreRejection::NotRunning,
             )
-            | Outcome::Stale => defect("a message to a born actor is accepted, a repeat or full"),
+            | Outcome::Stale => {
+                defect("a message to a born actor is accepted, a repeat, full or stopped")
+            }
         };
         let Some((at, original)) = self.delivered(command.message_id) else {
             defect("the core took a message the log does not hold");
@@ -1039,15 +1080,19 @@ impl Session {
                     }),
                 }
             }
+            Outcome::Rejected(CoreRejection::Stopped) => {
+                Err(Rejection::ActorStopped { actor_id: self.id })
+            }
             Outcome::Exists
             | Outcome::Rejected(
-                CoreRejection::Stopped
-                | CoreRejection::Limit
+                CoreRejection::Limit
                 | CoreRejection::Unborn
                 | CoreRejection::Mismatch
                 | CoreRejection::NotRunning,
             )
-            | Outcome::Stale => defect("a verdict is accepted or for no call awaiting one"),
+            | Outcome::Stale => {
+                defect("a verdict is accepted, for no call awaiting one, or stopped")
+            }
         }
     }
 
@@ -1071,14 +1116,18 @@ impl Session {
                     Err(Rejection::TurnNotRunning { turn_id })
                 }
             }
+            Outcome::Rejected(CoreRejection::Stopped) => {
+                Err(Rejection::ActorStopped { actor_id: self.id })
+            }
             Outcome::Rejected(
-                CoreRejection::Stopped
-                | CoreRejection::Limit
+                CoreRejection::Limit
                 | CoreRejection::Unborn
                 | CoreRejection::Mismatch
                 | CoreRejection::UnknownCall,
             )
-            | Outcome::Stale => defect("an interrupt is accepted, a repeat or not running"),
+            | Outcome::Stale => {
+                defect("an interrupt is accepted, a repeat, not running or stopped")
+            }
         }
     }
 

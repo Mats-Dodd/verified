@@ -939,3 +939,53 @@ fn renders_the_actor_tree_and_running_tasks() {
     );
     insta::assert_snapshot!(screen(&mut app, 90, 16));
 }
+
+#[test]
+fn ctrl_k_stops_the_actor_followed_only_once_confirmed() {
+    let mut app = opened();
+    let ask = key(&app, KeyCode::Char('k'), KeyModifiers::CONTROL).expect("a message");
+    assert!(matches!(ask, Msg::AskStop(_)));
+    assert_eq!(
+        app.update(Msg::AskStop(stamp(4))),
+        Cmd::None,
+        "it asks first"
+    );
+    assert!(app.confirming_stop() && !app.settled());
+    assert!(
+        matches!(
+            key(&app, KeyCode::Char('n'), KeyModifiers::NONE),
+            Some(Msg::ConfirmStop(false))
+        ),
+        "the next key answers the question"
+    );
+    assert_eq!(app.update(Msg::ConfirmStop(false)), Cmd::None);
+    assert!(app.settled(), "dropped");
+    let _cmd = app.update(Msg::AskStop(stamp(5)));
+    let stop = StopActor {
+        stop_id: message_id(5),
+    };
+    assert_eq!(
+        app.update(Msg::ConfirmStop(true)),
+        Cmd::Send(Command::Stop {
+            actor: session(),
+            body: stop,
+        })
+    );
+    assert!(!app.settled(), "on its way");
+    let _cmd = answer(
+        &mut app,
+        Answer::Stopped {
+            stop_id: stop.stop_id,
+            result: Err(ClientError::Rejected(Rejection::ActorStopped {
+                actor_id: session(),
+            })),
+        },
+    );
+    assert!(app.settled());
+    assert!(
+        app.notice()
+            .is_some_and(|notice| notice.contains("stopped")),
+        "{:?}",
+        app.notice()
+    );
+}

@@ -114,6 +114,7 @@ async fn send(client: &Client, command: Command) -> Result<(), ClientError> {
         Answer::MessageSent { result, .. } => result.map(drop),
         Answer::Approved { result, .. } => result.map(drop),
         Answer::Cancelled { result, .. } => result.map(drop),
+        Answer::Stopped { result, .. } => result.map(drop),
     }
 }
 
