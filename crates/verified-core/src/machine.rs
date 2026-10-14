@@ -20,18 +20,23 @@
 //!   approved, and only a valid request is ever approved.
 //! - every grant is the user's command or a rule in force that fits the
 //!   call (A2, `grant_fits`): `apply` refuses any other `Approved`, and
-//!   `decide` grants by the first fitting rule (`rules::grant`) or asks.
+//!   `decide` grants by the first fitting rule (`rules::grant`) or asks. A
+//!   user's grant is recorded only on the user's approval command, as its
+//!   decision's first record (`honest`); `resume` records none.
 //! - an envelope is delivered at most once (O2, L4): a `Delivered` for an id
 //!   already seen does not apply.
 //! - `decide` and `resume` return records that apply, one after another,
 //!   to the state they were given (never a refusal), and every effect they
 //!   start is licensed (A1, `runs_ok`): a `RunTool` by its call's
-//!   `Dispatched` or a running task's, and a `Stop` by a running stop task's
-//!   `StopSent`, the very record its effect id names, in the current epoch.
+//!   `Dispatched` or by a running task started by that very call, and a
+//!   `Stop` by a running stop task's `StopSent`, the very record its effect
+//!   id names, in the current epoch.
 //!   For `decide` that record is one of the decision's own (`decided`):
 //!   nothing is started twice by later decisions. Only `resume` may start
 //!   again what was started before it, and never an `Unsafe` call or task,
-//!   in the new epoch (`resumed`, O1).
+//!   in the new epoch (`resumed`, O1), nor anything under a durable cancel
+//!   or stop (A3: a call reruns only while its turn proceeds, and a stopped
+//!   actor reruns only its stops).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
 //! - a result claims no more than v knows (H2, `result_fits`, `end_fits`):
@@ -39,12 +44,14 @@
 //!   dispatched (or a timer that never fired) and `Unknown` for one that
 //!   may have acted, besides what the core itself does at dispatch (a
 //!   background call's start, a `cancel`); a run reports only once
-//!   dispatched.
+//!   dispatched, and its report is recorded exactly as it came, only on
+//!   its `ToolDone` (`honest`).
 //! - cancel is revocation (A3): once a turn's cancel is durable, no step,
 //!   retry, approval or dispatch applies until the turn ends
 //!   (`lemma_nothing_starts_after_a_cancel`); once a stop is durable, no
 //!   turn, step, approval, dispatch or delivery applies, ever
-//!   (`lemma_nothing_starts_after_a_stop`).
+//!   (`lemma_nothing_starts_after_a_stop`). The stop cascade's `StopSent`
+//!   and their `Stop` effects are the only things a stopped actor starts.
 //! - a known outcome is never overwritten, and a task ends at most once
 //!   (H1): no record gives a resolved call another result
 //!   (`lemma_known_outcome_stays`) or ends an ended task
@@ -68,11 +75,17 @@
 //!   resolves `Ok` in the decision that dispatches it, and a `send` or
 //!   `spawn` on its delivery, never on another actor's turn.
 //! - the limits (B3): `decide` delivers no envelope past
-//!   `messages_per_actor`, starts no turn past `turns_per_actor`, no task
-//!   past `tasks_per_actor`, and no spawn past `depth`.
-//! - steering: a user's message while a step waits for approvals denies
-//!   them (`NotStarted(Steered)`), and notifications and agents' messages
-//!   that arrive together are carried together.
+//!   `messages_per_actor` (a stop always lands), starts no turn past
+//!   `turns_per_actor`, no task past `tasks_per_actor`, and no spawn past
+//!   `depth`.
+//! - steering: while a user's message waits, no call of the step waits for
+//!   the user: each is denied (`NotStarted(Steered)`), however the message
+//!   and the step met (during the model call, during the wait, or across a
+//!   crash); notifications and agents' messages that arrive together are
+//!   carried together.
+//! - a run is signalled at most once: Esc signals its turn's runs, a
+//!   `cancel` its task (`Task::cancelled`), and a later stop or deadline
+//!   signals neither again.
 
 #![expect(
     clippy::indexing_slicing,
@@ -1009,6 +1022,51 @@ pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> 
     }
 }
 
+/// A record the core does not decide on its own: the user's grant (A2),
+/// or a run's report (H2). A decision holds one only as its first record,
+/// and only from the event that brings it (`honest`).
+pub open spec fn given<P: Payload>(record: Record<P>) -> bool {
+    match record {
+        Record::Approved { by, .. } => by is User,
+        Record::ToolResult { output, .. } => output is Some,
+        Record::TaskEnded { output, .. } => output is Some,
+        _ => false,
+    }
+}
+
+/// `event` brings `record`: the user's approval command a `Grant::User`,
+/// and a run's report the result it records, exactly as reported.
+pub open spec fn gives<P: Payload>(event: Event<P>, record: Record<P>) -> bool {
+    match event {
+        Event::Approve { verdict, .. } => record is Approved && verdict == Verdict::Approve,
+        Event::ToolDone { exit, output, .. } => match record {
+            Record::ToolResult { exit: recorded, output: reported, .. } => recorded == exit && reported
+                == Some(output),
+            Record::TaskEnded { exit: recorded, output: reported, .. } => recorded == exit && reported
+                == Some(output),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// What `decide` records of the world and the user is what `event` says
+/// (A2, H2): a user's grant only on the user's approval command, a run's
+/// report only on that run's `ToolDone`, exactly as it came, and each only
+/// as the decision's first record. Every other record is the core's own.
+pub open spec fn honest<P: Payload>(event: Event<P>, records: Seq<Record<P>>) -> bool {
+    forall|index: int| 0 <= index < records.len() && given(#[trigger] records[index]) ==> index == 0 && gives(
+        event,
+        records[index],
+    )
+}
+
+/// `resume` records nothing of the world or the user: no user's grant, no
+/// run's report.
+pub open spec fn nothing_given<P: Payload>(records: Seq<Record<P>>) -> bool {
+    forall|index: int| 0 <= index < records.len() ==> !given(#[trigger] records[index])
+}
+
 /// The running turn is `turn`, and the user asked it to stop.
 pub open spec fn cancelled(view: CoreView, turn: TurnId) -> bool {
     match view.turn {
@@ -1617,6 +1675,9 @@ struct Plan<P: Payload> {
     start: Ghost<CoreView>,
     /// The sequence number of the decision's first record.
     from: u64,
+    /// The one record the event brings that the core does not decide on
+    /// its own (`given`): the user's grant or a run's report, if any.
+    given: Ghost<Option<Record<P>>>,
     scratch: Core<P>,
     records: Vec<Record<P>>,
     effects: Vec<Effect<P>>,
@@ -1630,6 +1691,9 @@ impl<P: Payload> Plan<P> {
         &&& forall|index: int|
             0 <= index < self.effects@.len() ==> !((#[trigger] self.effects@[index]) is RunTool) && !(
             self.effects@[index] is Stop)
+        &&& forall|index: int|
+            0 <= index < self.records@.len() && given(#[trigger] self.records@[index]) ==> index == 0
+                && self.given@ == Some(self.records@[index])
     }
 
     /// Appends `record`, applying it to the scratch copy, and returns its
@@ -1638,9 +1702,11 @@ impl<P: Payload> Plan<P> {
         requires
             old(self).inv(),
             spec_apply(old(self).scratch@, record) is Some,
+            given(record) ==> old(self).records@.len() == 0 && old(self).given@ == Some(record),
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
             final(self).from == old(self).from,
             final(self).scratch@ == spec_apply(old(self).scratch@, record)->0,
             final(self).effects@ == old(self).effects@,
@@ -1670,6 +1736,7 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
             final(self).from == old(self).from,
             final(self).scratch@ == old(self).scratch@,
     {
@@ -1710,6 +1777,7 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
             final(self).from == old(self).from,
             final(self).scratch@.turn == old(self).scratch@.turn,
             final(self).scratch@.epoch == old(self).scratch@.epoch,
@@ -1737,6 +1805,7 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
             final(self).from == old(self).from,
             final(self).scratch@.turn == old(self).scratch@.turn,
             final(self).scratch@.epoch == old(self).scratch@.epoch,
@@ -1776,6 +1845,7 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
             final(self).from == old(self).from,
             final(self).scratch@ == old(self).scratch@,
     {
@@ -1791,6 +1861,7 @@ impl<P: Payload> Plan<P> {
             invariant
                 self.inv(),
                 self.start == old(self).start,
+                self.given == old(self).given,
                 self.from == old(self).from,
                 self.scratch@ == old(self).scratch@,
                 count == self.scratch.calls@.len(),
@@ -1817,6 +1888,9 @@ impl<P: Payload> Plan<P> {
                 Runs::New => decided(self.start@, decision),
                 Runs::All => resumed(self.start@, decision),
             },
+            forall|index: int|
+                0 <= index < decision.records@.len() && given(#[trigger] decision.records@[index]) ==> index
+                    == 0 && self.given@ == Some(decision.records@[index]),
     {
         let mut plan = self;
         proof {
@@ -1850,6 +1924,8 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).started(reruns@),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
+            final(self).records@ == old(self).records@,
             final(self).scratch@ == old(self).scratch@,
             final(self).scratch.calls@ == old(self).scratch.calls@,
             final(self).scratch.tasks@ == old(self).scratch.tasks@,
@@ -1883,6 +1959,8 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).started(runs is All),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
+            final(self).records@ == old(self).records@,
             final(self).scratch@ == old(self).scratch@,
             final(self).scratch.tasks@ == old(self).scratch.tasks@,
             final(self).scratch.runs@ == old(self).scratch.runs@,
@@ -1894,6 +1972,7 @@ impl<P: Payload> Plan<P> {
         let ghost tasks = self.scratch.tasks@;
         let ghost task_runs = self.scratch.runs@;
         let ghost from = self.from;
+        let ghost records = self.records@;
         // A3: nothing reruns under a durable cancel or stop. `resume`
         // resolves every call dispatched before the crash when its turn is
         // cancelled (`resume_tools`), so this only states it.
@@ -1911,6 +1990,8 @@ impl<P: Payload> Plan<P> {
                 self.scratch.tasks@ == tasks,
                 self.scratch.runs@ == task_runs,
                 self.from == from,
+                self.records@ == records,
+                self.given == old(self).given,
                 count == self.scratch.calls@.len(),
                 proceeds == proceeding(self.scratch@),
             decreases count - index,
@@ -1952,6 +2033,8 @@ impl<P: Payload> Plan<P> {
         ensures
             final(self).started(runs is All),
             final(self).start == old(self).start,
+            final(self).given == old(self).given,
+            final(self).records@ == old(self).records@,
             final(self).scratch@ == old(self).scratch@,
             final(self).from == old(self).from,
     {
@@ -1959,6 +2042,7 @@ impl<P: Payload> Plan<P> {
         let ghost start = self.start@;
         let ghost scratch = self.scratch@;
         let ghost from = self.from;
+        let ghost records = self.records@;
         let count = self.scratch.tasks.len();
         let mut at: usize = 0;
         while at < count
@@ -1967,6 +2051,8 @@ impl<P: Payload> Plan<P> {
                 self.start@ == start,
                 self.scratch@ == scratch,
                 self.from == from,
+                self.records@ == records,
+                self.given == old(self).given,
                 count == self.scratch.tasks@.len(),
                 self.scratch.runs@.len() == count,
             decreases count - at,
@@ -2377,7 +2463,7 @@ impl<P: Payload> Core<P> {
         ensures
             match granted {
                 Granted::Invalid => self@.calls[index as int].shape is None,
-                Granted::Rule(by) => self@.calls[index as int].shape is Some && grant_fits(
+                Granted::Rule(by) => by is Rule && self@.calls[index as int].shape is Some && grant_fits(
                     by,
                     self@,
                     index as int,
@@ -3188,10 +3274,13 @@ impl<P: Payload> Core<P> {
             plan.inv(),
             plan.start@ == self@,
             plan.scratch@ == self@,
+            plan.records@.len() == 0,
+            plan.given@ is None,
     {
         let plan = Plan {
             start: Ghost(self@),
             from: self.seq,
+            given: Ghost(None),
             scratch: self.scratch(),
             records: Vec::new(),
             effects: Vec::new(),
@@ -3211,6 +3300,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3250,6 +3340,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
@@ -3280,6 +3371,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3309,6 +3401,7 @@ impl<P: Payload> Core<P> {
             invariant
                 plan.inv(),
                 plan.start == old(plan).start,
+                plan.given == old(plan).given,
                 plan.from == old(plan).from,
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.stopped == stopped,
@@ -3357,6 +3450,7 @@ impl<P: Payload> Core<P> {
                 invariant
                     plan.inv(),
                     plan.start == old(plan).start,
+                    plan.given == old(plan).given,
                     plan.from == old(plan).from,
                     plan.scratch@.epoch == old(plan).scratch@.epoch,
                     plan.scratch@.stopped == stopped,
@@ -3418,6 +3512,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3459,6 +3554,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3494,6 +3590,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
@@ -3517,6 +3614,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3539,6 +3637,7 @@ impl<P: Payload> Core<P> {
                     invariant
                         plan.inv(),
                         plan.start == old(plan).start,
+                        plan.given == old(plan).given,
                         plan.from == old(plan).from,
                         plan.scratch@ == old(plan).scratch@,
                         plan.scratch@.turn == Turn::Open(open),
@@ -3566,6 +3665,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -3576,6 +3676,7 @@ impl<P: Payload> Core<P> {
             invariant
                 plan.inv(),
                 plan.start == old(plan).start,
+                plan.given == old(plan).given,
                 plan.from == old(plan).from,
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.stopped == old(plan).scratch@.stopped,
@@ -3610,6 +3711,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped,
@@ -3620,6 +3722,7 @@ impl<P: Payload> Core<P> {
             invariant
                 plan.inv(),
                 plan.start == old(plan).start,
+                plan.given == old(plan).given,
                 plan.from == old(plan).from,
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.stopped,
@@ -3646,6 +3749,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
@@ -3667,6 +3771,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(event, decision.records@),
     {
         match event {
             Event::Born { born } => self.on_born(born),
@@ -3687,6 +3792,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Born { born }, decision.records@),
     {
         if let Some(already) = &self.born {
             return quiet(
@@ -3710,6 +3816,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Rules { rules, file }, decision.records@),
     {
         let mut plan = self.plan();
         plan.emit(Record::RulesLoaded { rules, file });
@@ -3726,6 +3833,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Deliver { envelope }, decision.records@),
     {
         let Some(born) = &self.born else {
             return quiet(Outcome::Rejected(Rejection::Unborn));
@@ -3762,6 +3870,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Approve { call: *call, verdict }, decision.records@),
     {
         let mut plan = self.plan();
         let Some(open) = plan.open() else {
@@ -3801,6 +3910,8 @@ impl<P: Payload> Core<P> {
         }
         match verdict {
             Verdict::Approve => {
+                // The one grant only your command gives (A2).
+                plan.given = Ghost(Some(Record::Approved { call: CallIx(index), by: Grant::User }));
                 plan.emit(Record::Approved { call: CallIx(index), by: Grant::User });
             },
             Verdict::Deny => plan.resolve(index, Exit::NotStarted(Unstarted::Denied)),
@@ -3816,6 +3927,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Interrupt { turn }, decision.records@),
     {
         let mut plan = self.plan();
         let Some(open) = plan.open() else {
@@ -3861,6 +3973,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::ModelParts { id, parts }, decision.records@),
     {
         let Some(open) = self.live_model(id) else {
             return quiet(Outcome::Stale);
@@ -3899,6 +4012,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::ModelDone { id, result }, decision.records@),
     {
         let Some(open) = self.live_model(id) else {
             return quiet(Outcome::Stale);
@@ -4028,15 +4142,19 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::ToolDone { id, exit, output }, decision.records@),
     {
         let mut plan = self.plan();
+        // The run's report, recorded exactly as it came (H2).
         if let Some(index) = Self::running_call(&plan, id) {
+            plan.given = Ghost(Some(Record::ToolResult { call: CallIx(index), exit, output: Some(output) }));
             plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
             self.settle(&mut plan);
         } else if Self::task_of(&plan, id).is_some() {
             proof {
                 assert(running(plan.scratch@.tasks, id.seq));
             };
+            plan.given = Ghost(Some(Record::TaskEnded { task: TaskId(id.seq), exit, output: Some(output) }));
             plan.emit(Record::TaskEnded { task: TaskId(id.seq), exit, output: Some(output) });
         } else {
             return quiet(Outcome::Stale);
@@ -4054,6 +4172,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Expired { id }, decision.records@),
     {
         let mut plan = self.plan();
         if let Some(index) = Self::running_call(&plan, id) {
@@ -4084,6 +4203,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             decided(self@, decision),
+            honest(Event::Woke { id }, decision.records@),
     {
         let mut plan = self.plan();
         let Some(open) = plan.open() else {
@@ -4125,6 +4245,7 @@ impl<P: Payload> Core<P> {
             self.wf(),
         ensures
             resumed(self@, decision),
+            nothing_given(decision.records@),
     {
         let mut plan = self.plan();
         let epoch = Epoch(bump(self.epoch.0));
@@ -4188,6 +4309,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.turn == old(plan).scratch@.turn,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
@@ -4205,6 +4327,7 @@ impl<P: Payload> Core<P> {
             invariant
                 plan.inv(),
                 plan.start == old(plan).start,
+                plan.given == old(plan).given,
                 plan.from == old(plan).from,
                 plan.scratch@.turn == Turn::Open(open),
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
@@ -4260,6 +4383,7 @@ impl<P: Payload> Core<P> {
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
             final(plan).scratch@.stopped == old(plan).scratch@.stopped,
@@ -4274,6 +4398,7 @@ impl<P: Payload> Core<P> {
             invariant
                 plan.inv(),
                 plan.start == old(plan).start,
+                plan.given == old(plan).given,
                 plan.from == old(plan).from,
                 plan.scratch@.epoch == old(plan).scratch@.epoch,
                 plan.scratch@.stopped == stopped,
