@@ -95,11 +95,14 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
                     },
                 ));
             }
-            Entry::Shell(Observation::Passed(
-                Barrier::GroupWritten { .. }
-                | Barrier::Delivering { .. }
-                | Barrier::Delivered { .. },
-            ))
+            Entry::Shell(
+                Observation::Requested { .. }
+                | Observation::Passed(
+                    Barrier::GroupWritten { .. }
+                    | Barrier::Delivering { .. }
+                    | Barrier::Delivered { .. },
+                ),
+            )
             | Entry::Listed { .. }
             | Entry::Boot { .. }
             | Entry::Wrote { .. }

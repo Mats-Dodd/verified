@@ -84,8 +84,9 @@ pub struct ServerLimits {
     /// before it stops waiting and records `Unknown` (B2). A `read` or an
     /// `edit` has no bound of its own: this is its deadline.
     pub deadline_slack: Millis,
-    /// The deadline of a delivery between actors (a `send`, a `spawn`, a
-    /// stop): the recipient's append, bounded.
+    /// The deadline of a delivery between actors (a `send`, a `spawn`):
+    /// the recipient's append, bounded. A stop has none: it is sent until
+    /// it lands (O2).
     pub deliver_deadline: Millis,
     /// How long a background `bash` may run before its process group is
     /// killed: its own timeout, as `exec_timeout` is a foreground one's.
@@ -188,6 +189,7 @@ impl ServerLimits {
     /// the run's own timeout and drains, so a run's honest report normally
     /// comes first (B2). `None` for a run that reports at once (`tasks`)
     /// or is a timer (`wake`), and for a `cancel`, which the core does.
+    /// A stop is no call and has none.
     #[must_use]
     pub const fn deadline(&self, args: &ToolArgs) -> Option<Millis> {
         let drains = self.exec_drain.get().saturating_mul(2);

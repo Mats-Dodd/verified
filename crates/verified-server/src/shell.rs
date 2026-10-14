@@ -151,14 +151,18 @@ pub enum Planted {
     /// and the message is never read.
     #[cfg(feature = "sim")]
     ConsumeAtInjection,
-    /// Drop a stop's delivery to a child (breaks the stop cascade): the
-    /// child runs on though its parent stopped.
+    /// Drop a stop's delivery to a child and report it done (breaks O2 for
+    /// a stop): the child runs on though its parent stopped.
     #[cfg(feature = "sim")]
     StopSkipsChildren,
     /// Render a message where it was delivered, between a running step's
     /// `tool_use` and its results (breaks L5's well-formed history).
     #[cfg(feature = "sim")]
     SpliceSteering,
+    /// Never tell the model a task's end, though the step that carries it
+    /// records it consumed (breaks H3 and L4: the model never sees it).
+    #[cfg(feature = "sim")]
+    UntoldTaskEnds,
     /// Acknowledge a group commit without its fsync (breaks L3): a crash
     /// loses records the shell acted on. The simulation's log store
     /// plants it ([`crate::log::FileLogStore::skipping_sync`]).
@@ -524,6 +528,11 @@ pub struct Session {
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// The deadline of each run in flight (B2): cancelled when it reports.
     deadlines: BTreeMap<EffectId, CancellationToken>,
+    /// Each child this session's spawn delivery last ran for, and a token
+    /// cancelled once that delivery is done: a stop to the child waits for
+    /// it, so it never finds the child unborn while the spawn may still
+    /// birth it.
+    spawning: BTreeMap<ActorId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
     /// Why the log stopped taking records, once it has: from then on the
@@ -604,6 +613,7 @@ impl Session {
             registry,
             cancels: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            spawning: BTreeMap::new(),
             held_bytes,
             full: None,
         };
@@ -803,9 +813,9 @@ impl Session {
     }
 
     /// The log refused an append: the session fails stop (L3). It records
-    /// why, and stops its model calls (they are not effects, and nothing
-    /// they say could be recorded). Tool runs already started run on; what
-    /// they report is dropped, and a restart resolves them from the log.
+    /// why, and asks every model call and run it holds to stop, since
+    /// nothing they say could be recorded. Each was dispatched durably;
+    /// what it reports is dropped, and a restart resolves it from the log.
     fn halt(&mut self, why: String) {
         self.full.get_or_insert(why);
         for cancel in self.cancels.values() {
@@ -1037,14 +1047,16 @@ impl Session {
             Outcome::Rejected(CoreRejection::Stopped) => {
                 return Err(Rejection::ActorStopped { actor_id: self.id });
             }
+            // A log a spawn made whose birth a crash tore, and that no
+            // spawn will birth: no actor lives there.
+            Outcome::Rejected(CoreRejection::Unborn) => {
+                return Err(Rejection::UnknownActor { actor_id: self.id });
+            }
             Outcome::Rejected(
-                CoreRejection::Unborn
-                | CoreRejection::Mismatch
-                | CoreRejection::UnknownCall
-                | CoreRejection::NotRunning,
+                CoreRejection::Mismatch | CoreRejection::UnknownCall | CoreRejection::NotRunning,
             )
             | Outcome::Stale => {
-                defect("a message to a born actor is accepted, a repeat, full or stopped")
+                defect("a message is accepted, a repeat, full, stopped or to no actor")
             }
         };
         let Some((at, original)) = self.delivered(command.message_id) else {
@@ -1271,7 +1283,8 @@ impl Session {
                     &self.config.system,
                     self.config.limits.model_max_tokens,
                 );
-                // The planted defect: a steer spliced into its step.
+                // The planted defects: a steer spliced into its step, or a
+                // task's end never told.
                 #[cfg(feature = "sim")]
                 let request = if self.config.planted == Planted::SpliceSteering {
                     history::spliced(
@@ -1279,9 +1292,21 @@ impl Session {
                         &self.config.system,
                         self.config.limits.model_max_tokens,
                     )
+                } else if self.config.planted == Planted::UntoldTaskEnds {
+                    history::untold(
+                        &self.records,
+                        &self.config.system,
+                        self.config.limits.model_max_tokens,
+                    )
                 } else {
                     request
                 };
+                #[cfg(feature = "sim")]
+                crate::shim::observe(crate::shim::Observation::Requested {
+                    actor: self.id,
+                    id,
+                    said: history::said(&request),
+                });
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 let task = ModelTask {
@@ -1315,11 +1340,27 @@ impl Session {
                     report(&inbox, Event::Woke { id }).await;
                 });
             }
+            // A stop has no deadline: it is sent until it lands (O2). Its
+            // only waits are its parent's spawn of the child, if one is in
+            // flight, then the registry and the child's append.
             Effect::Stop { id, child } => {
-                // The planted defect: the stop never reaches the child.
+                // The planted defect: the stop never reaches the child,
+                // and says it did.
                 #[cfg(feature = "sim")]
                 if self.config.planted == Planted::StopSkipsChildren {
-                    self.arm(id, self.config.limits.deliver_deadline);
+                    let inbox = self.inbox.clone();
+                    self.seams.tasks.spawn(async move {
+                        let output = measure(ToolOutput::complete(format!("stopped {child}")));
+                        report(
+                            &inbox,
+                            Event::ToolDone {
+                                id,
+                                exit: Exit::Ok,
+                                output,
+                            },
+                        )
+                        .await;
+                    });
                     return;
                 }
                 let envelope = Envelope {
@@ -1334,14 +1375,17 @@ impl Session {
                 };
                 let (registry, actor) = (self.registry.clone(), self.id);
                 let inbox = self.inbox.clone();
+                let spawn = self.spawning.get(&child).cloned();
                 self.seams.tasks.spawn(async move {
+                    if let Some(spawn) = spawn {
+                        spawn.cancelled().await;
+                    }
                     barrier(Barrier::Delivering { actor, id }).await;
                     let (exit, said) = outbox::stop(&registry, envelope).await;
                     barrier(Barrier::Delivered { actor, id }).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
-                self.arm(id, self.config.limits.deliver_deadline);
             }
         }
     }
@@ -1411,11 +1455,16 @@ impl Session {
             }
             ToolArgs::Spawn { .. } | ToolArgs::Send { .. } => {
                 let work = self.outbound(&call);
+                let done = CancellationToken::new();
+                if let ToolArgs::Spawn { child, .. } = call.args() {
+                    self.spawning.insert(*child, done.clone());
+                }
                 let (registry, actor) = (self.registry.clone(), self.id);
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
                     barrier(Barrier::Delivering { actor, id }).await;
                     let (exit, said) = outbox::deliver(&registry, work).await;
+                    done.cancel();
                     barrier(Barrier::Delivered { actor, id }).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;

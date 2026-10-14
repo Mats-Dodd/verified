@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
+use verified_core::{Outcome, Rejection};
 use verified_domain::id::ActorId;
 use verified_domain::{ActorName, Born, Record, Request, Tool};
 use verified_wire::command::Outcome as WireOutcome;
@@ -81,6 +82,10 @@ fn io_error(what: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Daemon
 pub enum CreateError {
     #[error("the daemon hosts its limit of {limit} actors")]
     Full { limit: usize },
+    /// Its log exists, but its birth was refused (past the depth limit, or
+    /// its log is full): it is no actor that can act.
+    #[error("its birth was refused: {rejection:?}")]
+    Unborn { rejection: Rejection },
     #[error(transparent)]
     Log(#[from] LogError),
     #[error("the daemon is stopping")]
@@ -88,8 +93,8 @@ pub enum CreateError {
 }
 
 /// One actor the daemon hosts: its handle, and who it is once its `Born`
-/// is in its log (`None`: a log a spawn made before its birth was
-/// durable; it is hosted, and born when the spawn is run again).
+/// is durable in its log (`None`: a log a spawn made whose birth is not
+/// durable yet, or never was; it is hosted, and born by its spawn).
 #[derive(Clone)]
 struct Entry {
     handle: ActorHandle,
@@ -116,6 +121,10 @@ enum RegistryInput {
     },
     List {
         reply: oneshot::Sender<Vec<Listed>>,
+    },
+    /// The actor's `Born` is durable.
+    Born {
+        born: Born,
     },
 }
 
@@ -169,10 +178,20 @@ impl Registry {
         // answers that it exists), and so is a root whose log a crash left
         // unborn. The caller waits on the actor, never the registry.
         if unborn || born.parent.is_some() {
-            handle
-                .born(born)
+            match handle
+                .born(born.clone())
                 .await
-                .map_err(|_gone| CreateError::Unavailable)?;
+                .map_err(|_gone| CreateError::Unavailable)?
+            {
+                Outcome::Accepted | Outcome::Exists => {}
+                Outcome::Rejected(rejection) => return Err(CreateError::Unborn { rejection }),
+                Outcome::Stale => crate::defect("a birth is accepted, a repeat, or refused"),
+            }
+            // Listed from now on: its birth is durable.
+            self.inbox
+                .send(RegistryInput::Born { born })
+                .await
+                .map_err(|_closed| CreateError::Unavailable)?;
         }
         Ok((outcome, handle))
     }
@@ -341,15 +360,15 @@ impl RegistryTask {
         // delivers its birth, as a step of its own (the order the model
         // checks): a crash between them leaves it unborn, and the spawn
         // run again births it.
+        // A root is listed at once: its first resume records its birth
+        // before it takes any input. A child is listed once its spawn has
+        // made its birth durable (`RegistryInput::Born`).
         let root = born.parent.is_none();
         let handle = self
             .spawn_session(actor, log, Vec::new(), root.then(|| born.clone()))
             .unwrap_or_else(|error| {
                 crate::defect(&format!("an empty log always replays: {error}"))
             });
-        if let Some(entry) = self.actors.get_mut(&actor) {
-            entry.born = Some(born);
-        }
         Ok((WireOutcome::Created, handle, !root))
     }
 
@@ -369,6 +388,11 @@ impl RegistryTask {
                 }
                 Some(RegistryInput::Lookup { actor, reply }) => {
                     drop(reply.send(self.actors.get(&actor).map(|entry| entry.handle.clone())));
+                }
+                Some(RegistryInput::Born { born }) => {
+                    if let Some(entry) = self.actors.get_mut(&born.actor) {
+                        entry.born.get_or_insert(born);
+                    }
                 }
                 Some(RegistryInput::List { reply }) => {
                     let listed = self

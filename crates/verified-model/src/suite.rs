@@ -396,6 +396,29 @@ pub fn chatter_goes_quiet_within_limits() -> Harness {
     )
 }
 
+/// O2 for a stop: a root spawns a child that runs a command, the user
+/// stops the root, and a run or a delivery may miss its deadline and the
+/// daemon crash anywhere. The stop reaches the child.
+#[must_use]
+pub fn stops_across_deadlines_and_crashes() -> Harness {
+    Harness::bounded(
+        actor_limits(),
+        Bounded {
+            stops: 1,
+            expiries: true,
+            max_crashes: 1,
+            ..actors(
+                2,
+                1,
+                vec![
+                    vec![vec![plain(Tool::Spawn)]],
+                    vec![vec![plain(Tool::Bash)]],
+                ],
+            )
+        },
+    )
+}
+
 /// Every bound BFS checks the model under, by its check's name.
 #[must_use]
 pub fn all() -> Vec<(&'static str, Harness)> {
@@ -429,6 +452,10 @@ pub fn all() -> Vec<(&'static str, Harness)> {
         (
             "chatter_goes_quiet_within_limits",
             chatter_goes_quiet_within_limits(),
+        ),
+        (
+            "stops_across_deadlines_and_crashes",
+            stops_across_deadlines_and_crashes(),
         ),
     ]
 }

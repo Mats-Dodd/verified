@@ -45,6 +45,9 @@
 //! - I13 every request the model was sent is a well-formed conversation
 //!   (L5): each `tool_use` answered by exactly one result in the next
 //!   message, before any text there.
+//! - I14 every model call is told what its step carried (H3, L4): each
+//!   envelope its `StepStarted` carries is in the request's last message,
+//!   a message by its text and a task's end as that task's notification.
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (B2): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between.
@@ -633,6 +636,9 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 boots.push(stamped.at);
                 disk.boot(at, files);
             }
+            Entry::Shell(Observation::Requested { actor, id, said }) => {
+                told(*actor, &logs.records(*actor), id.seq, said, &mut found);
+            }
             Entry::Shell(Observation::Refused { actor }) => {
                 halted.entry(*actor).or_insert(stamped.at);
                 refusals.push((*actor, stamped.at));
@@ -745,6 +751,68 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     edits_durable(&disk, &mut found);
     reads_exact(&last, &reads, &mut found);
     found
+}
+
+/// I14 for the model call whose `StepStarted` is at `seq` of `actor`'s
+/// `log`: each envelope the step carries is in `said`, the text blocks of
+/// the request's last message.
+fn told(
+    actor: ActorId,
+    log: &[Record<Parsed>],
+    seq: u64,
+    said: &[String],
+    found: &mut Vec<Violation>,
+) {
+    let Some(Record::StepStarted { carries, .. }) =
+        usize::try_from(seq).ok().and_then(|at| log.get(at))
+    else {
+        found.push(violation(
+            "I14",
+            format!("model call {seq} of {actor} has no StepStarted at its seq"),
+        ));
+        return;
+    };
+    for id in carries {
+        let text = match id {
+            EnvelopeId::Task(task) => Some(format!("task {} ended", task.0)),
+            EnvelopeId::User(_) | EnvelopeId::Minted { .. } => {
+                log.iter().find_map(|record| match record {
+                    Record::Delivered { envelope } if envelope.id == *id => match &envelope.body {
+                        Body::Text(text) => Some(text.body.clone()),
+                        Body::Stop => None,
+                    },
+                    Record::Delivered { .. }
+                    | Record::Born { .. }
+                    | Record::RulesLoaded { .. }
+                    | Record::TurnStarted { .. }
+                    | Record::StepStarted { .. }
+                    | Record::ModelOutput { .. }
+                    | Record::StepReset { .. }
+                    | Record::StepFinished { .. }
+                    | Record::Approved { .. }
+                    | Record::Dispatched { .. }
+                    | Record::ToolResult { .. }
+                    | Record::TaskEnded { .. }
+                    | Record::StopSent { .. }
+                    | Record::CancelRequested { .. }
+                    | Record::TurnEnded { .. }
+                    | Record::EpochBumped { .. } => None,
+                })
+            }
+        };
+        let seen = text
+            .as_deref()
+            .is_some_and(|text| said.iter().any(|block| block.contains(text)));
+        if !seen {
+            found.push(violation(
+                "I14",
+                format!(
+                    "model call {seq} of {actor} carried envelope {id:?}, which its request \
+                     never told ({text:?} not in {said:?})"
+                ),
+            ));
+        }
+    }
 }
 
 /// I15: every effect with a deadline resolved within it of its

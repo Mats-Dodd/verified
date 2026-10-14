@@ -592,6 +592,39 @@ fn a_missing_actor_limit_is_caught() {
     );
 }
 
+/// O2 for a stop: the user stops a root whose child runs a command, with
+/// deadlines and a crash anywhere. Every stop reaches its child.
+#[test]
+fn stops_across_deadlines_and_crashes() {
+    let states = check(
+        suite::stops_across_deadlines_and_crashes(),
+        &["a child is spawned", "a stop reaches a child"],
+    );
+    assert!(states > 1_000, "a real state space: {states}");
+}
+
+/// O2: a stop given up on at a deadline, then lost to a crash, never
+/// reaches the child.
+#[test]
+fn giving_up_on_a_stop_at_its_deadline_is_caught() {
+    caught(
+        suite::stops_across_deadlines_and_crashes(),
+        Bug::StopExpires,
+        &["every stop reaches its child"],
+    );
+}
+
+/// O2: a stop that lands while its child's spawn is in flight finds the
+/// child unborn, and the spawn then births a child that runs on.
+#[test]
+fn a_stop_before_its_childs_birth_is_caught() {
+    caught(
+        suite::chatter_goes_quiet_within_limits(),
+        Bug::StopBeforeBirth,
+        &["every stop reaches its child"],
+    );
+}
+
 /// Follows `path` from the initial state: each action must be one the
 /// model enables where it is taken, and every safety property must hold
 /// after it. Returns the state reached.

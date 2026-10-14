@@ -270,6 +270,13 @@ pub enum Bug {
     NoDeadline,
     /// The registry ignores its cap on actors (B3).
     NoActorLimit,
+    /// A stop has a deadline like any delivery, and v gives up on one that
+    /// misses it (O2): resolved `Unknown`, it is never sent again.
+    StopExpires,
+    /// A stop to a child lands while its parent's spawn of that child is
+    /// in flight (O2): the child is unborn, so the stop finds no actor,
+    /// and the spawn then births it.
+    StopBeforeBirth,
 }
 
 /// The core under `limits` in an abstract world.
@@ -1032,20 +1039,38 @@ impl Harness {
     }
 
     /// The next steps of the deliveries of the actor at `slot`: each lands
-    /// when its recipient's shell takes input.
-    fn landings(state: &World, slot: Slot, actions: &mut Vec<Action>) {
+    /// when its recipient's shell takes input. A stop to a child waits for
+    /// its parent's spawn of that child in flight, so it never finds the
+    /// child unborn while the spawn may still birth it.
+    fn landings(&self, state: &World, slot: Slot, actions: &mut Vec<Action>) {
         let Some(actor) = state.actor(slot) else {
             return;
+        };
+        let spawning = |child: Slot| {
+            actor.flights.values().any(|flight| {
+                matches!(
+                    flight.job,
+                    Job::Deliver {
+                        to: Some(to),
+                        what: Delivery::Spawn,
+                        ..
+                    } if to == child
+                )
+            })
         };
         for (id, flight) in &actor.flights {
             if let Job::Deliver {
                 to: Some(to),
+                what,
                 landing: Landing::Create | Landing::Born | Landing::Queued,
                 ..
             } = flight.job
                 && state
                     .actor(to)
                     .is_some_and(|recipient| !recipient.persisting())
+                && (what != Delivery::Stop
+                    || !spawning(to)
+                    || self.bug == Some(Bug::StopBeforeBirth))
             {
                 actions.push(Action::Land(slot, *id));
             }
@@ -1153,9 +1178,18 @@ impl Harness {
                         .filter(admitted)
                         .map(|event| Action::Deliver(slot, event)),
                 );
+                // A stop has no deadline: it is sent until it lands.
+                let stop = matches!(
+                    flight.job,
+                    Job::Deliver {
+                        what: Delivery::Stop,
+                        ..
+                    }
+                );
                 if bounded.expiries
                     && self.bug != Some(Bug::NoDeadline)
                     && matches!(flight.job, Job::Tool { .. } | Job::Deliver { .. })
+                    && (!stop || self.bug == Some(Bug::StopExpires))
                 {
                     actions.push(Action::Deliver(slot, Event::Expired { id }));
                 }
@@ -1394,9 +1428,9 @@ impl Harness {
             Some(Event::Deliver { envelope }) => {
                 let stop = matches!(envelope.body, Body::Stop);
                 let id_of = envelope.id;
-                let call = match &world.actor(slot)?.flights.get(&id)?.job {
-                    Job::Deliver { call, .. } => call.clone(),
-                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep => None,
+                let (call, what) = match &world.actor(slot)?.flights.get(&id)?.job {
+                    Job::Deliver { call, what, .. } => (call.clone(), *what),
+                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep => return None,
                 };
                 match self.deliver(world, to, Event::Deliver { envelope })? {
                     Outcome::Accepted => {
@@ -1406,6 +1440,16 @@ impl Harness {
                         Landing::Pending
                     }
                     Outcome::Exists => Landing::Answered(Exit::Ok),
+                    // A spawn made its child, so it acted (H2): a stopped
+                    // or full child is `Ok`, said so in its output.
+                    Outcome::Rejected(Rejection::Stopped | Rejection::Limit)
+                        if what == Delivery::Spawn =>
+                    {
+                        Landing::Answered(Exit::Ok)
+                    }
+                    Outcome::Rejected(_) | Outcome::Stale if what == Delivery::Spawn => {
+                        Landing::Answered(Exit::Unknown)
+                    }
                     Outcome::Rejected(rejection) => Landing::Answered(refused(rejection, stop)),
                     Outcome::Stale => Landing::Answered(Exit::NotStarted(Unstarted::Refused)),
                 }
@@ -1676,7 +1720,7 @@ impl Model for Harness {
                 }
             }
             self.executions(state, slot, actions);
-            Self::landings(state, slot, actions);
+            self.landings(state, slot, actions);
         }
         if self.may_crash(state) {
             // A crash keeps a prefix of every pending group.
@@ -1988,6 +2032,26 @@ impl Model for Harness {
             // Every path is finite (the world's faults and the user's
             // input are bounded), so this is checked on the states where a
             // path ends: fairness by finiteness.
+            // O2 for a stop: it is `Keyed`, so it reaches the child. Once
+            // the world settles, every child a stopped actor spawned is
+            // stopped too (an unborn one never acts).
+            Property::always(
+                "every stop reaches its child",
+                |model: &Self, world: &World| {
+                    !model.settled(world)
+                        || (0..world.actors.len()).all(|slot| {
+                            let Some(core) = model.core(world, slot) else {
+                                return true;
+                            };
+                            let parent = core
+                                .born()
+                                .and_then(|born| born.parent)
+                                .and_then(|parent| model.slot_of(parent))
+                                .and_then(|parent| model.core(world, parent));
+                            parent.is_none_or(|parent| !parent.stopped() || core.stopped())
+                        })
+                },
+            ),
             Property::eventually("the world settles", |model: &Self, world: &World| {
                 model.settled(world)
             }),

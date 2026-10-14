@@ -160,9 +160,9 @@ async fn create_actor(State(app): State<App>, body: Bytes) -> Response {
             encode_reply(&CreateActorReply { outcome }),
         ),
         Err(CreateError::Full { limit }) => rejection(&Rejection::TooManyActors { limit }),
-        Err(error @ (CreateError::Log(_) | CreateError::Unavailable)) => {
-            unavailable(&error.to_string())
-        }
+        Err(
+            error @ (CreateError::Log(_) | CreateError::Unborn { .. } | CreateError::Unavailable),
+        ) => unavailable(&error.to_string()),
     }
 }
 

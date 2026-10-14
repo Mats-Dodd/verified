@@ -2279,3 +2279,203 @@ async fn a_birth_a_crash_tore_is_recorded_again_as_it_was_made() {
     );
     second.tasks.shutdown().cancel();
 }
+
+/// Whether `log`'s actor holds a stop.
+fn holds_stop(log: &[Record<Parsed>]) -> bool {
+    log.iter().any(|record| {
+        matches!(record, Record::Delivered { envelope } if envelope.body == verified_domain::Body::Stop)
+    })
+}
+
+/// The first `Dispatched` of a spawn in `log`, once there is one.
+fn spawn_dispatched(log: &[Record<Parsed>]) -> bool {
+    log.iter()
+        .any(|record| matches!(record, Record::Dispatched { .. }))
+}
+
+/// A stop is `Keyed` and has no deadline (O2): one whose child's append
+/// stalls is still running when the daemon crashes, and the restart sends
+/// it again, so the stopped parent's child ends stopped.
+#[tokio::test]
+async fn a_stop_the_crash_caught_in_flight_lands_after_the_restart() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let disk = MemDisk::new();
+    let mut limits = limits();
+    limits.deliver_deadline = Millis::new(100);
+    // The child's append of v's stop never returns in the first daemon.
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(|_, records: &[Record<Parsed>]| {
+            let stop = records.iter().any(|record| {
+                matches!(record, Record::Delivered { envelope }
+                    if envelope.body == verified_domain::Body::Stop
+                        && envelope.from == verified_domain::Address::Runtime)
+            });
+            if stop { Act::Stall } else { Act::Append }
+        }),
+    );
+    let first = boot_on(
+        store,
+        Arc::<MemEnv>::clone(&env),
+        limits.clone(),
+        Planted::None,
+    )
+    .await;
+    let (_, handle) = first.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper hello"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        result_saying(log, "spawned helper").is_some()
+    })
+    .await;
+    let child = other(&log);
+    handle.stop(message_id(50)).await.expect("answered");
+    // Long past the old deadline of a delivery.
+    SystemClock.sleep(Millis::new(500)).await;
+    let log = records(&handle).await;
+    assert!(
+        !log.iter()
+            .any(|record| matches!(record, Record::TaskEnded { .. })),
+        "a stop is never given up on: {log:?}"
+    );
+    first.tasks.shutdown().cancel();
+    drop(handle);
+
+    let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
+    let child_handle = second.registry.lookup(child).await.expect("recovered");
+    let stopped = within(Duration::from_secs(5), until_log(&child_handle, holds_stop)).await;
+    second.tasks.shutdown().cancel();
+    assert!(stopped.is_ok(), "the stopped parent's child is stopped");
+}
+
+/// H2 for a spawn: once it has made its child, it has acted. A child
+/// stopped before its prompt lands is reported `Ok`, never `NotStarted`.
+#[tokio::test]
+async fn a_spawn_whose_child_is_stopped_before_its_prompt_is_ok() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let disk = MemDisk::new();
+    let limits = limits();
+    let parent = session_id();
+    // A child's birth is slow to become durable: time to stop it.
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let birth = records
+                .iter()
+                .any(|record| matches!(record, Record::Born { .. }));
+            if actor != parent && birth {
+                Act::Slow
+            } else {
+                Act::Append
+            }
+        }),
+    );
+    let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, Planted::None).await;
+    let (_, handle) = daemon.registry.create(parent).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper hello"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, spawn_dispatched).await;
+    let child = other(&log);
+    let child_handle = loop {
+        if let Some(found) = daemon.registry.lookup(child).await {
+            break found;
+        }
+        tokio::task::yield_now().await;
+    };
+    // Queued behind the slow birth: it lands before the prompt.
+    let stopped = child_handle.stop(message_id(60)).await;
+    let log = until_log(&handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::ToolResult { .. }))
+    })
+    .await;
+    let child_log = records(&child_handle).await;
+    daemon.tasks.shutdown().cancel();
+    assert_eq!(
+        stopped,
+        Ok(verified_core::Outcome::Accepted),
+        "{child_log:?}"
+    );
+    assert_eq!(
+        result_saying(&log, "spawned helper"),
+        Some(Exit::Ok),
+        "the spawn made a child: {log:?}"
+    );
+}
+
+/// A log a spawn made, whose birth a crash tore and which no spawn will
+/// birth (its parent was stopped), hosts no actor: a message to it is
+/// refused as to no actor, and the daemon lives on (L3: no crash loop).
+#[tokio::test]
+async fn a_message_to_an_unborn_actor_is_refused() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let disk = MemDisk::new();
+    let mut limits = limits();
+    // The spawn's deadline ends the stopped parent's turn.
+    limits.deliver_deadline = Millis::new(100);
+    let parent = session_id();
+    let (store, _) = Watched::new(
+        &disk,
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let birth = records
+                .iter()
+                .any(|record| matches!(record, Record::Born { .. }));
+            if actor != parent && birth {
+                Act::Stall
+            } else {
+                Act::Append
+            }
+        }),
+    );
+    let first = boot_on(
+        store,
+        Arc::<MemEnv>::clone(&env),
+        limits.clone(),
+        Planted::None,
+    )
+    .await;
+    let (_, handle) = first.registry.create(parent).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper hello"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, spawn_dispatched).await;
+    let child = other(&log);
+    handle.stop(message_id(50)).await.expect("answered");
+    until_log(&handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::TurnEnded { .. }))
+    })
+    .await;
+    first.tasks.shutdown().cancel();
+    drop(handle);
+
+    let second = boot(&disk, Arc::<MemEnv>::clone(&env)).await;
+    let unborn = second.registry.lookup(child).await.expect("hosted");
+    let answer = unborn.send_message(send(9, "hello?")).await;
+    let listed = second.registry.list().await;
+    let crashed = second.tasks.crashed().is_cancelled();
+    second.tasks.shutdown().cancel();
+    assert!(
+        matches!(
+            answer,
+            Err(CommandError::Rejected(Rejection::UnknownActor { .. }))
+        ),
+        "{answer:?}"
+    );
+    assert!(!crashed, "the daemon lives on");
+    assert!(
+        listed.iter().all(|listed| listed.actor != child),
+        "an unborn log is no actor: {listed:?}"
+    );
+}

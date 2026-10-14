@@ -591,6 +591,7 @@ fn the_actor_scenarios_break_nothing() {
         a_stopped_parent(),
         a_silent_run(),
         a_steer_while_a_command_runs(),
+        a_background_command(),
     ] {
         run::twice(&scenario)
             .map_err(|error| error.to_string())
@@ -759,6 +760,30 @@ fn a_stopped_parent() -> Scenario {
 fn a_stop_that_skips_a_child_fails() {
     let outcome = played(&a_stopped_parent(), Planted::StopSkipsChildren);
     assert!(broke(&outcome, "I12"), "{:#?}", outcome.violations);
+}
+
+/// A command in the background: its end is a notification, which starts
+/// the next turn.
+fn a_background_command() -> Scenario {
+    Scenario::of(vec![TurnPlan::granted("bg touch t0")])
+}
+
+/// H3 and L4, as a mutation test: a shell that never tells the model a
+/// task's end, though the step that carries it records it consumed. I14
+/// finds a model call whose request lacks what its step carried.
+#[test]
+fn a_task_end_never_told_is_caught() {
+    let fair = played(&a_background_command(), Planted::None);
+    assert!(
+        fair.entries.iter().any(|stamped| matches!(
+            &stamped.entry,
+            Entry::Shell(Observation::Requested { said, .. })
+                if said.iter().any(|text| text.contains("ended"))
+        )),
+        "a model call is told the task ended"
+    );
+    let outcome = played(&a_background_command(), Planted::UntoldTaskEnds);
+    assert!(broke(&outcome, "I14"), "{:#?}", outcome.violations);
 }
 
 /// A command that never reports, whatever it is told.

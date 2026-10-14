@@ -12,8 +12,12 @@
 //! any run does. A session's loop never awaits one, and a delivery awaits
 //! only the registry (which awaits no session) and its recipient's bounded
 //! append, so actors cannot deadlock on each other (B1). What comes back is
-//! the outcome: a delivery is not cancelled mid-flight, and its deadline
-//! bounds it (B2).
+//! the outcome: a delivery is not cancelled mid-flight, and a `send`'s or a
+//! `spawn`'s deadline bounds it (B2). A stop has none: it is sent until it
+//! lands (O2), and its only waits are those of any delivery.
+//!
+//! Once a spawn has made its child, it has acted: whatever its prompt
+//! meets, it is never `NotStarted` (H2).
 
 use verified_core::{Outcome, Rejection};
 use verified_domain::{Address, Born, Envelope, Exit, Unstarted};
@@ -98,6 +102,18 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
                         format!("not spawned: the daemon hosts its limit of {limit} actors"),
                     );
                 }
+                // Its birth was refused: no actor exists that could act.
+                Err(CreateError::Unborn { rejection }) => {
+                    let exit = match rejection {
+                        Rejection::Limit => Exit::NotStarted(Unstarted::Limit),
+                        Rejection::Stopped
+                        | Rejection::Unborn
+                        | Rejection::Mismatch
+                        | Rejection::UnknownCall
+                        | Rejection::NotRunning => Exit::NotStarted(Unstarted::Refused),
+                    };
+                    return (exit, format!("not spawned: {name}'s birth was refused"));
+                }
                 // The log may or may not have been made; a rerun finds it.
                 Err(error @ (CreateError::Log(_) | CreateError::Unavailable)) => {
                     return (Exit::Unknown, format!("spawning {name} failed: {error}"));
@@ -105,7 +121,24 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
             };
             let spawned = format!("spawned {name} at {}", Address::Actor(child));
             match handle.deliver(prompt).await {
-                Ok(outcome) => landed(outcome, &spawned),
+                Ok(Outcome::Accepted | Outcome::Exists) => (Exit::Ok, spawned),
+                Ok(Outcome::Rejected(Rejection::Stopped)) => (
+                    Exit::Ok,
+                    format!("{spawned}; it was stopped before its prompt landed"),
+                ),
+                Ok(Outcome::Rejected(Rejection::Limit)) => (
+                    Exit::Ok,
+                    format!("{spawned}; its prompt was not delivered: it takes no more mail"),
+                ),
+                Ok(
+                    Outcome::Rejected(
+                        Rejection::Unborn
+                        | Rejection::Mismatch
+                        | Rejection::UnknownCall
+                        | Rejection::NotRunning,
+                    )
+                    | Outcome::Stale,
+                ) => (Exit::Unknown, format!("{spawned}; its prompt was refused")),
                 Err(_gone) => lost(),
             }
         }
@@ -113,7 +146,10 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
 }
 
 /// Delivers a stop to a child. A child already stopped is stopped: the
-/// stop took effect.
+/// stop took effect. The shell holds a stop until its parent's spawn of
+/// that child, if one is in flight, has landed, so a child is never unborn
+/// here while a spawn may still birth it; one a crash left unborn can never
+/// be born (its parent, stopped, reruns no spawn) and so never acts.
 pub(crate) async fn stop(registry: &Registry, envelope: Envelope<Parsed>) -> (Exit, String) {
     let child = envelope.to;
     let Some(handle) = registry.lookup(child).await else {

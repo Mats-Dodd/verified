@@ -569,6 +569,14 @@ pub enum Observation {
     /// or applied, and none of its effects start. `actor`'s session then
     /// fails stop.
     Refused { actor: verified_domain::ActorId },
+    /// The model call `id` of `actor` is about to be sent a request whose
+    /// last message is the user's turn holding `said`, its text blocks:
+    /// what the step its `StepStarted` (at `id.seq`) carried must be there.
+    Requested {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+        said: Vec<String>,
+    },
     /// A barrier was reached.
     Passed(Barrier),
 }

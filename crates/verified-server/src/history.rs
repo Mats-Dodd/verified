@@ -50,6 +50,8 @@ struct Builder {
     /// The planted defect: a message lands where it was delivered, inside
     /// the step that was running ([`spliced`]).
     splice: bool,
+    /// The planted defect: a task's end is never told ([`untold`]).
+    untold: bool,
 }
 
 /// The model-facing text of a result the core synthesized.
@@ -183,6 +185,7 @@ impl Builder {
                     }
                 }
             }
+            Record::TaskEnded { .. } if self.untold => {}
             Record::TaskEnded { task, exit, output } => {
                 let output = output
                     .as_ref()
@@ -304,7 +307,7 @@ fn tool_use(id: &CallId, name: &ToolName, input: &ToolInput) -> Content {
 /// The request for the next model call, from every record so far.
 #[must_use]
 pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    build(records, system, max_tokens, false)
+    build(records, system, max_tokens, (false, false))
 }
 
 /// The planted defect `Planted::SpliceSteering` (breaks L5).
@@ -315,16 +318,54 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
 #[cfg(feature = "sim")]
 #[must_use]
 pub fn spliced(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    build(records, system, max_tokens, true)
+    build(records, system, max_tokens, (true, false))
 }
 
-fn build(records: &[Record<Parsed>], system: &str, max_tokens: u32, splice: bool) -> ModelRequest {
+/// The planted defect `Planted::UntoldTaskEnds` (breaks H3 and L4 as the
+/// model sees them).
+///
+/// The request without any task's end: a step that carries one records it
+/// consumed, and the model is never told. Only under `sim`.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn untold(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    build(records, system, max_tokens, (false, true))
+}
+
+/// The text blocks of `request`'s last message, if it is the user's turn:
+/// where what the step about to run carried is told.
+#[must_use]
+pub fn said(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .last()
+        .filter(|message| message.role == Role::User)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::Text { text } => Some(text.clone()),
+                    Content::ToolUse { .. } | Content::ToolResult { .. } => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn build(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    (splice, untold): (bool, bool),
+) -> ModelRequest {
     let mut builder = Builder {
         messages: Vec::new(),
         calls: Vec::new(),
         step: None,
         mail: BTreeMap::new(),
         splice,
+        untold,
     };
     for (seq, record) in (0u64..).zip(records) {
         builder.record(seq, record);
