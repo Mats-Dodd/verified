@@ -544,7 +544,10 @@ fn the_approval_prompt_takes_y_and_n() {
         key(&app, KeyCode::Char('n'), KeyModifiers::NONE),
         Some(Msg::Decide(Verdict::Deny))
     ));
-    assert!(key(&app, KeyCode::Char('x'), KeyModifiers::NONE).is_none());
+    assert!(
+        key(&app, KeyCode::Enter, KeyModifiers::NONE).is_none(),
+        "nothing to send"
+    );
 
     let call_id = CallId::parse("toolu_8").expect("a call id");
     assert_eq!(
@@ -572,6 +575,28 @@ fn the_approval_prompt_takes_y_and_n() {
         },
     );
     assert!(app.settled());
+}
+
+/// Typing at the approval prompt steers: the text is typed, `y` and `n`
+/// among it, and Enter sends it (the waiting calls are denied).
+#[test]
+fn typing_at_the_approval_prompt_steers() {
+    let mut app = opened();
+    let _cmd = read(&mut app, fixture("tools"), 71);
+    assert!(app.awaiting_approval().is_some());
+    assert!(matches!(
+        key(&app, KeyCode::Char('x'), KeyModifiers::NONE),
+        Some(Msg::Type('x'))
+    ));
+    let _cmd = app.update(Msg::Type('x'));
+    assert!(matches!(
+        key(&app, KeyCode::Char('n'), KeyModifiers::NONE),
+        Some(Msg::Type('n'))
+    ));
+    assert!(matches!(
+        key(&app, KeyCode::Enter, KeyModifiers::NONE),
+        Some(Msg::Submit(_))
+    ));
 }
 
 #[test]
