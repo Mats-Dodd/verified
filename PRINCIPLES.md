@@ -131,32 +131,27 @@ Below, each promise is split into clauses. A clause has a status:
   that check fail. It is not yet a promise.
 - **Planned**: designed, not built. It is not a promise; it says what the
   check and the planted bug must be when it is built.
-- **Retired**: superseded by another clause, kept so references resolve.
 
 ### A. Authorized
 
-**An effect starts only under a live grant from you, with the grant and the
+**An effect starts only under a grant from you, with the grant and the
 intent durable before it starts. A cancel revokes the grant.**
 
 | # | Clause | Status | Strongest check | Planted bug |
 |---|---|---|---|---|
-| A1 | A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Upheld | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. | replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
-| A2 | Retired, superseded by A3: the class of a call no longer decides its approval; every grant is the user's command or a rule. Its plant moved to A3. | Retired | | |
-| A3 | Every `Approved` record names your command or a rule, with the version of the rules (the seq of their `RulesLoaded` record), that matches the call; the rules' content is in the log. Nothing else produces a grant, and who spawned an actor is never an input to one. | Upheld | Proved (`rules::grant` returns the first rule that fits; `spec_apply` refuses an `Approved` whose grant does not fit (`grant_fits`), so `decided` forces `decide` to grant only by a fitting rule; the matcher's signature is the rules, the actor's own name and the call's shape). Model-checked ("every grant is the user's or a rule in force that fits"; α drops subjects, so the model checks patterns only as `Any`). Property-tested (`grant_is_the_first_fitting_rule`). The shell reads no rules file yet: it records the default rules (`read: allow`) at the first boot. | Stateright `approval_by_a_rule_that_does_not_match_is_caught`; Verus mutations recorded in the commit that admitted it |
-| A4 | Every effect, not only tools (`send`, `spawn`, timers, stops), starts only under a durable grant and a durable `Dispatched`. | Planned | Every tool kind (`read`, `edit`, `bash`, `spawn`, `send`, `wake`, `tasks`, `cancel`) already passes the one gate, a grant (A3) then a durable `Dispatched`, and `runs_ok` proves every `RunTool` licensed whatever its kind. It stays Planned because the effects that are not tool runs (a stop, a delivery to another actor's log) do not exist yet; they land with actors. | A `send` delivered before its `Dispatched` is durable. |
-| A5 | Once a cancel of a turn is durable, nothing under it starts: no step, retry, approval or dispatch until the turn ends, and a repeated cancel signals no run again. Nothing starting for a stopped actor is the same guard, and is Planned until stops exist. | Upheld (turns); Planned (stopped actors) | Proved (`lemma_cancel_revokes`, `lemma_nothing_starts_after_a_cancel`: `spec_apply` refuses each start under a cancel, and `decided` forces `decide` to respect it). | Verus mutation recorded in the commit that admitted it (`StepStarted` without its cancel guard) |
+| A1 | Every effect (a tool run, a `send`, a `spawn`, a timer, a stop) starts only after a durable grant and a durable `Dispatched`, in the current epoch. | Upheld (tool runs); Planned (`send`, `spawn`, timers, stops) | Proved (`call_ok`, `licensed`, `decided`; `runs_ok` covers every `RunTool` whatever its tool). Trace-checked. Every tool kind passes the one gate, a grant (A2) then a durable `Dispatched`. The effects that are not tool runs (a stop, a delivery into another actor's log) land with actors. | replay `running_tools_before_their_dispatch_is_durable_fails_the_replay`. Planned: a `send` delivered before its `Dispatched` is durable. |
+| A2 | Every `Approved` record names your command or a rule in `.verified/v.toml`, with the version of the rules (the seq of their `RulesLoaded` record), that matches the call; the rules' content is in the log. Nothing else produces a grant, and who spawned an actor is never an input to one. | Upheld | Proved (`rules::grant` returns the first rule that fits; `spec_apply` refuses an `Approved` whose grant does not fit (`grant_fits`), so `decided` forces `decide` to grant only by a fitting rule; the matcher's signature is the rules, the actor's own name and the call's shape). Model-checked ("every grant is the user's or a rule in force that fits"; α drops subjects, so the model checks patterns only as `Any`). Property-tested (`grant_is_the_first_fitting_rule`). The shell reads no rules file yet: it records the default rules (`read: allow`) at the first boot. | Stateright `approval_by_a_rule_that_does_not_match_is_caught`; Verus mutations recorded in the commit that admitted it |
+| A3 | Once a cancel is durable, nothing under it starts: no step, retry, approval or dispatch until the turn ends, and a repeated cancel signals no run again. A stop is the same guard for a whole actor. | Upheld (turns); Planned (stopped actors) | Proved (`lemma_cancel_revokes`, `lemma_nothing_starts_after_a_cancel`: `spec_apply` refuses each start under a cancel, and `decided` forces `decide` to respect it). | Verus mutation recorded in the commit that admitted it (`StepStarted` without its cancel guard) |
 
 ### O. Once
 
 **`Unsafe` effects start at most once, ever. `Keyed` effects take effect
-exactly once. `Safe` effects are started again until they resolve.**
+exactly once.**
 
 | # | Clause | Status | Strongest check | Planted bug |
 |---|---|---|---|---|
-| O1 | An `Unsafe` call is dispatched at most once, ever, and acts at most once; after a crash v never starts it again. | Upheld | Proved (`resumed`). Model-checked. Trace-checked. | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
-| O2 | A message starts at most one turn: a retried command gets `Exists` and records nothing. | Upheld | Proved (`spec_apply` refuses a `TurnStarted` for a seen message). | Mutation recorded in the commit that admitted it (`on_message` without its seen guard) |
-| O3 | A `Keyed` effect takes effect exactly once across crashes: resume starts it again with the same id, and its target accepts that id at most once. An acknowledged `send` is in its recipient's log exactly once. | Planned | Prove the resume case and the target's dedup. Model-check two actors with crashes on both sides. | Resume mints a fresh id (two deliveries); the ack sent before the recipient's append is durable (a lost envelope). |
-| O4 | A `Safe` effect dispatched before a crash is started again in the new epoch until it resolves. | Held | Model-checked (quiescence implies every call resolved). `resumed` proves only that no `Unsafe` call is started again. | A resume that drops a dispatched `Safe` call (it would hang: see B). |
+| O1 | An `Unsafe` effect is dispatched at most once, ever, and acts at most once; after a crash v never starts it again. | Upheld | Proved (`resumed`). Model-checked. Trace-checked. | Stateright `rerunning_an_unsafe_call_after_a_crash_is_caught`; replay `running_a_tool_twice_in_one_dispatch_fails_the_replay` |
+| O2 | A `Keyed` effect takes effect exactly once across crashes: resume starts it again with the same id, and its target accepts that id at most once. An acknowledged `send` is in its recipient's log exactly once. | Planned | Prove the resume case and the target's dedup. Model-check two actors with crashes on both sides. | Resume mints a fresh id (two deliveries); the ack sent before the recipient's append is durable (a lost envelope). |
 
 ### H. Honest
 
@@ -165,13 +160,9 @@ than v knows.**
 
 | # | Clause | Status | Strongest check | Planted bug |
 |---|---|---|---|---|
-| H1 | After a crash, a dispatched `Unsafe` call resolves `Unknown`, never as `NotStarted` or succeeded. | Upheld | Proved (`result_fits` refuses a synthesized result other than `Unknown` for a dispatched call). Model-checked. Trace-checked. | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_not_started_fails_the_replay` |
-| H2 | Each call has at most one result. | Upheld | Proved (`spec_apply` refuses a `ToolResult` for a resolved call). | Mutation recorded in the commit that admitted it (`apply` without its `Resolved` guard) |
-| H3 | Each call has a result at quiescence (with H2, exactly one). | Held | Model-checked ("quiescent implies the turn ended"). Simulated (I5). Stateright plant `leaving_an_unsafe_call_dispatched_after_a_crash_is_caught`. | A planted shell bug: a run's report lost. |
-| H4 | The outcome vocabulary is `NotStarted`, `Ok`, `Failed`, `Unknown`. A result v synthesizes is `NotStarted` only for a call never dispatched, and `Unknown` for one that was. A run reports `NotStarted` only if it never acted; a cancel or timeout while it ran is `Unknown`. | Upheld | Proved (`result_fits`: `spec_apply` refuses any other synthesized result, and `resolve` requires it). Trace-checked (the model admits a `NotStarted` report only from a cancelled run that never acted). | replay `reporting_a_command_stopped_mid_run_as_not_started_fails_the_replay`; Verus mutations recorded in the commit that admitted it |
-| H5 | Every task ends exactly once, and its actor is notified exactly once (the notification is a `Keyed` `send` from `v`). | Planned | Prove the task records' grammar. Model-check with crashes between the end and the notification. | A notification sent twice after a crash; a task ended twice. |
-| H6 | A known outcome is never overwritten: whichever of a run's report and its deadline (`Expired`, v cancelling) reaches the core first resolves the call, and the other is stale. Either order is honest. Tasks are Planned with H5. | Upheld (calls) | Proved (`lemma_known_outcome_stays`; `on_tool_done` and `on_expired` act only on a dispatched, unresolved call). The shell arms no deadline yet (B2), so only the core's tests and proptests deliver `Expired`. | Verus mutation recorded in the commit that admitted it (`ToolResult` for a resolved call) |
-| H7 | An `edit` reported `Ok` wrote `new` in place of `old`. | Held | Simulated (I7). | A committed planted bug. |
+| H1 | Every effect, call and task resolves exactly once, and a known outcome is never overwritten: whichever of a run's report and its deadline (`Expired`, v cancelling) reaches the core first resolves it, and the other is stale. | Upheld (calls: at most one result, never overwritten); Held (calls: a result for every call at quiescence); Planned (tasks) | Proved (`spec_apply` refuses a `ToolResult` for a resolved call; `lemma_known_outcome_stays`; `on_tool_done` and `on_expired` act only on a dispatched, unresolved call). Model-checked ("quiescent implies the turn ended"). Simulated (I5). The shell arms no deadline yet (B2), so only the core's tests and proptests deliver `Expired`. | Mutations recorded in the commits that admitted it (`apply` without its `Resolved` guard; `ToolResult` for a resolved call). For "a result at quiescence": Stateright `leaving_an_unsafe_call_dispatched_after_a_crash_is_caught` fails the model check, but the plant it needs is a shell's, a run's report lost. |
+| H2 | An effect is `NotStarted` only when it provably never acted, and `Unknown` whenever it may have acted: a result v synthesizes is `NotStarted` only for a call never dispatched and `Unknown` for one that was (after a crash, a dispatched `Unsafe` call resolves `Unknown`, never `NotStarted` or succeeded), and a run reports `NotStarted` only if it never acted; a cancel or timeout while it ran is `Unknown`. | Upheld | Proved (`result_fits`: `spec_apply` refuses any other synthesized result, and `resolve` requires it). Model-checked. Trace-checked (the model admits a `NotStarted` report only from a cancelled run that never acted). | Stateright `resolving_an_unsafe_call_known_after_a_crash_is_caught`; replay `persisting_unknown_as_not_started_fails_the_replay`, `reporting_a_command_stopped_mid_run_as_not_started_fails_the_replay`; Verus mutations recorded in the commit that admitted it |
+| H3 | A task's actor is notified exactly once that it ended. | Planned | Prove the task records' grammar (the notification is the `TaskEnded` record, an envelope from `v` in the actor's own mailbox). Model-check with crashes. | A task ended, and so notified, twice after a crash. |
 
 ### L. Logged
 
@@ -183,10 +174,9 @@ reader.**
 |---|---|---|---|---|
 | L1 | An actor's state is the replay of its log: `recover(log)` equals the fold of the log, and every durable prefix recovers. `spec_apply` is the one home of every clause on the log's shape. | Upheld | Proved (`recover` ensures `replay(log) == Some(core)`). Model-checked. | Mutation recorded in the commit that added this file's first version |
 | L2 | The client's view is an exact prefix of the durable log: only committed records, no gaps or duplicates across reconnects, and once caught up it equals the projection of the log. | Upheld | Model-checked. Simulated (I6). | Stateright `serving_records_before_they_are_durable_is_caught`, `skipping_a_record_on_reconnect_is_caught` |
-| L3 | Anything acknowledged survives a crash and replays. A 200 for a message means it is durably in the mailbox. | Held | Property-tested (`everything_acknowledged_replays`). Trace-checked (each acknowledged group is the model's next sync). | A committed DST planted bug: an append that skips fsync. |
-| L4 | Every durable envelope is consumed by exactly one model call, in send order per sender. An envelope is consumed when a model call carrying it is dispatched, not when it is written into the history: one injected and never seen (the turn was cancelled first) starts the next turn. | Planned | Prove the mailbox grammar. Model-check with steering, cancels and crashes. | Consumption recorded at injection (a steered message lost to Esc); two senders' order swapped. |
-| L5 | The model's history is well-formed: every `tool_use` has exactly one `tool_result`, and steering messages and notifications are inserted only at step boundaries, after every result of the step. A message sent while the step waits for approvals denies them ("the user steered") and lands at that boundary. | Planned | Check the history builder on every replayed state. Model-check. | A message spliced between a `tool_use` and its result. |
-| L6 | Notifications that arrive together are consumed by one turn; a user message is never coalesced, so it starts or steers exactly one turn. | Planned | Model-check. | A user message merged into a notification batch. |
+| L3 | An acknowledgement means durable: anything acknowledged survives a crash and replays, and a 200 for a message means it is durably in the mailbox. A, O, H and L hold when storage refuses appends: v fails stop (it reports full, refuses new work, never acts without a durable record and never crash-loops). | Held (acknowledged means durable); Planned (fail-stop) | Property-tested (`everything_acknowledged_replays`). Trace-checked (each acknowledged group is the model's next sync). Fail-stop: today the shell still closes the running turn into a reserve on a refused append; fail-stop replaces it. | A committed DST planted bug: an append that skips fsync. Planned: a shell that acts, or acknowledges, after a refused append. |
+| L4 | Each durable envelope is consumed by exactly one model call. An envelope is consumed when a model call carrying it is dispatched (its `StepStarted`), not when it is written into the history: steering counts as consumption, and one injected and never seen (the turn was cancelled first) starts the next turn. A retried user command is accepted at most once: a repeat gets `Exists` and records nothing. | Upheld (a command accepted at most once); Planned (consumption) | Proved (`spec_apply` refuses a second record of a seen message). | Mutation recorded in the commit that admitted it (`on_message` without its seen guard). Planned: consumption recorded at injection (a steered message lost to Esc). |
+| L5 | Injections land only at step boundaries, after every result of the step, and the model's history is always well-formed: every `tool_use` has exactly one `tool_result`. | Planned | Check the history builder on every replayed state. Model-check. | A message spliced between a `tool_use` and its result. |
 
 ### B. Bounded
 
@@ -197,11 +187,18 @@ Without new input, the system goes quiet within its limits.**
 |---|---|---|---|---|
 | B1 | No turn waits on another actor or on a task: the only waits in a turn are its own foreground calls and approvals. So actors cannot deadlock. | Planned | Structural: no effect resolves on another actor's turn. Model-check an actor cycle (A sends to B, B to A). | A blocking `ask`. |
 | B2 | Every in-flight effect resolves by its deadline: it reports back, or v stops waiting and records `Unknown`. | Planned (today: many separate timeouts, no single check) | Model-check an `eventually` property with fairness. DST: every effect resolves within its computed bound. | A cancel that waits for a run that never reports. |
-| B3 | Every turn ends, even on a full log: a reserve lets the running turn close. | Held | Simulated (`a_full_log_ends_the_running_turn_and_replays`); not model-checked (BFS never fills a log). | A full log that refuses the turn's closing records. |
-| B4 | Without new user input the system reaches quiescence: chatter between actors is capped by global limits on messages, turns, actors and depth. Stopping an actor stops everything it spawned. | Planned | Model-check an `eventually quiescent` property under the limits. DST with chattering actors. | A stop that does not reach a child; a missing message limit. |
+| B3 | Without new input the system goes quiet within its limits: chatter between actors is capped by global limits on messages, turns, tasks, actors and depth. | Planned | Model-check an `eventually quiescent` property under the limits. DST with chattering actors. | A missing message limit. |
+| B4 | At every beat (a step boundary) there is headroom for the next step in every resource v owns: context bytes, and mailbox, task and actor slots. Storage is not one of them (L3). | Planned | Model-check "within limits" at every step boundary. | A limit checked after the step it bounds. |
 
-Old numbers, for code comments that still use them: U1 is A1, U2 is A2 (retired), U3
-is O1, U4 is H1, U5 is L1, U6 is L2, U7 is O2, U8 is H2.
+Old numbers, for code comments that still use them. Before the restatement
+around five promises: U1 is A1, U2 the retired grant-by-class clause, U3
+O1, U4 H2, U5 L1, U6 L2, U7 L4 (a command accepted once), U8 H1. In the
+first restatement: A1 and A4 are A1, A3 is A2, A5 is A3, A2 is retired
+(superseded by A2), O3 is O2, O4 is a mechanism (a `Safe` rerun), H2, H3
+and H6 are H1, with H5's "a task ends once"; H1 and H4 are H2; H5's
+notification is H3; H7 is the Env contract (the trusted base); O2 is part of
+L4; L6 is a mechanism (coalescing); B3 is not promised (a full disk); B4 is
+B3.
 
 ## Candidates
 
@@ -212,8 +209,6 @@ yet.
   are byte-for-byte the arguments recorded and shown for approval. This
   holds by construction (the `Approved` token carries the call), but
   nothing checks it end to end.
-- **Results are honest for every tool.** The `edit` case is H7. `bash` and
-  `read` are not checked.
 
 ## Not promised
 
@@ -253,8 +248,10 @@ instead.
 **Actors**
 - **Delivery, not conversation.** v delivers every envelope exactly once and
   promises nothing about whether anyone answers. `reply_to` is a convention.
-- **No ordering across senders.** Envelopes from different actors may be
-  consumed in any order.
+- **No ordering per sender, or across senders.** An actor consumes
+  envelopes in the order its own log received them. An envelope may carry
+  its sender's sequence number, so the model can see the order they were
+  sent in; v does not serialize one sender's deliveries.
 - **A stop is not a kill.** Stopping an actor revokes its grants and asks
   its runs to stop; a child's in-flight `Unsafe` call may still land, and
   resolves `Unknown`.
@@ -263,6 +260,9 @@ instead.
 - A turn always ends, but it may end `Failed` (provider outage, step limit,
   context limit). v promises no latency, and bounds cost only through its
   global limits.
+- **Storage is the world.** A full disk, or the log's own file cap, halts
+  progress: a turn running when the log fills need not end. What v
+  promises there is fail-stop (L3), not liveness.
 - A message typed into the TUI is lost if the TUI dies before delivering it.
 - The log format may change between versions without migration.
 
@@ -272,11 +272,11 @@ Each of these weakens a promise above. Until it is fixed, read that promise
 with this caveat.
 
 - **Approval commands are unauthenticated** (weakens A). The daemon listens
-  on localhost TCP, and any local process can send an approval. A3 proves
+  on localhost TCP, and any local process can send an approval. A2 proves
   that every grant names your command or your rule. It does not prove that
   the command came from you.
 - **A rule naming an actor matches any actor that takes that name**
-  (weakens A3, by design). Names are labels, and an agent that spawns a
+  (weakens A2, by design). Names are labels, and an agent that spawns a
   child chooses its name; you approved that `spawn` or wrote the rule that
   allows it.
 - **The rules file is yours to get wrong** (weakens A, by design). A rule
@@ -305,7 +305,7 @@ These are assumed, not checked:
   model reaches what the fakes never do:
   - **Orphans never act.** A crashed daemon's tool tasks die with the
     turmoil host, but a real `bash` child outlives the daemon and may act
-    after the crash, even after its call resolved `Unknown`. O1 and H1 hold
+    after the crash, even after its call resolved `Unknown`. O1 and H2 hold
     there by model checking only; no run has seen it.
   - **The fake model never loops.** It ends a turn after one round of
     tools, so no run reaches the step limit; a real model may call tools
@@ -315,11 +315,17 @@ These are assumed, not checked:
   more hostile than the world (late duplicate completions, replies from a
   dead daemon's tasks), only the model checks are stronger; `just coverage`
   lists these as over-approximations. A full log is outside BFS: the model
-  never fills its log, so ending a turn on a full log is not model-checked.
-  It is trace-checked only on the runs of
+  never fills its log. Today's reserve, which closes the running turn on a
+  full log, is trace-checked only on the runs of
   `a_full_log_ends_the_running_turn_and_replays` (no seed fills a log), whose
   replay applies the log's refusal and the resume it forces by hand
-  (`Observed::Refused`, `Harness::resumed`).
+  (`Observed::Refused`, `Harness::resumed`); fail-stop (L3) replaces both.
+- **The Env contract.** Tools act on the world through the `Env` seam, and
+  their reports are the Env's to make honest; v records what they say. Each
+  implementation is held to it by tests, not promised:
+  - an `edit` reported `Ok` wrote `new` in place of `old` (simulated, I7, a
+    check of `LocalEnv` and `SimEnv`; it has a committed planted bug);
+  - `bash` and `read` report what they did; nothing checks it.
 - **The hardware and OS:** fsync tells the truth, the monotonic clock is
   monotonic, and signals are delivered on a best-effort basis.
 
@@ -333,13 +339,13 @@ described in `AGENTS.md` and the code.
   only way back (L1).
 - Epochs on effect ids, so stale completions change nothing (A1, O1).
 - TigerBeetle-style ids at every hop: the sender mints the id, persists it,
-  and reuses it on retry (O2, O3).
+  and reuses it on retry (O2, L4).
 - Group commit with bounds identical at append and replay (the "survives
   and replays" property above).
 - Trace checking: the shell reports, under `sim` only, each input entering
   the core and what it decided, and the barriers it passes; with the
   simulation's ledger these are a run's observations, replayed through the
-  model after every DST run (A1, O1, H1).
+  model after every DST run (A1, O1, H2).
 - Model coverage: each step of the model, BFS's and every replayed run's,
   is keyed small (a call's class, how far it got and how it resolved; a
   crash against a run's act; situations such as a torn group). `just
@@ -349,10 +355,22 @@ described in `AGENTS.md` and the code.
   (two runs acting together, or an interrupt durable before a run
   starts) kept by a barrier.
 - Cancel as revocation: one primitive (cancel an effect by id) that closes
-  the gate, signals once and records what comes back (A5, H6, B2).
+  the gate, signals once and records what comes back (A3, H1, B2).
 - Actors as sessions: one log per actor, envelopes delivered by appending
   to the recipient's log, and only `Keyed` effects crossing between logs
-  (O3, L4).
+  (O2, L4).
+- `Safe` effects are started again after a crash until they resolve: the
+  class only says one may run more than once. Model-checked ("quiescent
+  implies the turn ended"); `resumed` proves only that no `Unsafe` effect is
+  started again.
+- Coalescing: notifications that arrive together are carried by one model
+  call, and a user message is carried alone, so it starts or steers
+  exactly one turn.
+- Deny-on-steer: a user message that arrives while a step waits for
+  approvals denies them ("the user steered") and lands at that step's
+  boundary.
+- The stop cascade: stopping an actor sends `stop` to every actor it
+  spawned. That every descendant stops follows from A3 and O2.
 
 ## Deciding new work
 

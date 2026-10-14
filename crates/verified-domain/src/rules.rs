@@ -1,4 +1,4 @@
-//! Grants: every permission comes from the user (A3).
+//! Grants: every permission comes from the user (A2).
 //!
 //! A call may start under a live approval command (`Grant::User`) or under
 //! a rule the user wrote in advance in the rules file, `v.toml`

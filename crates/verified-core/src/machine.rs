@@ -19,7 +19,7 @@
 //!   is approved at most once, dispatched at most once and only after it was
 //!   approved, and only a valid request is ever approved.
 //! - every grant is the user's command or a rule in force that fits the
-//!   call (A3, `grant_fits`): `apply` refuses any other `Approved`, and
+//!   call (A2, `grant_fits`): `apply` refuses any other `Approved`, and
 //!   `decide` grants by the first fitting rule (`rules::grant`) or asks.
 //! - one message, one turn: a `TurnStarted` for a message that already
 //!   started one does not apply (recovery refuses such a log).
@@ -33,14 +33,14 @@
 //!   (`resumed`).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
-//! - a result claims no more than v knows (H4, `result_fits`): one the core
+//! - a result claims no more than v knows (H2, `result_fits`): one the core
 //!   synthesizes is `NotStarted` only for a call never dispatched and
 //!   `Unknown` for one that was, and a run reports only for a dispatched
 //!   call.
-//! - cancel is revocation (A5): once a turn's cancel is durable, no step,
+//! - cancel is revocation (A3): once a turn's cancel is durable, no step,
 //!   retry, approval or dispatch applies until the turn ends
 //!   (`lemma_nothing_starts_after_a_cancel`).
-//! - a known outcome is never overwritten (H6): no record gives a resolved
+//! - a known outcome is never overwritten (H1): no record gives a resolved
 //!   call another result (`lemma_known_outcome_stays`), so of a run's report
 //!   and its deadline (`Expired`), the first to reach the core wins.
 //!
@@ -196,7 +196,7 @@ pub open spec fn seen_message(messages: Seq<MessageId>, message: MessageId) -> b
     exists|at: int| 0 <= at < messages.len() && #[trigger] messages[at] == message
 }
 
-/// A3: a grant names the user's command, or a rule of the rules in force
+/// A2: a grant names the user's command, or a rule of the rules in force
 /// (by the seq of their record) that fits this actor's own name and call
 /// `index`. Nothing else is an input: not the class, not who spawned the
 /// actor.
@@ -282,7 +282,7 @@ pub open spec fn proposed<P: Payload>(calls: Seq<Proposal<P>>) -> Seq<CallView> 
     Seq::new(calls.len(), |index: int| fresh_call(request_shape(calls[index].request)))
 }
 
-/// H4: a result claims no more than v knows. One the core synthesizes
+/// H2: a result claims no more than v knows. One the core synthesizes
 /// (`reported` false) is `NotStarted` only for a call never dispatched, and
 /// `Unknown` for one that was: a dispatched call may have acted. A run's
 /// own report (`reported`) comes only for a dispatched call; whether a run
@@ -649,7 +649,7 @@ pub open spec fn starts<P: Payload>(record: Record<P>) -> bool {
     ||| record is Dispatched
 }
 
-/// A5, one record: once a cancel of the running turn is durable, nothing
+/// A3, one record: once a cancel of the running turn is durable, nothing
 /// that starts something applies, and the turn stays cancelled until it
 /// ends.
 pub proof fn lemma_cancel_revokes<P: Payload>(view: CoreView, turn: TurnId, record: Record<P>)
@@ -662,7 +662,7 @@ pub proof fn lemma_cancel_revokes<P: Payload>(view: CoreView, turn: TurnId, reco
 {
 }
 
-/// A5, a log: after a durable cancel, no record up to the turn's end starts
+/// A3, a log: after a durable cancel, no record up to the turn's end starts
 /// anything, and the turn is still cancelled.
 pub proof fn lemma_nothing_starts_after_a_cancel<P: Payload>(
     view: CoreView,
@@ -693,7 +693,7 @@ pub proof fn lemma_nothing_starts_after_a_cancel<P: Payload>(
     }
 }
 
-/// H6: a known outcome is never overwritten. Within its turn, no record
+/// H1: a known outcome is never overwritten. Within its turn, no record
 /// gives a resolved call another result, and none changes it.
 pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, record: Record<P>)
     requires
@@ -837,7 +837,7 @@ pub enum Violation {
     WrongGrant,
     /// The actor is born a second time.
     Reborn,
-    /// A result claims more than v knows (H4): a synthesized `NotStarted`
+    /// A result claims more than v knows (H2): a synthesized `NotStarted`
     /// for a dispatched call, anything but `NotStarted` for an undispatched
     /// one, or a run's report for a call never dispatched.
     WrongResult,
@@ -1414,7 +1414,7 @@ impl<P: Payload> Core<P> {
     }
 
     /// What the rules in force say of call `index`: the first rule that
-    /// fits it, if any (A3).
+    /// fits it, if any (A2).
     fn rule_for(&self, index: usize) -> (granted: Granted)
         requires
             self.wf(),
@@ -2326,7 +2326,7 @@ impl<P: Payload> Core<P> {
 
     /// A run reported. Whichever of this report and the run's deadline
     /// reaches the core first resolves the call; the other finds it
-    /// resolved and is stale (H6).
+    /// resolved and is stale (H1).
     fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -2344,7 +2344,7 @@ impl<P: Payload> Core<P> {
 
     /// A run's deadline passed: v stops waiting, records `Unknown` (it may
     /// have acted) and signals the run to stop. A run that reported first
-    /// keeps its outcome: the deadline is stale (H6).
+    /// keeps its outcome: the deadline is stale (H1).
     fn on_expired(&self, id: EffectId) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -2478,10 +2478,10 @@ impl<P: Payload> Core<P> {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
                 // It was dispatched, so it may have acted: `NotStarted` would
-                // claim more than v knows (H4). A `Safe` or `Keyed` call is
+                // claim more than v knows (H2). A `Safe` or `Keyed` call is
                 // rerun only while the turn proceeds: rerunning it under a
                 // cancel would start something after the cancel is durable
-                // (A5).
+                // (A3).
                 match (plan.scratch.calls[index].class, open.intent) {
                     (None | Some(Class::Unsafe), Intent::Proceed | Intent::Cancel)
                     | (Some(Class::Safe | Class::Keyed), Intent::Cancel) => {

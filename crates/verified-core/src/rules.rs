@@ -1,4 +1,4 @@
-//! The rules matcher (A3): a pure function over data in the log.
+//! The rules matcher (A2): a pure function over data in the log.
 //!
 //! A rule grants a call when it names the call's tool, names no actor or
 //! this actor's own name, and its pattern fits the call's subject. The

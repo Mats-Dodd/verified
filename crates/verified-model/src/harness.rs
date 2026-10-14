@@ -207,7 +207,7 @@ fn load(core: &Core<Abstract>) -> Option<Loaded<Abstract>> {
 /// Whether `flight`, effect `id`, may reply `event`: a reply of its own
 /// job's kind, a cancelled one only once it was asked to stop, and a tool's
 /// other reports only once it ran. A cancelled run reports `NotStarted`
-/// only if it never acted (H4); a run that acted and was stopped (a cancel,
+/// only if it never acted (H2); a run that acted and was stopped (a cancel,
 /// or its own timeout) reports `Unknown`.
 fn admits(id: EffectId, flight: &Flight, event: &Event<Abstract>) -> bool {
     let (of, admitted) = match event {
@@ -777,7 +777,7 @@ impl Model for Harness {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // U3. Runs are no more than starts: a run acts only in a flight.
+            // O1. Runs are no more than starts: a run acts only in a flight.
             Property::always(
                 "an Unsafe call is dispatched at most once across crashes",
                 |_, world: &World| {
@@ -787,7 +787,7 @@ impl Model for Harness {
                         .all(|(tool, count)| tool.class() == Class::Safe || *count <= 1)
                 },
             ),
-            // U4.
+            // H2.
             Property::always(
                 "after a crash a dispatched Unsafe call resolves Unknown",
                 |model: &Self, world: &World| {
@@ -797,13 +797,13 @@ impl Model for Harness {
                         .contains(&Breach::UnsafeKnownAfterCrash)
                 },
             ),
-            // U5. Every log shape the core refuses (`spec_apply`) is caught
+            // L1. Every log shape the core refuses (`spec_apply`) is caught
             // here.
             Property::always(
                 "every durable prefix recovers",
                 |model: &Self, world: &World| model.core(world).is_some(),
             ),
-            // U6.
+            // L2.
             Property::always(
                 "the client sees a prefix of the durable log",
                 |_, world: &World| {

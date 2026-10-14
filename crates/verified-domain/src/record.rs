@@ -20,7 +20,7 @@ verus! {
 ///
 /// The shell offers the model `read`, `edit` and `bash`; the others
 /// (actors and tasks) are named here so that rules and grants already cover
-/// every kind (A4), and are offered once the runtime runs them.
+/// every kind (A1), and are offered once the runtime runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Tool {
@@ -147,7 +147,7 @@ pub enum Unstarted {
     Invalid,
 }
 
-/// How an effect ended, claiming no more than v knows (H4).
+/// How an effect ended, claiming no more than v knows (H2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Exit {
@@ -205,7 +205,7 @@ pub enum TurnOutcome {
 pub enum Record<P: Payload> {
     /// Who this actor is. At most once.
     Born { born: Born },
-    /// The rules in force from here on (A3), and the text of the rules
+    /// The rules in force from here on (A2), and the text of the rules
     /// file they were read from (`None`: there is none, so the default
     /// rules). Recorded whenever they are loaded or change.
     RulesLoaded { rules: Rules, file: Option<Measured<P::Text>> },
@@ -227,7 +227,7 @@ pub enum Record<P: Payload> {
     Approved { call: CallIx, by: Grant },
     /// A call is about to run. At most one per call.
     Dispatched { call: CallIx },
-    /// What a call actually did. At most one per call (H2); one for every
+    /// What a call actually did. At most one per call (H1); one for every
     /// call once the turn is quiescent is held, not promised. `output` is
     /// absent when the core synthesized the result: `NotStarted` for a call
     /// never dispatched (denied, cancelled, invalid, past a limit), and

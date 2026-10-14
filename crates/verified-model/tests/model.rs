@@ -130,7 +130,7 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
         );
         // The log refuses it too ("every durable prefix recovers"): a
         // synthesized `NotStarted` for a dispatched call claims more than v
-        // knows (H4).
+        // knows (H2).
         assert_eq!(
             checker
                 .discovery("an Unsafe call is dispatched at most once across crashes")
@@ -167,7 +167,7 @@ fn leaving_an_unsafe_call_dispatched_after_a_crash_is_caught() {
     }
 }
 
-/// A3: a grant names a rule in force that fits its call. A shell that
+/// A2: a grant names a rule in force that fits its call. A shell that
 /// approves what it should ask about, by the first rule in force (the
 /// default `read: allow`), is caught by the audit, and the core refuses
 /// the log too.
@@ -915,7 +915,7 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
 /// A run stopped before it acted did not act: its return, observed
 /// `stopped`, takes no `Execute`, so the call resolves `NotStarted` while
 /// still `Dispatched`. The same report from a run that acted claims more
-/// than v knows (H4), and the replay refuses it.
+/// than v knows (H2), and the replay refuses it.
 #[test]
 fn a_stopped_run_did_not_act() {
     let harness = Harness::bounded(

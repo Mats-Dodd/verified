@@ -645,7 +645,7 @@ fn interrupt_during_tools() {
     );
 }
 
-/// A5, signal once: a second interrupt of a turn already stopping is a
+/// A3, signal once: a second interrupt of a turn already stopping is a
 /// repeat, and asks no run to stop again.
 #[test]
 fn a_second_interrupt_signals_nothing() {
@@ -666,7 +666,7 @@ fn a_second_interrupt_signals_nothing() {
     assert_eq!(driver.since(from), Vec::new(), "nothing recorded");
 }
 
-/// H6, the deadline first: v stops waiting, records `Unknown` and asks the
+/// H1, the deadline first: v stops waiting, records `Unknown` and asks the
 /// run to stop; the run's late report changes nothing.
 #[test]
 fn a_deadline_before_the_report_resolves_unknown() {
@@ -696,7 +696,7 @@ fn a_deadline_before_the_report_resolves_unknown() {
     assert_eq!(outcome, Outcome::Stale, "and so does a repeated deadline");
 }
 
-/// H6, the report first: its outcome stands, and the deadline is stale.
+/// H1, the report first: its outcome stands, and the deadline is stale.
 #[test]
 fn a_report_before_the_deadline_wins() {
     let mut driver = Driver::new(small_limits());
@@ -712,7 +712,7 @@ fn a_report_before_the_deadline_wins() {
     assert_eq!(driver.since(from), Vec::new(), "the Failed result stands");
 }
 
-/// A5: a deadline during a cancel resolves the run and ends the turn; no
+/// A3: a deadline during a cancel resolves the run and ends the turn; no
 /// step starts.
 #[test]
 fn a_deadline_under_a_cancel_starts_nothing() {
@@ -1140,7 +1140,7 @@ fn crash_restarts_model_step() {
     assert_eq!(model_call(&effects).epoch, Epoch(1), "new epoch");
 }
 
-/// H4: a crash while the turn is being cancelled leaves a dispatched read
+/// H2: a crash while the turn is being cancelled leaves a dispatched read
 /// `Unknown`, never `NotStarted`: it was dispatched, so it may have acted.
 #[test]
 fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
@@ -1166,7 +1166,7 @@ fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
     );
 }
 
-/// H4: the log refuses a result that claims more than v knows.
+/// H2: the log refuses a result that claims more than v knows.
 #[test]
 fn a_log_claiming_more_than_v_knows_is_corrupt() {
     let dispatched = vec![
@@ -1339,7 +1339,7 @@ fn a_log_repeating_a_message_is_corrupt() {
     );
 }
 
-/// A3, on the log: a grant names a rule in force that fits the call.
+/// A2, on the log: a grant names a rule in force that fits the call.
 #[test]
 fn a_grant_names_a_rule_in_force_that_fits() {
     let mut log = vec![Record::RulesLoaded {

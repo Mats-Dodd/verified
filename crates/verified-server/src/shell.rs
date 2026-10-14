@@ -110,13 +110,13 @@ pub enum Planted {
     /// dispatch). The replay must catch the second act.
     #[cfg(feature = "sim")]
     RunTwice,
-    /// Persist an `Unknown` result as `NotStarted` (breaks H1 in the shell,
+    /// Persist an `Unknown` result as `NotStarted` (breaks H2 in the shell,
     /// below the core). The replay must catch the durable records differing
     /// from the decided ones.
     #[cfg(feature = "sim")]
     UnknownAsNotStarted,
     /// Report a command stopped mid-run as `NotStarted`, as `Interrupted`
-    /// did before H4: a run that may have acted claims it never began. The
+    /// did before H2: a run that may have acted claims it never began. The
     /// replay must catch the report of a run that acted.
     #[cfg(feature = "sim")]
     StoppedAsNotStarted,
@@ -1031,7 +1031,7 @@ fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
 /// The planted defect: `records` with every `Unknown` result made a
 /// `NotStarted` report, as if the shell knew the call never ran. It invents
 /// the report (an empty output): the core refuses a synthesized `NotStarted`
-/// for a dispatched call (H4), so a shell can only lie past it this way.
+/// for a dispatched call (H2), so a shell can only lie past it this way.
 #[cfg(feature = "sim")]
 fn unknown_as_not_started(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
     for record in &mut records {

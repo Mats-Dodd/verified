@@ -29,7 +29,7 @@ pub(crate) enum Breach {
     UnsafeKnownAfterCrash,
     /// An `Approved` names a rule that is not one of the rules in force
     /// (by the seq of their `RulesLoaded`), or one that does not fit the
-    /// call (A3). α keeps no subject, so a pattern is matched against an
+    /// call (A2). α keeps no subject, so a pattern is matched against an
     /// empty one: what the model checks of patterns is only `Any`'s.
     GrantUnfit,
 }

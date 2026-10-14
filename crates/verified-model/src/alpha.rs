@@ -3,7 +3,7 @@
 //! A record keeps every id and every size, drops each body, and reduces a
 //! call's arguments to the tool they name: its subject (a path, a command)
 //! is dropped, so a rule's pattern is matched in the model against an empty
-//! subject. The matcher itself is proved (A3); the model checks grants up
+//! subject. The matcher itself is proved (A2); the model checks grants up
 //! to subjects, and commutes with the core under rules whose patterns are
 //! `Any` (the default rules). The core reads nothing else of a
 //! payload (it compares sizes against `Limits::context_bytes` and asks a

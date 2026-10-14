@@ -1,4 +1,4 @@
-//! Grants (A3): the matcher against a naive reference, and the core
+//! Grants (A2): the matcher against a naive reference, and the core
 //! granting by rule, or asking, call by call.
 
 use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -249,7 +249,7 @@ fn grants(records: &[Record<Shaped>]) -> Vec<(CallIx, Grant)> {
         .collect()
 }
 
-/// A3: a rule grants exactly the calls it fits, by tool, subject and the
+/// A2: a rule grants exactly the calls it fits, by tool, subject and the
 /// actor's own name; every other call asks the user.
 #[test]
 fn a_rule_grants_only_what_it_fits() {
@@ -300,7 +300,7 @@ fn a_rule_grants_only_what_it_fits() {
     );
 }
 
-/// A3: a grant names the rules in force by their record. Once new rules
+/// A2: a grant names the rules in force by their record. Once new rules
 /// load, a grant naming the old ones does not apply.
 #[test]
 fn rules_pin_the_version_in_force() {

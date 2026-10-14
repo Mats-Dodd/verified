@@ -309,7 +309,7 @@ fn a_crash_while_a_command_runs_is_after_it_acted() {
 }
 
 /// What the shell makes durable is what the core decided, as a mutation
-/// test: a shell that persists an `Unknown` result as `NotStarted` (H1,
+/// test: a shell that persists an `Unknown` result as `NotStarted` (H2,
 /// broken below the core) leaves the model where a group commit becomes
 /// durable holding other records than the model's.
 #[test]
@@ -335,7 +335,7 @@ fn persisting_unknown_as_not_started_fails_the_replay() {
     );
 }
 
-/// H4, as a mutation test: a shell whose stopped command reports
+/// H2, as a mutation test: a shell whose stopped command reports
 /// `NotStarted`, as `Interrupted` did, claims a run that acted never began.
 /// The replay refuses the report: the model admits `NotStarted` only from a
 /// cancelled run that never acted.
