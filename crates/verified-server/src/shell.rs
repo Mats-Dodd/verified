@@ -614,8 +614,8 @@ impl Session {
 
     /// The answer to every command once the log is full.
     fn full(&self) -> Rejection {
-        Rejection::SessionFull {
-            session_id: self.id,
+        Rejection::ActorFull {
+            actor_id: self.id,
             reason: format!(
                 "its log takes no more records ({})",
                 self.full.as_deref().unwrap_or("full")
@@ -658,22 +658,12 @@ impl Session {
             Input::Message { command, reply } => {
                 let delivered = self.delivered(command.message_id).is_some();
                 if self.held_bytes >= self.config.limits.session_bytes && !delivered {
-                    drop(reply.send(Err(Rejection::SessionFull {
-                        session_id: self.id,
+                    drop(reply.send(Err(Rejection::ActorFull {
+                        actor_id: self.id,
                         reason: format!(
                             "it holds {} bytes, its limit is {}",
                             self.held_bytes, self.config.limits.session_bytes
                         ),
-                    })));
-                    return Ok(());
-                }
-                // Until the shell steers, a new message to a running turn
-                // is answered busy, without the core; a repeat the core
-                // answers (`Exists`).
-                if let (Some(running), false) = (self.core.running(), delivered) {
-                    drop(reply.send(Err(Rejection::SessionBusy {
-                        session_id: self.id,
-                        turn_id: running,
                     })));
                     return Ok(());
                 }
@@ -746,8 +736,8 @@ impl Session {
             Outcome::Accepted => WireOutcome::Created,
             Outcome::Exists => WireOutcome::Exists,
             Outcome::Rejected(CoreRejection::Limit) => {
-                return Err(Rejection::SessionFull {
-                    session_id: self.id,
+                return Err(Rejection::ActorFull {
+                    actor_id: self.id,
                     reason: format!(
                         "it holds its limit of {} messages",
                         self.config.limits.core.messages_per_actor()
@@ -771,10 +761,12 @@ impl Session {
                 message_id: command.message_id,
             });
         }
-        // The turn the message started: the first after its delivery.
-        let turn = self.records.get(at..).and_then(|after| {
-            after.iter().find_map(|record| match record {
-                Record::TurnStarted { turn } => Some(*turn),
+        // The turn the message landed in: the one running at its delivery,
+        // which it steers, or else the first after it, which it started.
+        let running = self.records.get(..at).and_then(|before| {
+            before.iter().rev().find_map(|record| match record {
+                Record::TurnStarted { turn } => Some(Some(*turn)),
+                Record::TurnEnded { .. } => Some(None),
                 Record::Born { .. }
                 | Record::RulesLoaded { .. }
                 | Record::Delivered { .. }
@@ -788,8 +780,29 @@ impl Session {
                 | Record::TaskEnded { .. }
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
-                | Record::TurnEnded { .. }
                 | Record::EpochBumped { .. } => None,
+            })
+        });
+        let turn = running.flatten().or_else(|| {
+            self.records.get(at..).and_then(|after| {
+                after.iter().find_map(|record| match record {
+                    Record::TurnStarted { turn } => Some(*turn),
+                    Record::Born { .. }
+                    | Record::RulesLoaded { .. }
+                    | Record::Delivered { .. }
+                    | Record::StepStarted { .. }
+                    | Record::ModelOutput { .. }
+                    | Record::StepReset { .. }
+                    | Record::StepFinished { .. }
+                    | Record::Approved { .. }
+                    | Record::Dispatched { .. }
+                    | Record::ToolResult { .. }
+                    | Record::TaskEnded { .. }
+                    | Record::StopSent { .. }
+                    | Record::CancelRequested { .. }
+                    | Record::TurnEnded { .. }
+                    | Record::EpochBumped { .. } => None,
+                })
             })
         });
         match turn {
@@ -797,8 +810,8 @@ impl Session {
                 turn_id: turn,
                 outcome: created,
             }),
-            None => Err(Rejection::SessionFull {
-                session_id: self.id,
+            None => Err(Rejection::ActorFull {
+                actor_id: self.id,
                 reason: format!(
                     "it started its limit of {} turns",
                     self.config.limits.core.turns_per_actor()

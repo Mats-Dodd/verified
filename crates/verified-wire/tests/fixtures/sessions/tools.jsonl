@@ -1,6 +1,7 @@
-{"type":"data-user-message","id":"1","data":{"text":"fix the typo in lib.rs","messageId":"01a10400-0000-7000-8000-0000000000a1"}}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-0000000000a1"},"from":"user","text":"fix the typo in lib.rs"}}
 {"type":"data-turn-start","id":"1","data":{"model":"claude-sonnet-4-5"}}
 {"type":"start","messageId":"1"}
+{"type":"data-step-carries","id":"1","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-0000000000a1"}]}}
 {"type":"start-step"}
 {"type":"text-start","id":"t0"}
 {"type":"text-delta","id":"t0","delta":"Let me look."}
@@ -28,9 +29,10 @@
 {"type":"finish-step"}
 {"type":"finish","finishReason":"stop"}
 {"type":"data-turn-end","id":"1","data":{"reason":"completed"}}
-{"type":"data-user-message","id":"2","data":{"text":"run the tests"}}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000b0c"},"from":"user","text":"run the tests"}}
 {"type":"data-turn-start","id":"2","data":{"model":"claude-sonnet-4-5"}}
 {"type":"start","messageId":"2"}
+{"type":"data-step-carries","id":"2","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000b0c"}]}}
 {"type":"start-step"}
 {"type":"tool-input-start","toolCallId":"toolu_3","toolName":"bash"}
 {"type":"tool-input-available","toolCallId":"toolu_3","toolName":"bash","input":{"command":"cargo test"}}
@@ -40,9 +42,10 @@
 {"type":"finish-step"}
 {"type":"finish","finishReason":"tool-calls"}
 {"type":"data-turn-end","id":"2","data":{"reason":"completed"}}
-{"type":"data-user-message","id":"3","data":{"text":"search for it"}}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000b0d"},"from":"user","text":"search for it"}}
 {"type":"data-turn-start","id":"3","data":{"model":"claude-sonnet-4-5"}}
 {"type":"start","messageId":"3"}
+{"type":"data-step-carries","id":"3","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000b0d"}]}}
 {"type":"start-step"}
 {"type":"tool-input-start","toolCallId":"toolu_4","toolName":"read"}
 {"type":"tool-input-delta","toolCallId":"toolu_4","inputTextDelta":"{\"path\":"}
@@ -66,9 +69,10 @@
 {"type":"finish-step"}
 {"type":"abort","reason":"cancelled"}
 {"type":"data-turn-end","id":"3","data":{"reason":"cancelled"}}
-{"type":"data-user-message","id":"4","data":{"text":"delete the build dir"}}
+{"type":"data-envelope","data":{"envelope":{"user":"01a10400-0000-7000-8000-000000000b0e"},"from":"user","text":"delete the build dir"}}
 {"type":"data-turn-start","id":"4","data":{"model":"claude-sonnet-4-5"}}
 {"type":"start","messageId":"4"}
+{"type":"data-step-carries","id":"4","data":{"envelopes":[{"user":"01a10400-0000-7000-8000-000000000b0e"}]}}
 {"type":"start-step"}
 {"type":"tool-input-start","toolCallId":"toolu_8","toolName":"bash"}
 {"type":"tool-input-available","toolCallId":"toolu_8","toolName":"bash","input":{"command":"rm -rf target"}}

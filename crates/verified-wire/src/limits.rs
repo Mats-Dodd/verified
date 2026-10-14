@@ -25,6 +25,11 @@ pub struct WireLimits {
     pub max_part_bytes: usize,
     /// Most `error` chunks one turn records.
     pub max_errors_per_turn: usize,
+    /// Most envelopes waiting in a transcript's mailbox, and most one turn
+    /// carries.
+    pub max_envelopes: usize,
+    /// Most tasks a transcript holds.
+    pub max_tasks: usize,
 }
 
 impl WireLimits {
@@ -38,6 +43,8 @@ impl WireLimits {
         max_parts_per_reply: 1024,
         max_part_bytes: 1 << 20,
         max_errors_per_turn: 64,
+        max_envelopes: 1024,
+        max_tasks: 1024,
     };
 
     /// The most JSON one Durable Streams read (an SSE `data` event)

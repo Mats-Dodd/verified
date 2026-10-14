@@ -7,10 +7,18 @@
 //! [`WireLimits`]; unknown fields are rejected because both ends are the same
 //! binary.
 //!
-//! Routes (the server owns them; listed so both ends agree):
-//! `POST /sessions` [`CreateSession`], `POST /sessions/{id}/messages`
-//! [`SendMessage`], `POST /sessions/{id}/approvals` [`Approve`],
-//! `POST /sessions/{id}/cancel` [`Cancel`].
+//! Routes (the server owns them; listed so both ends agree). Every actor is
+//! addressed by its id; a root actor is named `main`:
+//!
+//! - `POST /actors` [`CreateActor`];
+//! - `GET /actors` answers [`ActorList`];
+//! - `POST /actors/{id}/messages` [`SendMessage`]: a 200 means the message is
+//!   durably in the actor's mailbox. A message to a busy actor steers its
+//!   running turn: it enters at the next step boundary;
+//! - `POST /actors/{id}/approvals` [`Approve`], for that actor's calls;
+//! - `POST /actors/{id}/cancel` [`Cancel`] (Esc);
+//! - `GET /actors/{id}/tasks` answers [`TaskList`];
+//! - `GET /actors/{id}/stream?offset=…`, the actor's stream.
 
 use core::fmt;
 
@@ -18,7 +26,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::WireLimits;
-use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
+use crate::chunk::EffectEnd;
+use verified_domain::id::{ActorId, CallId, MessageId, TaskId, ToolName, TurnId};
 
 /// Why a command body did not parse.
 #[derive(Debug, thiserror::Error)]
@@ -88,14 +97,14 @@ fn json_of<T: Serialize>(body: &T) -> Vec<u8> {
     serde_json::to_vec(body).expect("wire types have string keys and serialize infallibly")
 }
 
-/// Creates a session with a client-minted id.
+/// Creates a root actor, named `main`, with a client-minted id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateSession {
-    pub session_id: ActorId,
+pub struct CreateActor {
+    pub actor_id: ActorId,
 }
 
-impl CreateSession {
+impl CreateActor {
     /// # Errors
     /// An oversized or malformed body.
     pub fn decode(body: &[u8], limits: &WireLimits) -> Result<Self, DecodeError> {
@@ -108,7 +117,8 @@ impl CreateSession {
     }
 }
 
-/// Sends a user message; starts a turn.
+/// Sends a user message to an actor: it starts a turn, or steers the
+/// running one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessage {
@@ -211,14 +221,19 @@ pub enum Outcome {
     Exists,
 }
 
-/// Reply to [`CreateSession`].
+/// Reply to [`CreateActor`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateSessionReply {
+pub struct CreateActorReply {
     pub outcome: Outcome,
 }
 
-/// Reply to [`SendMessage`]: the turn the message started (the same turn on a repeat).
+/// Reply to [`SendMessage`]: the message is durably in the mailbox.
+///
+/// The turn is the one it landed in: the turn it started, or the running turn
+/// it steers (the same turn on a repeat). A steer the user cancels before
+/// any step carries it starts the next turn instead; the stream says which
+/// step carried it (`data-step-carries`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendMessageReply {
@@ -240,6 +255,69 @@ pub struct ApproveReply {
 pub struct CancelReply {
     pub turn_id: TurnId,
     pub outcome: Outcome,
+}
+
+/// Where an actor is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ActorState {
+    Idle,
+    Running {
+        turn_id: TurnId,
+    },
+    /// A stop landed: it starts nothing more.
+    Stopped,
+}
+
+/// One actor, as `GET /actors` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActorSummary {
+    pub actor_id: ActorId,
+    /// Its name: a label, which may repeat.
+    pub name: String,
+    /// Who spawned it; `None` for a root the user made.
+    pub parent: Option<ActorId>,
+    pub depth: u32,
+    pub state: ActorState,
+    /// Its calls awaiting the user's approval, in order.
+    pub approvals: Vec<CallId>,
+    /// Its tasks still running.
+    pub tasks: u32,
+    /// Envelopes in its mailbox no step has carried yet.
+    pub unread: u32,
+}
+
+/// Reply to `GET /actors`: every actor the daemon hosts that is born.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActorList {
+    pub actors: Vec<ActorSummary>,
+}
+
+/// One task of an actor, as `GET /actors/{id}/tasks` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskSummary {
+    pub task_id: TaskId,
+    pub tool: ToolName,
+    /// The path, command, recipient or child it acts on, if any.
+    pub subject: Option<String>,
+    /// How it ended; `None` while it runs.
+    pub end: Option<EffectEnd>,
+}
+
+/// Reply to `GET /actors/{id}/tasks`: the actor's tasks in the order they
+/// started, read from its log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskList {
+    pub tasks: Vec<TaskSummary>,
 }
 
 /// Decodes a reply body (the TUI's side).
@@ -270,15 +348,8 @@ pub fn encode_reply<T: Serialize>(reply: &T) -> Vec<u8> {
 pub enum Rejection {
     #[error("the body did not parse: {reason}")]
     Malformed { reason: String },
-    #[error("no session {session_id}")]
-    SessionNotFound { session_id: ActorId },
-    #[error("session {session_id} exists")]
-    SessionExists { session_id: ActorId },
-    #[error("session {session_id} is running turn {turn_id}")]
-    SessionBusy {
-        session_id: ActorId,
-        turn_id: TurnId,
-    },
+    #[error("no actor {actor_id}")]
+    UnknownActor { actor_id: ActorId },
     #[error("message {message_id} exists with different text")]
     MessageExistsWithDifferentText { message_id: MessageId },
     #[error("tool call {call_id} is not awaiting approval")]
@@ -287,16 +358,17 @@ pub enum Rejection {
     ApprovalExistsWithDifferentVerdict { call_id: CallId, verdict: Verdict },
     #[error("turn {turn_id} is not running")]
     TurnNotRunning { turn_id: TurnId },
-    /// The session holds all it may (turns or bytes); it takes no new message.
-    #[error("session {session_id} is full: {reason}")]
-    SessionFull { session_id: ActorId, reason: String },
-    /// The daemon hosts its limit of sessions.
-    #[error("the daemon hosts its limit of {limit} sessions")]
-    TooManySessions { limit: usize },
-    /// The session, or the daemon, has its limit of live stream followers;
+    /// The actor holds all it may (messages, turns or bytes), or its log is
+    /// full; it takes no new message.
+    #[error("actor {actor_id} is full: {reason}")]
+    ActorFull { actor_id: ActorId, reason: String },
+    /// The daemon hosts its limit of actors.
+    #[error("the daemon hosts its limit of {limit} actors")]
+    TooManyActors { limit: usize },
+    /// The actor, or the daemon, has its limit of live stream followers;
     /// retry later.
-    #[error("too many live readers of session {session_id} (limit {limit})")]
-    TooManyFollowers { session_id: ActorId, limit: usize },
+    #[error("too many live readers of actor {actor_id} (limit {limit})")]
+    TooManyFollowers { actor_id: ActorId, limit: usize },
 }
 
 impl Rejection {
@@ -305,15 +377,13 @@ impl Rejection {
     pub const fn status(&self) -> u16 {
         match self {
             Self::Malformed { .. } => 400,
-            Self::SessionNotFound { .. } => 404,
-            Self::SessionExists { .. }
-            | Self::SessionBusy { .. }
-            | Self::MessageExistsWithDifferentText { .. }
+            Self::UnknownActor { .. } => 404,
+            Self::MessageExistsWithDifferentText { .. }
             | Self::NoPendingApproval { .. }
             | Self::ApprovalExistsWithDifferentVerdict { .. }
             | Self::TurnNotRunning { .. }
-            | Self::SessionFull { .. } => 409,
-            Self::TooManySessions { .. } | Self::TooManyFollowers { .. } => 503,
+            | Self::ActorFull { .. } => 409,
+            Self::TooManyActors { .. } | Self::TooManyFollowers { .. } => 503,
         }
     }
 }
@@ -388,11 +458,11 @@ mod tests {
 
     #[test]
     fn capacity_rejections_are_typed() {
-        let full = Rejection::TooManySessions { limit: 2 };
+        let full = Rejection::TooManyActors { limit: 2 };
         assert_eq!(full.status(), 503, "retryable");
         assert_eq!(
             encode_reply(&full),
-            br#"{"error":"too-many-sessions","limit":2}"#.to_vec()
+            br#"{"error":"too-many-actors","limit":2}"#.to_vec()
         );
         assert_eq!(
             decode_reply::<Rejection>(&encode_reply(&full), &LIMITS).ok(),
@@ -424,6 +494,43 @@ mod tests {
             decode_reply::<Rejection>(&body, &LIMITS).ok(),
             Some(rejection)
         );
+    }
+
+    #[test]
+    fn actor_summaries_have_stable_json() {
+        let actor = ActorId::parse("01a10400-0000-7000-8000-000000000001").expect("an id");
+        let list = ActorList {
+            actors: vec![ActorSummary {
+                actor_id: actor,
+                name: "main".to_owned(),
+                parent: None,
+                depth: 0,
+                state: ActorState::Running { turn_id: TurnId(4) },
+                approvals: vec![CallId::parse("toolu_1").expect("a token")],
+                tasks: 1,
+                unread: 2,
+            }],
+        };
+        let body = encode_reply(&list);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"actors":[{"actorId":"01a10400-0000-7000-8000-000000000001","name":"main","parent":null,"depth":0,"state":{"state":"running","turnId":"4"},"approvals":["toolu_1"],"tasks":1,"unread":2}]}"#
+        );
+        assert_eq!(decode_reply(&body, &LIMITS).ok(), Some(list));
+        let tasks = TaskList {
+            tasks: vec![TaskSummary {
+                task_id: TaskId(9),
+                tool: ToolName::parse("bash").expect("a name"),
+                subject: Some("sleep 1".to_owned()),
+                end: Some(EffectEnd::Unknown),
+            }],
+        };
+        let body = encode_reply(&tasks);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"tasks":[{"taskId":"9","tool":"bash","subject":"sleep 1","end":"unknown"}]}"#
+        );
+        assert_eq!(decode_reply(&body, &LIMITS).ok(), Some(tasks));
     }
 
     #[test]

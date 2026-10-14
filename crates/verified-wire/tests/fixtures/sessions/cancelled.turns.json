@@ -1,7 +1,16 @@
 [
   {
     "id": "1",
-    "text": "slow please",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b01"
+        },
+        "from": "user",
+        "text": "slow please",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "1",
       "role": "assistant",
@@ -21,7 +30,16 @@
   },
   {
     "id": "2",
-    "text": "again",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b02"
+        },
+        "from": "user",
+        "text": "again",
+        "step": 0
+      }
+    ],
     "reply": {
       "id": "2",
       "role": "assistant",

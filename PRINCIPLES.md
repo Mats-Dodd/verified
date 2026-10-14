@@ -379,8 +379,10 @@ described in `AGENTS.md` and the code.
   the step's boundary. That covers a message during the approval wait,
   one during the model call (the step's calls are denied as they are
   proposed), and a steer a crash tore after its `Delivered` (resume
-  finishes it). Built in the core; until the shell steers, it answers a
-  new message to a running turn `busy` without asking the core.
+  finishes it). Built in the core, and the shell steers: a message to a
+  busy actor is delivered like any other and answered once its
+  `Delivered` is durable (tested over HTTP:
+  `a_message_to_a_busy_actor_steers_its_running_turn`).
 - The stop cascade: stopping an actor sends `stop` to every actor it
   spawned. That every descendant stops follows from A3 and O2.
 

@@ -55,6 +55,12 @@ pub struct Limits {
     pub stream_idle: Millis,
     /// The tallest the input box grows, in lines.
     pub input_lines: u16,
+    /// How often the actor list is refreshed.
+    pub refresh: Millis,
+    /// The tallest the actor tree grows, in lines.
+    pub tree_lines: u16,
+    /// The tallest the task panel grows, in lines.
+    pub task_lines: u16,
 }
 
 impl Limits {
@@ -76,6 +82,9 @@ impl Limits {
         exchange_timeout: Millis::new(10_000),
         stream_idle: Millis::new(35_000),
         input_lines: 8,
+        refresh: Millis::new(1_000),
+        tree_lines: 6,
+        task_lines: 4,
     };
 }
 

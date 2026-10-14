@@ -93,6 +93,9 @@ enum RegistryInput {
         session: ActorId,
         reply: oneshot::Sender<Option<SessionHandle>>,
     },
+    List {
+        reply: oneshot::Sender<Vec<SessionHandle>>,
+    },
 }
 
 /// The sessions a daemon hosts. A handle to the registry task.
@@ -132,6 +135,20 @@ impl Registry {
             .await
             .ok()?;
         answer.await.ok().flatten()
+    }
+
+    /// Every session the daemon hosts, by id; empty once it is stopping.
+    pub async fn list(&self) -> Vec<SessionHandle> {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .inbox
+            .send(RegistryInput::List { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
     }
 }
 
@@ -204,6 +221,9 @@ impl RegistryTask {
                 }
                 Some(RegistryInput::Lookup { session, reply }) => {
                     drop(reply.send(self.sessions.get(&session).cloned()));
+                }
+                Some(RegistryInput::List { reply }) => {
+                    drop(reply.send(self.sessions.values().cloned().collect()));
                 }
             }
         }

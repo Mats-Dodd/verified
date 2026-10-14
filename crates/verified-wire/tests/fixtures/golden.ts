@@ -30,22 +30,47 @@ const replyOf = async (chunks: Chunk[]) => {
   return last
 }
 
+// An actor's transcript: a turn per `data-turn-start`, the envelopes its
+// steps carried (each with the step that carried it), and the reply the AI
+// SDK makes of the turn's other chunks. Mail waits from `data-envelope` (or a
+// task's end, its own notification) until a `data-step-carries` takes it.
+const ended: Record<string, string> = { ok: "ok", failed: "failed", "not-started": "not started", unknown: "unknown" }
+
 const transcriptOf = async (chunks: Chunk[]) => {
-  const turns: { id: string; text: string; chunks: Chunk[]; errors: string[]; end: string | null }[] = []
+  const turns: { id: string; inputs: any[]; steps: number; chunks: Chunk[]; errors: string[]; end: string | null }[] = []
+  const queued: any[] = []
   for (const chunk of chunks) {
-    if (chunk.type === "data-user-message") {
-      turns.push({ id: chunk.id!, text: chunk.data.text, chunks: [], errors: [], end: null })
+    if (chunk.type === "data-envelope") {
+      const { envelope, from, replyTo, text } = chunk.data
+      if (text !== undefined) queued.push(replyTo === undefined ? { envelope, from, text } : { envelope, from, replyTo, text })
+      continue
+    }
+    if (chunk.type === "data-task-start") continue
+    if (chunk.type === "data-task-end") {
+      queued.push({ envelope: { task: chunk.id }, from: "v", text: `task ${chunk.id} ended: ${ended[chunk.data.end]}` })
+      continue
+    }
+    if (chunk.type === "data-turn-start") {
+      turns.push({ id: chunk.id!, inputs: [], steps: 0, chunks: [], errors: [], end: null })
       continue
     }
     const current = turns.at(-1)
-    if (current === undefined || chunk.type === "data-turn-start") continue
+    if (current === undefined) continue
+    if (chunk.type === "data-step-carries") {
+      for (const id of chunk.data.envelopes) {
+        const at = queued.findIndex((mail) => JSON.stringify(mail.envelope) === JSON.stringify(id))
+        current.inputs.push({ ...queued.splice(at, 1)[0], step: current.steps })
+      }
+      continue
+    }
+    if (chunk.type === "start-step") current.steps++
     if (chunk.type === "data-turn-end") current.end = chunk.data.reason
     else if (chunk.type === "error") current.errors.push(chunk.errorText!)
     else current.chunks.push(chunk)
   }
   const out = []
   for (const turn of turns) {
-    out.push({ id: turn.id, text: turn.text, reply: await replyOf(turn.chunks), errors: turn.errors, end: turn.end })
+    out.push({ id: turn.id, inputs: turn.inputs, reply: await replyOf(turn.chunks), errors: turn.errors, end: turn.end })
   }
   return out
 }

@@ -54,9 +54,10 @@ impl Clock for FixedClock {
 
     /// Retry backoffs pass at once; deadlines (the exchange and stream-idle
     /// timeouts, longer than any backoff) never fire, because the scripted
-    /// daemon always answers.
+    /// daemon always answers; nor does the refresh tick, so the actors are
+    /// listed once, at the start.
     async fn sleep(&self, delay: Millis) {
-        if delay >= Limits::DEFAULT.exchange_timeout {
+        if delay >= Limits::DEFAULT.exchange_timeout || delay == Limits::DEFAULT.refresh {
             std::future::pending::<()>().await;
         }
         tokio::task::yield_now().await;
@@ -168,8 +169,10 @@ async fn serve(mut stream: DuplexStream, seen: SyncSender<Seen>) {
     seen.send(Seen::Request { line: line.clone() })
         .expect("the test is listening");
 
-    if line.starts_with("POST /sessions ") {
+    if line.starts_with("POST /actors ") {
         respond_json(stream, r#"{"outcome":"created"}"#).await;
+    } else if line.starts_with("GET /actors ") {
+        respond_json(stream, r#"{"actors":[]}"#).await;
     } else if line.contains("/messages ") {
         seen.send(Seen::Message(body))
             .expect("the test is listening");
@@ -279,8 +282,9 @@ async fn creates_catches_up_reconnects_sends_and_quits() {
             Seen::Message(_) => None,
         })
         .collect();
-    assert_eq!(lines.first(), Some(&"POST /sessions HTTP/1.1"));
-    let stream = format!("GET /sessions/{session}/stream?");
+    assert_eq!(lines.first(), Some(&"POST /actors HTTP/1.1"));
+    assert!(lines.contains(&"GET /actors HTTP/1.1"), "lists the actors");
+    let stream = format!("GET /actors/{session}/stream?");
     assert!(lines.contains(&format!("{stream}offset=0000000000000000 HTTP/1.1").as_str()));
     assert!(
         lines.contains(&format!("{stream}offset=0000000000000011 HTTP/1.1").as_str()),
@@ -343,7 +347,7 @@ fn flaky(refusals: u32) -> (Arc<FlakyDaemon>, Receiver<Seen>) {
 fn hello(entropy: u8) -> verified_tui::client::Command {
     let at = UnixMillis::new(NOW).expect("in range");
     verified_tui::client::Command::SendMessage {
-        session: verified_domain::id::ActorId::from_parts(at, &[0; 10]),
+        actor: verified_domain::id::ActorId::from_parts(at, &[0; 10]),
         body: SendMessage {
             message_id: MessageId::from_parts(at, &[entropy; 10]),
             text: verified_wire::command::MessageText::parse(
@@ -677,6 +681,6 @@ async fn holding_ctrl_r_while_the_daemon_is_silent_starts_nothing_new() {
         let app = verified_tui::run(start, Limits::DEFAULT, seams, &mut screen, &mut |_| {})
             .await
             .expect("the client quits");
-        assert_eq!(app.session(), session, "{start:?}");
+        assert_eq!(app.actor(), session, "{start:?}");
     }
 }

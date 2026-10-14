@@ -13,10 +13,10 @@ expression: "screen(&mut app, 80, 30)"
  ✗ The model reported an error
  ✗ failed
 
- › server died
-
  ✗ The turn failed unexpectedly
  ✗ failed
+
+ › server died  queued
 
 
 
@@ -31,4 +31,4 @@ expression: "screen(&mut app, 80, 30)"
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │Say something…                                                                │
 └──────────────────────────────────────────────────────────────────────────────┘
- verified  000000f1 claude-haiku-4-5 ● live   ⏎ send · ⇧⏎ newline · esc cancel ·
+ verified  000000f1 claude-haiku-4-5 ● live   ⏎ send · ⇧⏎ newline · tab actor ·

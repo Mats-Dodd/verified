@@ -1074,7 +1074,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             full,
-            Some(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Some(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "the session fills: {full:?}"
     );
@@ -1106,7 +1106,7 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
     assert!(
         matches!(
             refused,
-            Some(CommandError::Rejected(Rejection::SessionFull { .. }))
+            Some(CommandError::Rejected(Rejection::ActorFull { .. }))
         ),
         "{refused:?}"
     );

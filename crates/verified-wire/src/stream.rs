@@ -6,7 +6,7 @@
 //! is append-only; an [`Offset`] is the seq of the next chunk to read, so
 //! reading from an offset returns every chunk with `seq >= offset`.
 //!
-//! `GET /sessions/{id}/stream?offset=<o>` streams SSE. Every read is a
+//! `GET /actors/{id}/stream?offset=<o>` streams SSE. Every read is a
 //! [`EVENT_DATA`] event with its chunks (omitted when empty) followed by an
 //! [`EVENT_CONTROL`] event ([`Control`]). The server closes the connection
 //! after a lifetime; the client reconnects from the last `streamNextOffset`.

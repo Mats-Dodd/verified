@@ -31,12 +31,12 @@ use verified_server::shell::{Seams, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
-    CreateSession, CreateSessionReply, MessageText, Outcome, Rejection, SendMessage,
-    SendMessageReply, decode_reply,
+    ActorList, ActorState, CreateActor, CreateActorReply, MessageText, Outcome, Rejection,
+    SendMessage, SendMessageReply, TaskList, decode_reply,
 };
 use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
-use verified_wire::transcript::Transcript;
+use verified_wire::transcript::{Part, ToolState, Transcript};
 
 use common::{client, fake_model, listener, within};
 
@@ -119,27 +119,24 @@ async fn commands_and_streams_over_http() {
     );
 
     let session = ActorId::from_parts(UnixMillis::new(1_700_000_000_000).expect("t"), &[3; 10]);
-    let create = CreateSession {
-        session_id: session,
-    }
-    .encode();
+    let create = CreateActor { actor_id: session }.encode();
     let (status, body) = call(
         &client,
         Method::POST,
-        format!("{base}/sessions"),
+        format!("{base}/actors"),
         create.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "created");
-    let reply: CreateSessionReply = decode_reply(&body, &limits).expect("a reply");
+    let reply: CreateActorReply = decode_reply(&body, &limits).expect("a reply");
     assert_eq!(reply.outcome, Outcome::Created, "new");
-    let (status, _) = call(&client, Method::POST, format!("{base}/sessions"), create).await;
+    let (status, _) = call(&client, Method::POST, format!("{base}/actors"), create).await;
     assert_eq!(status, StatusCode::OK, "a repeat create is exists");
 
     let (status, _) = call(
         &client,
         Method::POST,
-        format!("{base}/sessions/{session}/messages"),
+        format!("{base}/actors/{session}/messages"),
         b"{\"nope\":1}".to_vec(),
     )
     .await;
@@ -149,7 +146,7 @@ async fn commands_and_streams_over_http() {
     let live = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{base}/sessions/{session}/stream?offset=0000000000000000"
+            "{base}/actors/{session}/stream?offset=0000000000000000"
         ))
         .body(Full::new(Bytes::new()))
         .expect("a request");
@@ -172,7 +169,7 @@ async fn commands_and_streams_over_http() {
     let (status, body) = call(
         &client,
         Method::POST,
-        format!("{base}/sessions/{session}/messages"),
+        format!("{base}/actors/{session}/messages"),
         message.encode(),
     )
     .await;
@@ -217,7 +214,7 @@ async fn commands_and_streams_over_http() {
                 .parts
                 .iter()
                 .filter_map(|part| {
-                    if let verified_wire::transcript::Part::Text { text, .. } = part {
+                    if let Part::Text { text, .. } = part {
                         Some(text.clone())
                     } else {
                         None
@@ -235,7 +232,7 @@ async fn commands_and_streams_over_http() {
     let (status, _) = call(
         &client,
         Method::GET,
-        format!("{base}/sessions/{unknown}/stream"),
+        format!("{base}/actors/{unknown}/stream"),
         Vec::new(),
     )
     .await;
@@ -261,7 +258,7 @@ async fn follow(
     let live = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{base}/sessions/{session}/stream?offset=0000000000000000"
+            "{base}/actors/{session}/stream?offset=0000000000000000"
         ))
         .body(Full::new(Bytes::new()))
         .expect("a request");
@@ -323,25 +320,25 @@ async fn capacity_limits_answer_typed_rejections() {
     let base = format!("http://{addr}");
     let wire = WireLimits::DEFAULT;
     for byte in [1u8, 2] {
-        let create = CreateSession {
-            session_id: session_at(byte),
+        let create = CreateActor {
+            actor_id: session_at(byte),
         };
         let (status, _) = call(
             &client,
             Method::POST,
-            format!("{base}/sessions"),
+            format!("{base}/actors"),
             create.encode(),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "session {byte}");
     }
-    let third = CreateSession {
-        session_id: session_at(3),
+    let third = CreateActor {
+        actor_id: session_at(3),
     };
     let (status, body) = call(
         &client,
         Method::POST,
-        format!("{base}/sessions"),
+        format!("{base}/actors"),
         third.encode(),
     )
     .await;
@@ -349,7 +346,7 @@ async fn capacity_limits_answer_typed_rejections() {
         rejected(status, &body),
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Rejection::TooManySessions { limit: 2 }
+            Rejection::TooManyActors { limit: 2 }
         ),
         "the daemon is full"
     );
@@ -363,7 +360,7 @@ async fn capacity_limits_answer_typed_rejections() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Rejection::TooManyFollowers {
-                session_id: session_at(1),
+                actor_id: session_at(1),
                 limit: 1
             }
         ),
@@ -376,7 +373,7 @@ async fn capacity_limits_answer_typed_rejections() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Rejection::TooManyFollowers {
-                session_id: session_at(2),
+                actor_id: session_at(2),
                 limit: 1
             }
         ),
@@ -401,7 +398,7 @@ async fn capacity_limits_answer_typed_rejections() {
         ),
         text: MessageText::parse(text.to_owned(), &wire).expect("text"),
     };
-    let messages = format!("{base}/sessions/{}/messages", session_at(1));
+    let messages = format!("{base}/actors/{}/messages", session_at(1));
     let (status, _) = call(
         &client,
         Method::POST,
@@ -438,7 +435,7 @@ async fn capacity_limits_answer_typed_rejections() {
     let (status, rejection) = rejected(status, &body);
     assert_eq!(status, StatusCode::CONFLICT, "{rejection:?}");
     assert!(
-        matches!(rejection, Rejection::SessionFull { session_id, .. } if session_id == session_at(1)),
+        matches!(rejection, Rejection::ActorFull { actor_id, .. } if actor_id == session_at(1)),
         "{rejection:?}"
     );
     let (status, _) = call(&client, Method::POST, messages, message(1, "hi").encode()).await;
@@ -446,6 +443,217 @@ async fn capacity_limits_answer_typed_rejections() {
         status,
         StatusCode::OK,
         "a repeat of an accepted message is still exists"
+    );
+    tasks.shutdown().cancel();
+}
+
+/// Folds `actor`'s stream from the start until `done` holds of the
+/// transcript, polling.
+async fn fold_until(
+    client: &HttpClient,
+    base: &str,
+    actor: ActorId,
+    done: impl Fn(&Transcript) -> bool,
+) -> Transcript {
+    let mut folded = None;
+    for _ in 0..1000u32 {
+        if let Some(chunks) = caught_up(client, base, actor).await {
+            let mut transcript = Transcript::new(&WireLimits::DEFAULT);
+            for chunk in &chunks {
+                transcript.apply(chunk).expect("folds");
+            }
+            if done(&transcript) {
+                folded = Some(transcript);
+                break;
+            }
+        }
+        SystemClock.sleep(Millis::new(10)).await;
+    }
+    folded.expect("the stream gets there")
+}
+
+async fn actors(client: &HttpClient, base: &str) -> ActorList {
+    let (status, body) = call(client, Method::GET, format!("{base}/actors"), Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "the actor list");
+    decode_reply(&body, &WireLimits::DEFAULT).expect("an actor list")
+}
+
+/// Actors are addressed by id. A message to a busy actor is answered once
+/// it is durably in the mailbox, and steers the running turn: the call
+/// waiting for the user is denied, and the next step carries the message.
+/// `GET /actors` tags each actor's waiting approvals.
+#[tokio::test]
+async fn a_message_to_a_busy_actor_steers_its_running_turn() {
+    let (addr, tasks) = start().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let base = format!("http://{addr}");
+    let wire = WireLimits::DEFAULT;
+    let (busy, idle) = (session_at(5), session_at(6));
+    for actor in [busy, idle] {
+        let create = CreateActor { actor_id: actor }.encode();
+        let (status, _) = call(&client, Method::POST, format!("{base}/actors"), create).await;
+        assert_eq!(status, StatusCode::CREATED, "{actor}");
+    }
+    let message = |byte: u8, text: &str| SendMessage {
+        message_id: MessageId::from_parts(
+            UnixMillis::new(1_700_000_000_001).expect("t"),
+            &[byte; 10],
+        ),
+        text: MessageText::parse(text.to_owned(), &wire).expect("text"),
+    };
+    let messages = format!("{base}/actors/{busy}/messages");
+    let (status, body) = call(
+        &client,
+        Method::POST,
+        messages.clone(),
+        message(1, "edit lib.rs a b").encode(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "the first message");
+    let first: SendMessageReply = decode_reply(&body, &wire).expect("a reply");
+    // No rule allows `edit`: the turn waits for the user.
+    let waiting = fold_until(&client, &base, busy, |transcript| {
+        transcript.running().is_some_and(|turn| {
+            turn.reply().is_some_and(|reply| {
+                reply.parts.iter().any(|part| {
+                    matches!(part, Part::Tool(tool) if tool.state == ToolState::ApprovalRequested)
+                })
+            })
+        })
+    })
+    .await;
+    let call_id = waiting
+        .running()
+        .and_then(verified_wire::transcript::TranscriptTurn::reply)
+        .and_then(|reply| {
+            reply.parts.iter().find_map(|part| match part {
+                Part::Tool(tool) => Some(tool.tool_call_id.clone()),
+                Part::StepStart | Part::Text { .. } => None,
+            })
+        })
+        .expect("the edit");
+
+    let listed = actors(&client, &base).await;
+    let summary = |list: &ActorList, actor: ActorId| {
+        list.actors
+            .iter()
+            .find(|summary| summary.actor_id == actor)
+            .cloned()
+            .expect("listed")
+    };
+    let asking = summary(&listed, busy);
+    assert_eq!(asking.name, "main");
+    assert_eq!(
+        asking.state,
+        ActorState::Running {
+            turn_id: first.turn_id
+        }
+    );
+    assert_eq!(
+        asking.approvals,
+        core::slice::from_ref(&call_id),
+        "tagged by actor"
+    );
+    let quiet = summary(&listed, idle);
+    assert_eq!(quiet.state, ActorState::Idle);
+    assert!(quiet.approvals.is_empty(), "the other actor asks nothing");
+
+    // Steer: answered at once, though the turn runs.
+    let (status, body) = call(
+        &client,
+        Method::POST,
+        messages.clone(),
+        message(2, "hello instead").encode(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a busy actor takes the message"
+    );
+    let steer: SendMessageReply = decode_reply(&body, &wire).expect("a reply");
+    assert_eq!(steer.turn_id, first.turn_id, "it steers the running turn");
+    let (status, body) = call(
+        &client,
+        Method::POST,
+        messages.clone(),
+        message(2, "hello instead").encode(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a repeat is exists");
+    let repeat: SendMessageReply = decode_reply(&body, &wire).expect("a reply");
+    assert_eq!(repeat.turn_id, first.turn_id, "the same turn");
+
+    let done = fold_until(&client, &base, busy, |transcript| {
+        transcript
+            .turns()
+            .first()
+            .is_some_and(|turn| turn.end().is_some())
+    })
+    .await;
+    assert_eq!(
+        done.turns().len(),
+        1,
+        "the steer started no turn of its own"
+    );
+    let turn = done.turns().first().expect("the turn");
+    assert_eq!(turn.end(), Some(TurnEndReason::Completed));
+    assert_eq!(
+        turn.inputs()
+            .iter()
+            .map(|input| (input.mail.text.as_str(), input.step))
+            .collect::<Vec<_>>(),
+        [("edit lib.rs a b", 0), ("hello instead", 1)],
+        "the next step carried the steer"
+    );
+    let parts = turn
+        .reply()
+        .map(|reply| reply.parts.to_vec())
+        .unwrap_or_default();
+    assert!(
+        parts.iter().any(|part| matches!(
+            part,
+            Part::Tool(tool) if tool.tool_call_id == call_id && tool.state == ToolState::OutputDenied
+        )),
+        "the waiting call was denied: {parts:?}"
+    );
+    assert!(
+        parts.iter().any(|part| matches!(
+            part,
+            Part::Text { text, .. } if text == "Echo: hello instead"
+        )),
+        "the model saw the steer: {parts:?}"
+    );
+    assert!(done.queued().is_empty(), "nothing left unread");
+    let after = summary(&actors(&client, &base).await, busy);
+    assert_eq!(after.state, ActorState::Idle);
+    assert_eq!(after.approvals, []);
+    assert_eq!(after.unread, 0);
+
+    let (status, body) = call(
+        &client,
+        Method::GET,
+        format!("{base}/actors/{busy}/tasks"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the task list");
+    let listed: TaskList = decode_reply(&body, &wire).expect("a task list");
+    assert!(listed.tasks.is_empty(), "no background call ran");
+    let unknown = session_at(7);
+    let (status, body) = call(
+        &client,
+        Method::GET,
+        format!("{base}/actors/{unknown}/tasks"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        rejected(status, &body),
+        (
+            StatusCode::NOT_FOUND,
+            Rejection::UnknownActor { actor_id: unknown }
+        )
     );
     tasks.shutdown().cancel();
 }
