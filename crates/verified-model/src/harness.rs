@@ -2,11 +2,10 @@
 //! properties every reachable state must keep.
 
 use stateright::{Model, Property};
-use verified_core::{Core, Decision, Event, ModelExit, Outcome, Verdict};
+use verified_core::{Core, Decision, Event, Loaded, ModelExit, Outcome, Verdict};
 use verified_domain::{
-    Abstract, Approver, CallId, EffectId, Epoch, Exit, Limits, Measured, MessageId, ModelFault,
-    Proposal, Record, Request, Rerun, Reset, Tool, TurnId, TurnOutcome, Unit, UnixMillis,
-    Unstarted,
+    Abstract, CallId, Class, EffectId, Epoch, Exit, Grant, Limits, Measured, MessageId, ModelFault,
+    Proposal, Record, Request, Reset, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 use crate::alpha::{self, Work};
@@ -151,8 +150,9 @@ pub enum Bug {
     ServePending,
     /// A reconnecting client resumes one record past its offset.
     SkipOnReconnect,
-    /// Policy approves a call of any tool, not only `Safe` ones.
-    PolicyApprovesAll,
+    /// The shell approves what it should ask about, as if by the first rule
+    /// in force, whether or not it fits the call.
+    RuleApprovesAll,
     /// After a crash, drop the `Unknown` result of a dispatched `Unsafe`
     /// call, and all the resume decided after it, so the call stays
     /// dispatched.
@@ -196,6 +196,12 @@ fn proposals(id: EffectId, tools: &[Tool]) -> Vec<Proposal<Abstract>> {
 
 const fn size(bytes: u64) -> Measured<Unit> {
     Measured { body: Unit, bytes }
+}
+
+/// The rules the shell reads at boot: none is a rules file, so the default
+/// rules, recorded once.
+fn load(core: &Core<Abstract>) -> Option<Loaded<Abstract>> {
+    core.rules().is_none().then(Loaded::defaults)
 }
 
 /// Whether `flight`, effect `id`, may reply `event`: a reply of its own
@@ -319,13 +325,17 @@ impl Harness {
     fn stage(&self, world: &mut World, decision: &Decision<Abstract>) {
         let decided = alpha::decision(decision);
         world.pending = decided.records;
-        if self.bug == Some(Bug::PolicyApprovesAll) {
-            // The shell approves what it should ask about, as if by policy.
+        if self.bug == Some(Bug::RuleApprovesAll)
+            && let Some(rules) = self
+                .core(world)
+                .and_then(|core| core.rules().map(|(seq, _)| *seq))
+        {
+            // The shell approves what it should ask about, as if by rule.
             for work in &decided.effects {
                 if let Work::AskApproval { call, .. } = work {
                     world.pending.push(Record::Approved {
                         call: *call,
-                        by: Approver::Policy,
+                        by: Grant::Rule { rule: 0, rules },
                     });
                 }
             }
@@ -353,7 +363,7 @@ impl Harness {
     /// empty log.
     pub(crate) fn boot(&self) -> World {
         let mut world = World::default();
-        let boot = Core::<Abstract>::new(self.limits.clone()).resume();
+        let boot = Core::<Abstract>::new(self.limits.clone()).resume(Some(Loaded::defaults()));
         self.stage(&mut world, &boot);
         world
     }
@@ -364,7 +374,8 @@ impl Harness {
     pub(crate) fn resumed(&self, world: &World) -> Option<World> {
         let mut next = world.clone();
         next.refused = false;
-        self.stage(&mut next, &self.core(world)?.resume());
+        let core = self.core(world)?;
+        self.stage(&mut next, &core.resume(load(&core)));
         Some(next)
     }
 
@@ -648,7 +659,7 @@ impl Model for Harness {
                 let Some(core) = self.core(&world) else {
                     return Some(world);
                 };
-                let mut resumed = core.resume();
+                let mut resumed = core.resume(load(&core));
                 if self.bug == Some(Bug::LeaveDispatched)
                     && let Some(at) = resumed.records.iter().position(|record| {
                         matches!(
@@ -677,7 +688,7 @@ impl Model for Harness {
                     let epoch = core.epoch().0.saturating_add(1);
                     for (id, flight) in &world.orphans {
                         if let Job::Tool { tool, .. } = flight.job
-                            && tool.rerun() == Rerun::Unsafe
+                            && tool.class() == Class::Unsafe
                         {
                             world.staged.push(Staged::Start(
                                 EffectId {
@@ -773,7 +784,7 @@ impl Model for Harness {
                     world
                         .starts
                         .values()
-                        .all(|(tool, count)| tool.rerun() == Rerun::Safe || *count <= 1)
+                        .all(|(tool, count)| tool.class() == Class::Safe || *count <= 1)
                 },
             ),
             // U4.
@@ -804,6 +815,12 @@ impl Model for Harness {
             Property::always("stale completions change nothing", |_, world: &World| {
                 !world.stale_changed
             }),
+            Property::always(
+                "every grant is the user's or a rule in force that fits",
+                |model: &Self, world: &World| {
+                    !model.audit(world).breaches.contains(&Breach::GrantUnfit)
+                },
+            ),
             Property::always(
                 "calls past a bound never run",
                 |model: &Self, world: &World| {
@@ -890,7 +907,7 @@ impl Model for Harness {
                         flight.executed
                             && matches!(
                                 flight.job,
-                                Job::Tool { tool, .. } if tool.rerun() == Rerun::Unsafe
+                                Job::Tool { tool, .. } if tool.class() == Class::Unsafe
                             )
                     })
                     .count()
@@ -900,7 +917,7 @@ impl Model for Harness {
                 world
                     .starts
                     .values()
-                    .any(|(tool, count)| tool.rerun() == Rerun::Safe && *count >= 2)
+                    .any(|(tool, count)| tool.class() == Class::Safe && *count >= 2)
             }),
             Property::sometimes("a model call streams a second batch", |_, world: &World| {
                 world

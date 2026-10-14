@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 
 use stateright::{Expectation, Model as _};
 use verified_core::Event;
-use verified_domain::{Abstract, EffectId, Rerun, Tool};
+use verified_domain::{Abstract, Class, EffectId, Tool};
 
 use crate::coverage::{self, Key};
 use crate::harness::{Action, Harness};
@@ -271,7 +271,7 @@ fn means(world: &World, observed: &Observed) -> Result<Vec<Action>, String> {
         }
         Observed::Mutated(id) => {
             let tool = running(world, *id)?;
-            if tool.rerun() == Rerun::Safe {
+            if tool.class() == Class::Safe {
                 return Err(format!(
                     "effect {id:?} is a {tool:?} run, which changes nothing in the world"
                 ));

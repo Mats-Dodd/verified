@@ -1,7 +1,11 @@
 //! α, the abstraction from any payload to [`Abstract`].
 //!
 //! A record keeps every id and every size, drops each body, and reduces a
-//! call's arguments to the tool they name. The core reads nothing else of a
+//! call's arguments to the tool they name: its subject (a path, a command)
+//! is dropped, so a rule's pattern is matched in the model against an empty
+//! subject. The matcher itself is proved (A3); the model checks grants up
+//! to subjects, and commutes with the core under rules whose patterns are
+//! `Any` (the default rules). The core reads nothing else of a
 //! payload (it compares sizes against `Limits::context_bytes` and asks a
 //! call's tool), so a core run on α of a log decides α of what it decides on
 //! the log. An event likewise keeps its ids and sizes, and a call's arguments
@@ -56,6 +60,11 @@ pub fn record<P: Payload>(record: &Record<P>) -> Record<Abstract> {
             turn: *turn,
             message: *message,
             text: measured(text),
+        },
+        Record::Born { born } => Record::Born { born: born.clone() },
+        Record::RulesLoaded { rules, file } => Record::RulesLoaded {
+            rules: rules.clone(),
+            file: file.as_ref().map(measured),
         },
         Record::StepStarted { step } => Record::StepStarted { step: *step },
         Record::ModelOutput { step, parts } => Record::ModelOutput {

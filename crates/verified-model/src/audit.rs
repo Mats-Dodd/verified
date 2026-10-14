@@ -2,9 +2,10 @@
 
 use std::collections::BTreeSet;
 
+use verified_core::rules::rule_fits;
 use verified_domain::{
-    Abstract, CallId, CallIx, Exit, Limits, Proposal, Record, Request, Rerun, TurnId, Unstarted,
-    named,
+    Abstract, ActorName, CallId, CallIx, Class, Exit, Grant, Limits, Payload as _, Proposal,
+    Record, Request, Rules, TurnId, Unstarted, named,
 };
 
 /// Facts read back from the log.
@@ -26,6 +27,11 @@ pub(crate) enum Breach {
     /// An `Unsafe` call dispatched before a crash was resolved after it
     /// other than `Unknown`.
     UnsafeKnownAfterCrash,
+    /// An `Approved` names a rule that is not one of the rules in force
+    /// (by the seq of their `RulesLoaded`), or one that does not fit the
+    /// call (A3). α keeps no subject, so a pattern is matched against an
+    /// empty one: what the model checks of patterns is only `Any`'s.
+    GrantUnfit,
 }
 
 pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
@@ -38,8 +44,37 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
     let mut unsafe_live: BTreeSet<usize> = BTreeSet::new();
     let mut crossed: BTreeSet<usize> = BTreeSet::new();
     let mut stopping: BTreeSet<TurnId> = BTreeSet::new();
-    for (record, target) in named(log) {
+    let mut name: Option<&ActorName> = None;
+    let mut rules: Option<(u64, &Rules)> = None;
+    for (seq, (record, target)) in (0u64..).zip(named(log)) {
         match record {
+            Record::Born { born } => name = Some(&born.name),
+            Record::RulesLoaded { rules: loaded, .. } => rules = Some((seq, loaded)),
+            Record::Approved {
+                by:
+                    Grant::Rule {
+                        rule,
+                        rules: pinned,
+                    },
+                ..
+            } => {
+                let fits = rules.is_some_and(|(at, in_force)| {
+                    at == *pinned
+                        && usize::try_from(*rule)
+                            .ok()
+                            .and_then(|rule| in_force.rules.get(rule))
+                            .zip(target)
+                            .is_some_and(|(rule, (_, proposal))| match &proposal.request {
+                                Request::Run { args } => {
+                                    rule_fits(rule, name, &Abstract::shape(args))
+                                }
+                                Request::Invalid { .. } => false,
+                            })
+                });
+                if !fits {
+                    audit.breaches.insert(Breach::GrantUnfit);
+                }
+            }
             Record::TurnStarted { .. } => {
                 proposed = 0;
                 over.clear();
@@ -69,7 +104,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                     audit.breaches.insert(Breach::OverBoundDispatched);
                 }
                 if let Some((number, proposal)) = target
-                    && rerun(proposal) == Some(Rerun::Unsafe)
+                    && class(proposal) == Some(Class::Unsafe)
                 {
                     unsafe_live.insert(number);
                 }
@@ -98,10 +133,10 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
     audit
 }
 
-/// The rerun class of the tool `proposal` asks for, if it asks for one.
-const fn rerun(proposal: &Proposal<Abstract>) -> Option<Rerun> {
+/// The class of the tool `proposal` asks for, if it asks for one.
+const fn class(proposal: &Proposal<Abstract>) -> Option<Class> {
     match proposal.request {
-        Request::Run { args } => Some(args.rerun()),
+        Request::Run { args } => Some(args.class()),
         Request::Invalid { .. } => None,
     }
 }

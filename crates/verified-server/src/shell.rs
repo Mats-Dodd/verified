@@ -47,12 +47,12 @@ use std::sync::Arc;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use verified_core::{
-    Approved, Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome,
+    Approved, Core, Corrupt, Decision, Effect, Event, Loaded, ModelExit, Outcome,
     Rejection as CoreRejection, ToolCall, Verdict,
 };
 use verified_domain::id::{CallId, MessageId, SessionId, TurnId};
 use verified_domain::{
-    Approver, EffectId, Exit, Measured, ModelFault, Proposal, Record, TurnOutcome, Unstarted, named,
+    EffectId, Exit, Grant, Measured, ModelFault, Proposal, Record, TurnOutcome, Unstarted, named,
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
@@ -499,7 +499,10 @@ impl Session {
     }
 
     async fn resume(&mut self) -> Result<Persisted, ShellError> {
-        let resumed = self.core.resume();
+        // No rules file is read yet: the default rules (`read: allow`) are
+        // recorded once, at the first boot.
+        let load = self.core.rules().is_none().then(Loaded::defaults);
+        let resumed = self.core.resume(load);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Resumed {
             records: resumed.records.clone(),
@@ -778,6 +781,8 @@ impl Session {
                 text,
             } if *seen == message => Some((*turn, text)),
             Record::TurnStarted { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
@@ -972,7 +977,9 @@ fn closes(record: &Record<Parsed>) -> bool {
         Record::CancelRequested { .. } | Record::TurnEnded { .. } | Record::EpochBumped { .. } => {
             true
         }
-        Record::TurnStarted { .. }
+        Record::Born { .. }
+        | Record::RulesLoaded { .. }
+        | Record::TurnStarted { .. }
         | Record::StepStarted { .. }
         | Record::ModelOutput { .. }
         | Record::StepReset { .. }
@@ -1315,13 +1322,15 @@ fn verdict_of(records: &[Record<Parsed>], call: &CallId) -> Option<WireVerdict> 
         .filter(|(_, target)| target.is_some_and(|(_, proposal)| proposal.id == *call))
         .filter_map(|(record, _)| match record {
             Record::Approved {
-                by: Approver::User, ..
+                by: Grant::User, ..
             } => Some(WireVerdict::Grant),
             Record::ToolResult {
                 exit: Exit::NotStarted(Unstarted::Denied),
                 ..
             } => Some(WireVerdict::Deny),
             Record::Approved { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
             | Record::ToolResult { .. }
             | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
@@ -1345,6 +1354,8 @@ fn was_cancelled(records: &[Record<Parsed>], turn: TurnId) -> bool {
             outcome: TurnOutcome::Cancelled,
         } => *cancelled == turn,
         Record::TurnStarted { .. }
+        | Record::Born { .. }
+        | Record::RulesLoaded { .. }
         | Record::StepStarted { .. }
         | Record::ModelOutput { .. }
         | Record::StepReset { .. }

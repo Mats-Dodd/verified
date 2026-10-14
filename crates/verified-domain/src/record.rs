@@ -12,48 +12,83 @@ use vstd::prelude::*;
 use crate::id::{CallId, CallIx, Epoch, MessageId, StepId, TurnId};
 use crate::limits::Millis;
 use crate::payload::{Measured, Payload};
+use crate::rules::{Born, Grant, Rules};
 
 verus! {
 
-/// The tools v0 offers the model.
+/// Every kind of effect a call may ask for.
+///
+/// The shell offers the model `read`, `edit` and `bash`; the others
+/// (actors and tasks) are named here so that rules and grants already cover
+/// every kind (A4), and are offered once the runtime runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Tool {
     Read,
     Edit,
     Bash,
+    Spawn,
+    Send,
+    Wake,
+    Tasks,
+    Cancel,
 }
 
-/// Whether a call may run again after a crash. v controls dispatch, not the
-/// world: a call is either free of side effects or it is not.
+/// What a crash does to an effect. v controls dispatch, not the world: an
+/// effect is free of side effects, or may change the world, or its target
+/// deduplicates it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[verifier::external_derive]
-pub enum Rerun {
-    /// No side effect: run it again.
+pub enum Class {
+    /// Repeating it is harmless: started again until it resolves.
     Safe,
-    /// It may act on the world: a dispatched call without a result becomes
-    /// `Unknown`, and only the user approves it.
+    /// It may change the world: never started again; a dispatched call
+    /// without a result becomes `Unknown`.
     Unsafe,
+    /// Its target deduplicates it by an id v minted before sending: started
+    /// again with the same id, and it takes effect once.
+    Keyed,
 }
 
-/// The rerun class of `tool`, as the proofs see it. A new tool is `Unsafe`
+/// The class of `tool`, as the proofs see it. A new tool is `Unsafe`
 /// unless it is known to have no side effect.
-pub open spec fn rerun_of(tool: Tool) -> Rerun {
+pub open spec fn class_of(tool: Tool) -> Class {
     match tool {
-        Tool::Read => Rerun::Safe,
-        Tool::Edit | Tool::Bash => Rerun::Unsafe,
+        Tool::Read | Tool::Wake | Tool::Tasks | Tool::Cancel => Class::Safe,
+        Tool::Edit | Tool::Bash => Class::Unsafe,
+        Tool::Spawn | Tool::Send => Class::Keyed,
     }
 }
 
 impl Tool {
+    /// Whether two tools are the same.
     #[must_use]
-    pub const fn rerun(self) -> (rerun: Rerun)
+    pub const fn same(self, other: Tool) -> (same: bool)
         ensures
-            rerun == rerun_of(self),
+            same == (self == other),
+    {
+        matches!(
+            (self, other),
+            (Tool::Read, Tool::Read)
+                | (Tool::Edit, Tool::Edit)
+                | (Tool::Bash, Tool::Bash)
+                | (Tool::Spawn, Tool::Spawn)
+                | (Tool::Send, Tool::Send)
+                | (Tool::Wake, Tool::Wake)
+                | (Tool::Tasks, Tool::Tasks)
+                | (Tool::Cancel, Tool::Cancel)
+        )
+    }
+
+    #[must_use]
+    pub const fn class(self) -> (class: Class)
+        ensures
+            class == class_of(self),
     {
         match self {
-            Tool::Read => Rerun::Safe,
-            Tool::Edit | Tool::Bash => Rerun::Unsafe,
+            Tool::Read | Tool::Wake | Tool::Tasks | Tool::Cancel => Class::Safe,
+            Tool::Edit | Tool::Bash => Class::Unsafe,
+            Tool::Spawn | Tool::Send => Class::Keyed,
         }
     }
 }
@@ -126,16 +161,6 @@ pub enum Exit {
     Unknown,
 }
 
-/// Who approved a call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[verifier::external_derive]
-pub enum Approver {
-    /// The user, through an approve command.
-    User,
-    /// Policy: `Rerun::Safe` tools are approved without asking.
-    Policy,
-}
-
 /// Why a step's output so far is discarded (an AI SDK `reset-step`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
@@ -178,6 +203,12 @@ pub enum TurnOutcome {
 #[verifier::external_derive]
 #[serde(tag = "type", bound = "P: crate::payload::Codec")]
 pub enum Record<P: Payload> {
+    /// Who this actor is. At most once.
+    Born { born: Born },
+    /// The rules in force from here on (A3), and the text of the rules
+    /// file they were read from (`None`: there is none, so the default
+    /// rules). Recorded whenever they are loaded or change.
+    RulesLoaded { rules: Rules, file: Option<Measured<P::Text>> },
     /// The user's message starts a turn.
     TurnStarted { turn: TurnId, message: MessageId, text: Measured<P::Text> },
     /// A model call begins. A second `StepStarted` for the same step is a
@@ -191,8 +222,9 @@ pub enum Record<P: Payload> {
     /// turn). Every call the model made is here, including any past a bound:
     /// those are resolved at once as failed by the limit.
     StepFinished { step: StepId, calls: Vec<Proposal<P>> },
-    /// A call may run. Always precedes its `Dispatched`.
-    Approved { call: CallIx, by: Approver },
+    /// A call may run, under `by`: the user's command or a rule in force
+    /// that fits it. Always precedes its `Dispatched`.
+    Approved { call: CallIx, by: Grant },
     /// A call is about to run. At most one per call.
     Dispatched { call: CallIx },
     /// What a call actually did. At most one per call (H2); one for every
@@ -242,7 +274,9 @@ where
             | Record::ToolResult { call, .. } => turn
                 .checked_add(call.0)
                 .and_then(|number| Some((number, *proposals.get(number)?))),
-            Record::StepStarted { .. }
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
             | Record::CancelRequested { .. }

@@ -18,8 +18,9 @@
 //! - every state `apply` reaches keeps the call ledger invariant: each call
 //!   is approved at most once, dispatched at most once and only after it was
 //!   approved, and only a valid request is ever approved.
-//! - approval policy: `Approved { by: Policy }` applies only to a `Safe`
-//!   call; an `Unsafe` one (`edit`, `bash`) needs the user (`approver_fits`).
+//! - every grant is the user's command or a rule in force that fits the
+//!   call (A3, `grant_fits`): `apply` refuses any other `Approved`, and
+//!   `decide` grants by the first fitting rule (`rules::grant`) or asks.
 //! - one message, one turn: a `TurnStarted` for a message that already
 //!   started one does not apply (recovery refuses such a log).
 //! - `decide` and `resume` return records that apply, one after another,
@@ -69,17 +70,22 @@ use core::fmt;
 use vstd::prelude::*;
 
 #[cfg(verus_only)]
-use verified_domain::record::rerun_of;
+use verified_domain::record::class_of;
+use verified_domain::rules::RuleView;
+use verified_domain::shape::ShapeView;
 use verified_domain::{
-    Approver, CallId, CallIx, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId,
-    Millis, ModelFault, Payload, Proposal, Record, Request, Rerun, Reset, StepId, TurnId,
-    TurnOutcome, Unstarted,
+    ActorName, CallId, CallIx, Class, EffectId, Epoch, Exit, Failure, Grant, Limit, Limits,
+    Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules,
+    Shape, StepId, TurnId, TurnOutcome, Unstarted,
 };
 
 use crate::effect::{self, Decision, Effect, Outcome, Rejection};
 #[cfg(verus_only)]
 use crate::effect::{Approved, ToolCall};
-use crate::event::{Event, ModelExit, Verdict};
+use crate::event::{Event, Loaded, ModelExit, Verdict};
+use crate::rules;
+#[cfg(verus_only)]
+use crate::rules::fits;
 
 verus! {
 
@@ -148,13 +154,14 @@ pub enum Turn {
 
 /// One call as the spec sees it, with how many `Approved` and `Dispatched`
 /// records were applied to it.
-#[expect(missing_copy_implementations, reason = "spec-only type, never copied at run time")]
 #[expect(missing_debug_implementations, reason = "spec-only type: it holds ghost `nat` values that exist only while verifying")]
 pub struct CallView {
     pub phase: Phase,
-    /// The rerun class of the call's tool; `None` for a request that did
-    /// not parse into a known tool's arguments.
-    pub rerun: Option<Rerun>,
+    /// The class of the call's tool; `None` for a request that did not
+    /// parse into a known tool's arguments.
+    pub class: Option<Class>,
+    /// The call's tool and subject; `None` for an invalid request.
+    pub shape: Option<ShapeView>,
     pub approvals: nat,
     pub dispatches: nat,
 }
@@ -166,6 +173,10 @@ pub struct CoreView {
     pub seq: u64,
     /// Every message that started a turn, in order.
     pub messages: Seq<MessageId>,
+    /// This actor's name, once it is born.
+    pub name: Option<Seq<u8>>,
+    /// The rules in force: the seq of their `RulesLoaded` record, and them.
+    pub rules: Option<(u64, Seq<RuleView>)>,
     pub turn: Turn,
     pub calls: Seq<CallView>,
 }
@@ -177,7 +188,7 @@ pub open spec fn call_ok(call: CallView) -> bool {
     &&& (call.phase is Proposed ==> call.approvals == 0)
     &&& (call.phase is Approved ==> call.approvals == 1 && call.dispatches == 0)
     &&& (call.phase is Dispatched ==> call.dispatches == 1)
-    &&& (call.rerun is None ==> call.approvals == 0)
+    &&& (call.shape is None ==> call.approvals == 0)
 }
 
 /// Whether `message` already started a turn.
@@ -185,9 +196,22 @@ pub open spec fn seen_message(messages: Seq<MessageId>, message: MessageId) -> b
     exists|at: int| 0 <= at < messages.len() && #[trigger] messages[at] == message
 }
 
-/// Policy approves only `Safe` calls; the user may approve any valid one.
-pub open spec fn approver_fits(by: Approver, rerun: Option<Rerun>) -> bool {
-    by is User || rerun == Some(Rerun::Safe)
+/// A3: a grant names the user's command, or a rule of the rules in force
+/// (by the seq of their record) that fits this actor's own name and call
+/// `index`. Nothing else is an input: not the class, not who spawned the
+/// actor.
+pub open spec fn grant_fits(by: Grant, view: CoreView, index: int) -> bool {
+    match by {
+        Grant::User => true,
+        Grant::Rule { rule, rules } => match (view.rules, view.calls[index].shape) {
+            (Some((seq, in_force)), Some(shape)) => seq == rules && rule < in_force.len() && fits(
+                in_force[rule as int],
+                view.name,
+                shape,
+            ),
+            _ => false,
+        },
+    }
 }
 
 pub open spec fn ledger_ok(calls: Seq<CallView>) -> bool {
@@ -220,25 +244,42 @@ pub open spec fn state_ok(view: CoreView) -> bool {
     }
 }
 
-pub open spec fn fresh_call(rerun: Option<Rerun>) -> CallView {
-    CallView { phase: Phase::Proposed, rerun, approvals: 0, dispatches: 0 }
+pub open spec fn fresh_call(shape: Option<ShapeView>) -> CallView {
+    CallView {
+        phase: Phase::Proposed,
+        class: match shape {
+            Some(shape) => Some(class_of(shape.tool)),
+            None => None,
+        },
+        shape,
+        approvals: 0,
+        dispatches: 0,
+    }
 }
 
 pub open spec fn initial() -> CoreView {
-    CoreView { epoch: 0, seq: 0, messages: Seq::empty(), turn: Turn::Idle, calls: Seq::empty() }
+    CoreView {
+        epoch: 0,
+        seq: 0,
+        messages: Seq::empty(),
+        name: None,
+        rules: None,
+        turn: Turn::Idle,
+        calls: Seq::empty(),
+    }
 }
 
-/// The rerun class a proposed request asks for; `None` when it is invalid.
-pub open spec fn request_rerun<P: Payload>(request: Request<P>) -> Option<Rerun> {
+/// The shape a proposed request asks for; `None` when it is invalid.
+pub open spec fn request_shape<P: Payload>(request: Request<P>) -> Option<ShapeView> {
     match request {
-        Request::Run { args } => Some(rerun_of(P::spec_tool(&args))),
+        Request::Run { args } => Some(P::spec_shape(&args)),
         Request::Invalid { .. } => None,
     }
 }
 
 /// The calls a `StepFinished` adds.
 pub open spec fn proposed<P: Payload>(calls: Seq<Proposal<P>>) -> Seq<CallView> {
-    Seq::new(calls.len(), |index: int| fresh_call(request_rerun(calls[index].request)))
+    Seq::new(calls.len(), |index: int| fresh_call(request_shape(calls[index].request)))
 }
 
 /// H4: a result claims no more than v knows. One the core synthesizes
@@ -265,6 +306,14 @@ pub open spec fn ending_fits(intent: Intent, outcome: TurnOutcome) -> bool {
 pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Option<CoreView> {
     let seq = (view.seq + 1) as u64;
     match record {
+        Record::Born { born } => if view.name is None {
+            Some(CoreView { seq, name: Some(born.name@), ..view })
+        } else {
+            None
+        },
+        Record::RulesLoaded { rules, .. } => Some(
+            CoreView { seq, rules: Some((view.seq, rules@)), ..view },
+        ),
         Record::TurnStarted { turn, message, .. } => match view.turn {
             Turn::Idle => if seen_message(view.messages, message) {
                 None
@@ -398,7 +447,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                 let index = call.0 as int;
                 if open.stage is Tools && open.intent is Proceed && open.first_call <= index
                     < view.calls.len() && view.calls[index].phase is Proposed
-                    && view.calls[index].rerun is Some && approver_fits(by, view.calls[index].rerun) {
+                    && view.calls[index].shape is Some && grant_fits(by, view, index) {
                     Some(
                         CoreView {
                             seq,
@@ -536,13 +585,15 @@ pub open spec fn fresh<P: Payload>(start: CoreView, call: ToolCall<Approved, P>)
 }
 
 /// A rerun after recovery: the call was dispatched before the decision, it
-/// is `Safe` (no side effect), and it runs in a new epoch, so its effect id
-/// differs from the run it repeats. An `Unsafe` call never reruns.
+/// is `Safe` (no side effect) or `Keyed` (its target deduplicates it), and
+/// it runs in a new epoch, so its effect id differs from the run it
+/// repeats. An `Unsafe` call never reruns.
 pub open spec fn rerun<P: Payload>(start: CoreView, end: CoreView, call: ToolCall<Approved, P>) -> bool {
     let index = call.spec_call().0 as int;
     &&& call.spec_effect().seq < start.seq
     &&& end.epoch > start.epoch
-    &&& end.calls[index].rerun == Some(Rerun::Safe)
+    &&& end.calls[index].class is Some
+    &&& end.calls[index].class != Some(Class::Unsafe)
 }
 
 /// Every `RunTool` in `effects` is licensed by `end` and dispatched by the
@@ -707,9 +758,12 @@ struct Call<P: Payload> {
     id: CallId,
     /// `None` for a request that did not parse.
     args: Option<P::Args>,
-    /// The rerun class of the call's tool, read from the arguments the
-    /// record carried; `None` for an invalid request.
-    rerun: Option<Rerun>,
+    /// The class of the call's tool, read from the arguments the record
+    /// carried; `None` for an invalid request.
+    class: Option<Class>,
+    /// The call's tool and subject, read from its arguments; `None` for an
+    /// invalid request.
+    shape: Option<Shape>,
     phase: Phase,
 }
 
@@ -718,14 +772,19 @@ impl<P: Payload> Call<P> {
     fn copy(&self) -> (copy: Call<P>)
         ensures
             copy.phase == self.phase,
-            copy.rerun == self.rerun,
+            copy.class == self.class,
+            shape_view(copy.shape) == shape_view(self.shape),
             copy.args is Some == self.args is Some,
     {
         let args = match &self.args {
             Some(args) => Some(args.clone()),
             None => None,
         };
-        Call { id: self.id.clone(), args, rerun: self.rerun, phase: self.phase }
+        let shape = match &self.shape {
+            Some(shape) => Some(Shape { tool: shape.tool, subject: shape.subject.clone() }),
+            None => None,
+        };
+        Call { id: self.id.clone(), args, class: self.class, shape, phase: self.phase }
     }
 }
 
@@ -738,6 +797,18 @@ enum Runs {
     /// Those too, and every `Safe` call dispatched before it: after a
     /// crash, its rerun in the new epoch.
     All,
+}
+
+/// What the rules in force say of a proposed call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verifier::external_derive]
+enum Granted {
+    /// The request did not parse: there is nothing to grant.
+    Invalid,
+    /// A rule fits it.
+    Rule(Grant),
+    /// No rule fits: it awaits the user.
+    Ask,
 }
 
 /// Why `apply` refused a record: the log does not describe a run of this
@@ -762,8 +833,10 @@ pub enum Violation {
     Overflow,
     /// A turn starts from a message that already started one.
     DuplicateMessage,
-    /// Policy approved a call that only the user may approve.
-    WrongApprover,
+    /// A grant names a rule that is not in force or does not fit the call.
+    WrongGrant,
+    /// The actor is born a second time.
+    Reborn,
     /// A result claims more than v knows (H4): a synthesized `NotStarted`
     /// for a dispatched call, anything but `NotStarted` for an undispatched
     /// one, or a run's report for a call never dispatched.
@@ -786,6 +859,10 @@ pub struct Core<P: Payload> {
     seq: u64,
     /// Every message the session accepted, for deduplication.
     messages: Vec<MessageId>,
+    /// This actor's name, once it is born.
+    name: Option<ActorName>,
+    /// The rules in force and the seq of the `RulesLoaded` that holds them.
+    rules: Option<(u64, Rules)>,
     turn: Turn,
     /// The calls of the running (or last) turn, indexed by `CallIx`.
     calls: Vec<Call<P>>,
@@ -805,6 +882,14 @@ impl<P: Payload> View for Core<P> {
             epoch: self.epoch.0,
             seq: self.seq,
             messages: self.messages@,
+            name: match &self.name {
+                Some(name) => Some(name@),
+                None => None,
+            },
+            rules: match &self.rules {
+                Some((seq, rules)) => Some((*seq, rules@)),
+                None => None,
+            },
             turn: self.turn,
             calls: self.ledger@,
         }
@@ -848,8 +933,18 @@ const fn quiet<P: Payload>(outcome: Outcome) -> (decision: Decision<P>)
 /// Mirrors exec call `call` in ghost call `view`.
 spec fn mirrors<P: Payload>(call: Call<P>, view: CallView) -> bool {
     &&& call.phase == view.phase
-    &&& call.rerun == view.rerun
-    &&& (call.args is Some) == (call.rerun is Some)
+    &&& call.class == view.class
+    &&& shape_view(call.shape) == view.shape
+    &&& (call.args is Some) == (call.class is Some)
+    &&& (call.args is Some) == (call.shape is Some)
+}
+
+/// A shape as the proofs see it.
+pub open spec fn shape_view(shape: Option<Shape>) -> Option<ShapeView> {
+    match shape {
+        Some(shape) => Some(shape@),
+        None => None,
+    }
 }
 
 /// A decision being drafted on a scratch copy of the core: the records so
@@ -957,8 +1052,9 @@ impl<P: Payload> Plan<P> {
         self.emit(Record::ToolResult { call: CallIx(index), exit, output: None });
     }
 
-    /// Announces each call of the current step that awaits the user: an
-    /// `Unsafe` call still proposed, unless the turn is being cancelled.
+    /// Announces each call of the current step that awaits the user: a
+    /// valid call still proposed (no rule granted it), unless the turn is
+    /// being cancelled.
     #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
     fn ask(&mut self)
         requires
@@ -986,10 +1082,7 @@ impl<P: Payload> Plan<P> {
                 count == self.scratch.calls@.len(),
             decreases count - index,
         {
-            if matches!(self.scratch.calls[index].phase, Phase::Proposed) && matches!(
-                self.scratch.calls[index].rerun,
-                Some(Rerun::Unsafe),
-            ) {
+            if matches!(self.scratch.calls[index].phase, Phase::Proposed) {
                 if let Some(args) = &self.scratch.calls[index].args {
                     let request = effect::pending(CallIx(index), self.scratch.calls[index].id.clone(), args.clone());
                     self.effect(Effect::AskApproval { request });
@@ -1031,8 +1124,8 @@ impl<P: Payload> Plan<P> {
         {
             if let Phase::Dispatched { seq } = plan.scratch.calls[index].phase {
                 let start = seq >= plan.from || (matches!(runs, Runs::All) && matches!(
-                    plan.scratch.calls[index].rerun,
-                    Some(Rerun::Safe),
+                    plan.scratch.calls[index].class,
+                    Some(Class::Safe | Class::Keyed),
                 ));
                 if start {
                     if let Some(args) = &plan.scratch.calls[index].args {
@@ -1092,6 +1185,8 @@ impl<P: Payload> Core<P> {
             epoch: Epoch(0),
             seq: 0,
             messages,
+            name: None,
+            rules: None,
             turn: Turn::Idle,
             calls,
             context: Context::Within(0),
@@ -1121,6 +1216,16 @@ impl<P: Payload> Core<P> {
         self.seq
     }
 
+    /// The rules in force and the seq of the `RulesLoaded` that holds them,
+    /// if any were ever loaded.
+    #[must_use]
+    pub const fn rules(&self) -> Option<&(u64, Rules)> {
+        match &self.rules {
+            Some(rules) => Some(rules),
+            None => None,
+        }
+    }
+
     /// The running turn, if any.
     #[must_use]
     pub const fn running(&self) -> Option<TurnId> {
@@ -1131,6 +1236,7 @@ impl<P: Payload> Core<P> {
     }
 
     /// A scratch copy to plan on: same state, same view.
+    #[expect(clippy::manual_map, reason = "Verus has no closures, so no `Option::map`")]
     fn scratch(&self) -> (copy: Core<P>)
         requires
             self.wf(),
@@ -1146,7 +1252,8 @@ impl<P: Payload> Core<P> {
                 calls@.len() == index,
                 forall|at: int|
                     0 <= at < index ==> (#[trigger] calls@[at]).phase == self.calls@[at].phase
-                        && calls@[at].rerun == self.calls@[at].rerun && (calls@[at].args is Some) == (
+                        && calls@[at].class == self.calls@[at].class && shape_view(calls@[at].shape)
+                        == shape_view(self.calls@[at].shape) && (calls@[at].args is Some) == (
                     self.calls@[at].args is Some),
             decreases self.calls@.len() - index,
         {
@@ -1166,11 +1273,21 @@ impl<P: Payload> Core<P> {
             assert(messages@ =~= self.messages@.take(at as int));
         }
         assert(self.messages@.take(self.messages@.len() as int) =~= self.messages@);
+        let name = match &self.name {
+            Some(name) => Some(name.copy()),
+            None => None,
+        };
+        let rules = match &self.rules {
+            Some((seq, rules)) => Some((*seq, rules.copy())),
+            None => None,
+        };
         let copy = Core {
             limits: self.limits.clone(),
             epoch: self.epoch,
             seq: self.seq,
             messages,
+            name,
+            rules,
             turn: self.turn,
             calls,
             context: self.context,
@@ -1258,6 +1375,189 @@ impl<P: Payload> Core<P> {
         all
     }
 
+    /// Whether grant `by` fits call `index` in this state: the user's
+    /// command, or a rule of the rules in force that fits it.
+    fn grant_fits(&self, by: Grant, index: usize) -> (fit: bool)
+        requires
+            self.wf(),
+            index < self@.calls.len(),
+        ensures
+            fit == grant_fits(by, self@, index as int),
+    {
+        assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+        let Some(shape) = &self.calls[index].shape else {
+            return matches!(by, Grant::User);
+        };
+        match by {
+            Grant::User => true,
+            Grant::Rule { rule, rules } => match &self.rules {
+                Some((seq, in_force)) => {
+                    #[expect(clippy::as_conversions, reason = "a usize fits in a u64 on every target")]
+                    let count = in_force.rules.len() as u64;
+                    if *seq != rules || rule >= count {
+                        return false;
+                    }
+                    proof {
+                        assert(in_force@[rule as int] == in_force.rules@[rule as int]@);
+                    };
+                    #[expect(
+                        clippy::as_conversions,
+                        clippy::cast_possible_truncation,
+                        reason = "Verus proves the index is below the rules' length, a usize"
+                    )]
+                    let at = rule as usize;
+                    rules::rule_fits(&in_force.rules[at], self.name.as_ref(), shape)
+                },
+                None => false,
+            },
+        }
+    }
+
+    /// What the rules in force say of call `index`: the first rule that
+    /// fits it, if any (A3).
+    fn rule_for(&self, index: usize) -> (granted: Granted)
+        requires
+            self.wf(),
+            index < self@.calls.len(),
+        ensures
+            match granted {
+                Granted::Invalid => self@.calls[index as int].shape is None,
+                Granted::Rule(by) => self@.calls[index as int].shape is Some && grant_fits(
+                    by,
+                    self@,
+                    index as int,
+                ),
+                Granted::Ask => true,
+            },
+    {
+        assert(mirrors(self.calls@[index as int], self.ledger@[index as int]));
+        let Some(shape) = &self.calls[index].shape else {
+            return Granted::Invalid;
+        };
+        let Some((seq, rules)) = &self.rules else {
+            return Granted::Ask;
+        };
+        match rules::grant(rules, self.name.as_ref(), shape) {
+            Some(rule) => Granted::Rule(Grant::Rule { rule, rules: *seq }),
+            None => Granted::Ask,
+        }
+    }
+
+    /// `apply` of `StepFinished { step, calls }`.
+    #[expect(clippy::manual_map, reason = "Verus has no closures, so no `Option::map`")]
+    #[expect(clippy::ptr_arg, reason = "the specification names the record's own `Vec`")]
+    fn apply_step_finished(&mut self, step: StepId, calls: &Vec<Proposal<P>>) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::StepFinished { step, calls: *calls }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !(matches!(open.stage, Stage::Model { .. })) {
+            return self.refuse(Violation::WrongStage);
+        }
+        if !step.same(open.step) {
+            return self.refuse(Violation::WrongStep);
+        }
+        let first_call = self.calls.len();
+        let ghost before = self.ledger@;
+        let mut index: usize = 0;
+        while index < calls.len()
+            invariant
+                index <= calls@.len(),
+                self.calls@.len() == first_call + index,
+                self.ledger@ == before + proposed(calls@.take(index as int)),
+                before.len() == first_call,
+                forall|at: int|
+                    0 <= at < self.calls@.len() ==> mirrors(#[trigger] self.calls@[at], self.ledger@[at]),
+            decreases calls@.len() - index,
+        {
+            let proposal = &calls[index];
+            let (args, shape) = match &proposal.request {
+                Request::Run { args } => (Some(args.clone()), Some(P::shape(args))),
+                Request::Invalid { .. } => (None, None),
+            };
+            let class = match &shape {
+                Some(shape) => Some(shape.tool.class()),
+                None => None,
+            };
+            let ghost view = shape_view(shape);
+            proof {
+                assert(view == request_shape(calls@[index as int].request));
+            };
+            self.calls.push(Call { id: proposal.id.clone(), args, class, shape, phase: Phase::Proposed });
+            self.ledger = Ghost(self.ledger@.push(fresh_call(view)));
+            assert(calls@.take(index + 1).drop_last() == calls@.take(index as int));
+            assert(proposed(calls@.take(index + 1)) =~= proposed(calls@.take(index as int)).push(fresh_call(view)));
+            index += 1;
+        }
+        assert(calls@.take(calls@.len() as int) == calls@);
+        self.turn = Turn::Open(Open { stage: Stage::Tools, first_call, ..open });
+        self.seq = next;
+        proof {
+            let view = self@;
+            assert(view.calls =~= before + proposed(calls@));
+            assert forall|at: int| 0 <= at < view.calls.len() implies call_ok(#[trigger] view.calls[at]) by {
+                if at < before.len() {
+                    assert(view.calls[at] == before[at]);
+                } else {
+                    assert(view.calls[at] == proposed(calls@)[at - before.len()]);
+                }
+            }
+            assert forall|at: int| 0 <= at < first_call implies (#[trigger] view.calls[at]).phase is Resolved by {
+                assert(view.calls[at] == before[at]);
+            }
+        };
+        Ok(())
+    }
+
+    /// `apply` of `Approved { call, by }`.
+    fn apply_approved(&mut self, call: CallIx, by: Grant) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::Approved { call, by }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !(matches!(open.stage, Stage::Tools)) {
+            return self.refuse(Violation::WrongStage);
+        }
+        if matches!(open.intent, Intent::Cancel) {
+            return self.refuse(Violation::Cancelling);
+        }
+        let index = self.current_call(open, call)?;
+        if !(matches!(self.calls[index].phase, Phase::Proposed)) {
+            return self.refuse(Violation::WrongPhase);
+        }
+        if self.calls[index].shape.is_none() {
+            return self.refuse(Violation::WrongPhase);
+        }
+        if !self.grant_fits(by, index) {
+            return self.refuse(Violation::WrongGrant);
+        }
+        let ghost was = self.ledger@[index as int];
+        self.calls[index].phase = Phase::Approved;
+        self.ledger = Ghost(
+            self.ledger@.update(
+                index as int,
+                CallView { phase: Phase::Approved, approvals: was.approvals + 1, ..was },
+            ),
+        );
+        self.seq = next;
+        assert(call_ok(self.ledger@[index as int]));
+        Ok(())
+    }
+
     /// Applies one durable record. The only way state changes; runs only
     /// after the log acknowledged `record`.
     ///
@@ -1265,6 +1565,7 @@ impl<P: Payload> Core<P> {
     ///
     /// `Corrupt` when `record` cannot follow the log so far; the core is
     /// left unchanged.
+    #[verifier::spinoff_prover]
     pub fn apply(&mut self, record: &Record<P>) -> (applied: Result<(), Corrupt>)
         requires
             old(self).wf(),
@@ -1278,6 +1579,19 @@ impl<P: Payload> Core<P> {
     {
         let next = bump(self.seq);
         match record {
+            Record::Born { born } => {
+                if self.name.is_some() {
+                    return self.refuse(Violation::Reborn);
+                }
+                self.name = Some(born.name.copy());
+                self.seq = next;
+                Ok(())
+            },
+            Record::RulesLoaded { rules, .. } => {
+                self.rules = Some((self.seq, rules.copy()));
+                self.seq = next;
+                Ok(())
+            },
             Record::TurnStarted { turn, message, text } => {
                 if matches!(self.turn, Turn::Open(_)) {
                     return self.refuse(Violation::TurnOpen);
@@ -1379,94 +1693,8 @@ impl<P: Payload> Core<P> {
                 self.seq = next;
                 Ok(())
             },
-            Record::StepFinished { step, calls } => {
-                let open = self.open()?;
-                if !(matches!(open.stage, Stage::Model { .. })) {
-                    return self.refuse(Violation::WrongStage);
-                }
-                if !step.same(open.step) {
-                    return self.refuse(Violation::WrongStep);
-                }
-                let first_call = self.calls.len();
-                let ghost before = self.ledger@;
-                let mut index: usize = 0;
-                while index < calls.len()
-                    invariant
-                        index <= calls@.len(),
-                        self.calls@.len() == first_call + index,
-                        self.ledger@ == before + proposed(calls@.take(index as int)),
-                        before.len() == first_call,
-                        forall|at: int|
-                            0 <= at < self.calls@.len() ==> mirrors(#[trigger] self.calls@[at], self.ledger@[at]),
-                    decreases calls@.len() - index,
-                {
-                    let proposal = &calls[index];
-                    let (args, rerun) = match &proposal.request {
-                        Request::Run { args } => (Some(args.clone()), Some(P::tool(args).rerun())),
-                        Request::Invalid { .. } => (None, None),
-                    };
-                    proof {
-                        assert(rerun == request_rerun(calls@[index as int].request));
-                    };
-                    self.calls.push(Call { id: proposal.id.clone(), args, rerun, phase: Phase::Proposed });
-                    self.ledger = Ghost(self.ledger@.push(fresh_call(rerun)));
-                    assert(calls@.take(index + 1).drop_last() == calls@.take(index as int));
-                    assert(proposed(calls@.take(index + 1)) =~= proposed(calls@.take(index as int)).push(fresh_call(rerun)));
-                    index += 1;
-                }
-                assert(calls@.take(calls@.len() as int) == calls@);
-                self.turn = Turn::Open(Open { stage: Stage::Tools, first_call, ..open });
-                self.seq = next;
-                proof {
-                    let view = self@;
-                    assert(view.calls =~= before + proposed(calls@));
-                    assert forall|at: int| 0 <= at < view.calls.len() implies call_ok(#[trigger] view.calls[at]) by {
-                        if at < before.len() {
-                            assert(view.calls[at] == before[at]);
-                        } else {
-                            assert(view.calls[at] == proposed(calls@)[at - before.len()]);
-                        }
-                    }
-                    assert forall|at: int| 0 <= at < first_call implies (#[trigger] view.calls[at]).phase is Resolved by {
-                        assert(view.calls[at] == before[at]);
-                    }
-                };
-                Ok(())
-            },
-            Record::Approved { call, by } => {
-                let open = self.open()?;
-                if !(matches!(open.stage, Stage::Tools)) {
-                    return self.refuse(Violation::WrongStage);
-                }
-                if matches!(open.intent, Intent::Cancel) {
-                    return self.refuse(Violation::Cancelling);
-                }
-                let index = self.current_call(open, *call)?;
-                if !(matches!(self.calls[index].phase, Phase::Proposed)) {
-                    return self.refuse(Violation::WrongPhase);
-                }
-                if self.calls[index].rerun.is_none() {
-                    return self.refuse(Violation::WrongPhase);
-                }
-                let fits = match by {
-                    Approver::User => true,
-                    Approver::Policy => matches!(self.calls[index].rerun, Some(Rerun::Safe)),
-                };
-                if !fits {
-                    return self.refuse(Violation::WrongApprover);
-                }
-                let ghost was = self.ledger@[index as int];
-                self.calls[index].phase = Phase::Approved;
-                self.ledger = Ghost(
-                    self.ledger@.update(
-                        index as int,
-                        CallView { phase: Phase::Approved, approvals: was.approvals + 1, ..was },
-                    ),
-                );
-                self.seq = next;
-                assert(call_ok(self.ledger@[index as int]));
-                Ok(())
-            },
+            Record::StepFinished { step, calls } => self.apply_step_finished(*step, calls),
+            Record::Approved { call, by } => self.apply_approved(*call, *by),
             Record::Dispatched { call } => {
                 let open = self.open()?;
                 if !(matches!(open.stage, Stage::Tools)) {
@@ -1679,7 +1907,7 @@ impl<P: Payload> Core<P> {
     }
 
     /// Moves the current step's calls forward: interrupts, calls past a
-    /// bound, invalid requests, policy approvals, dispatch of every approved
+    /// bound, invalid requests, rule grants, dispatch of every approved
     /// call, and once every call is resolved, the next step or the end of
     /// the turn.
     #[verifier::loop_isolation(false)]
@@ -1720,14 +1948,12 @@ impl<P: Payload> Core<P> {
                             >= self.limits.calls_per_turn() {
                             plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
                         } else {
-                            match plan.scratch.calls[index].rerun {
-                                None => plan.resolve(index, Exit::NotStarted(Unstarted::Invalid)),
-                                Some(Rerun::Safe) => {
-                                    plan.emit(
-                                        Record::Approved { call: CallIx(index), by: Approver::Policy },
-                                    );
+                            match plan.scratch.rule_for(index) {
+                                Granted::Invalid => plan.resolve(index, Exit::NotStarted(Unstarted::Invalid)),
+                                Granted::Rule(by) => {
+                                    plan.emit(Record::Approved { call: CallIx(index), by });
                                 },
-                                Some(Rerun::Unsafe) => {},
+                                Granted::Ask => {},
                             }
                         }
                     },
@@ -1874,7 +2100,7 @@ impl<P: Payload> Core<P> {
         }
         match verdict {
             Verdict::Approve => {
-                plan.emit(Record::Approved { call: CallIx(index), by: Approver::User });
+                plan.emit(Record::Approved { call: CallIx(index), by: Grant::User });
             },
             Verdict::Deny => plan.resolve(index, Exit::NotStarted(Unstarted::Denied)),
         }
@@ -2166,12 +2392,13 @@ impl<P: Payload> Core<P> {
     // -----------------------------------------------------------------------
 
     /// What to do after `recover`: bump the epoch so replies to effects from
-    /// before the crash are stale, then pick up where the log stops. A
-    /// dispatched call with no result is rerun if it is `Safe` and becomes
-    /// `Unknown` if it is `Unsafe`; a model call in
+    /// before the crash are stale, record the rules file if the shell read
+    /// rules other than those in force (`load`), then pick up where the log
+    /// stops. A dispatched call with no result is rerun if it is `Safe` or
+    /// `Keyed` and becomes `Unknown` if it is `Unsafe`; a model call in
     /// flight restarts its step; a backoff sleeps again. Like `decide`, the
     /// records apply and every tool run is licensed by them.
-    pub fn resume(&self) -> (decision: Decision<P>)
+    pub fn resume(&self, load: Option<Loaded<P>>) -> (decision: Decision<P>)
         requires
             self.wf(),
         ensures
@@ -2180,6 +2407,9 @@ impl<P: Payload> Core<P> {
         let mut plan = self.plan();
         let epoch = Epoch(bump(self.epoch.0));
         plan.emit(Record::EpochBumped { epoch });
+        if let Some(Loaded { rules, file }) = load {
+            plan.emit(Record::RulesLoaded { rules, file });
+        }
         if let Some(open) = plan.open() {
             match (open.stage, open.intent) {
                 (Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. }, Intent::Cancel) => {
@@ -2208,7 +2438,7 @@ impl<P: Payload> Core<P> {
 
     /// Resolves each dispatched call with no result that cannot be rerun
     /// `Unknown`: every `Unsafe` one, and when the turn is being cancelled,
-    /// the `Safe` ones too.
+    /// the `Safe` and `Keyed` ones too.
     #[verifier::loop_isolation(false)]
     fn resume_tools(plan: &mut Plan<P>)
         requires
@@ -2224,7 +2454,7 @@ impl<P: Payload> Core<P> {
             forall|index: int|
                 0 <= index < final(plan).scratch@.calls.len() && (
                 #[trigger] final(plan).scratch@.calls[index]).phase is Dispatched
-                    ==> final(plan).scratch@.calls[index].rerun == Some(Rerun::Safe),
+                    ==> final(plan).scratch@.calls[index].class is Some && final(plan).scratch@.calls[index].class != Some(Class::Unsafe),
     {
         let Some(open) = plan.open() else {
             return;
@@ -2242,21 +2472,22 @@ impl<P: Payload> Core<P> {
                 open.first_call <= index <= count,
                 forall|at: int|
                     0 <= at < index && (#[trigger] plan.scratch@.calls[at]).phase is Dispatched
-                        ==> plan.scratch@.calls[at].rerun == Some(Rerun::Safe),
+                        ==> plan.scratch@.calls[at].class is Some && plan.scratch@.calls[at].class != Some(Class::Unsafe),
             decreases count - index,
         {
             assert(mirrors(plan.scratch.calls@[index as int], plan.scratch.ledger@[index as int]));
             if let Phase::Dispatched { .. } = plan.scratch.calls[index].phase {
                 // It was dispatched, so it may have acted: `NotStarted` would
-                // claim more than v knows (H4). A `Safe` call is rerun only
-                // while the turn proceeds: rerunning it under a cancel would
-                // start something after the cancel is durable (A5).
-                match (plan.scratch.calls[index].rerun, open.intent) {
-                    (None | Some(Rerun::Unsafe), Intent::Proceed | Intent::Cancel)
-                    | (Some(Rerun::Safe), Intent::Cancel) => {
+                // claim more than v knows (H4). A `Safe` or `Keyed` call is
+                // rerun only while the turn proceeds: rerunning it under a
+                // cancel would start something after the cancel is durable
+                // (A5).
+                match (plan.scratch.calls[index].class, open.intent) {
+                    (None | Some(Class::Unsafe), Intent::Proceed | Intent::Cancel)
+                    | (Some(Class::Safe | Class::Keyed), Intent::Cancel) => {
                         plan.resolve(index, Exit::Unknown);
                     },
-                    (Some(Rerun::Safe), Intent::Proceed) => {},
+                    (Some(Class::Safe | Class::Keyed), Intent::Proceed) => {},
                 }
             }
             index += 1;
@@ -2291,7 +2522,8 @@ impl<P: Payload> fmt::Debug for Call<P> {
         f.debug_struct("Call")
             .field("id", &self.id)
             .field("args", &self.args)
-            .field("rerun", &self.rerun)
+            .field("class", &self.class)
+            .field("shape", &self.shape)
             .field("phase", &self.phase)
             .finish()
     }
@@ -2301,7 +2533,8 @@ impl<P: Payload> PartialEq for Call<P> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && self.args == other.args
-            && self.rerun == other.rerun
+            && self.class == other.class
+            && self.shape == other.shape
             && self.phase == other.phase
     }
 }
@@ -2313,6 +2546,8 @@ impl<P: Payload> fmt::Debug for Core<P> {
             .field("epoch", &self.epoch)
             .field("seq", &self.seq)
             .field("messages", &self.messages)
+            .field("name", &self.name)
+            .field("rules", &self.rules)
             .field("turn", &self.turn)
             .field("calls", &self.calls)
             .field("context", &self.context)
@@ -2328,6 +2563,8 @@ impl<P: Payload> PartialEq for Core<P> {
             && self.epoch == other.epoch
             && self.seq == other.seq
             && self.messages == other.messages
+            && self.name == other.name
+            && self.rules == other.rules
             && self.turn == other.turn
             && self.calls == other.calls
             && self.context == other.context
@@ -2353,7 +2590,8 @@ impl fmt::Display for Violation {
             Self::WrongEnding => "the turn's ending does not match whether it was cancelled",
             Self::Overflow => "a counter would overflow",
             Self::DuplicateMessage => "the message already started a turn",
-            Self::WrongApprover => "policy approved a call only the user may approve",
+            Self::WrongGrant => "the grant names no rule in force that fits the call",
+            Self::Reborn => "the actor is already born",
             Self::WrongResult => "the result claims more than v knows of the call",
         })
     }

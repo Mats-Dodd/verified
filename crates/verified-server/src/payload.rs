@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use verified_domain::id::{CallId, SessionId, ToolName};
-use verified_domain::{Measured, Payload, Proposal, Request, Tool};
+use verified_domain::{Measured, Payload, Proposal, Request, Shape, Tool};
 use verified_wire::chunk::FinishReason;
 
 /// The daemon's payloads: each slot holds the type its boundary parsed.
@@ -28,6 +28,10 @@ impl Payload for Parsed {
     /// Why a proposed call is invalid; the model is told.
     type Reason = String;
     type Output = ToolOutput;
+
+    fn shape(args: &ToolArgs) -> Shape {
+        args.shape()
+    }
 
     fn tool(args: &ToolArgs) -> Tool {
         args.tool()
@@ -328,6 +332,20 @@ impl ToolArgs {
             Self::Read { .. } => Tool::Read,
             Self::Edit { .. } => Tool::Edit,
             Self::Bash { .. } => Tool::Bash,
+        }
+    }
+
+    /// The tool and the subject a rule matches: the path of a `read` or an
+    /// `edit`, the command of a `bash`.
+    #[must_use]
+    pub fn shape(&self) -> Shape {
+        let subject = match self {
+            Self::Read { path } | Self::Edit { path, .. } => path.as_str(),
+            Self::Bash { command } => command.as_str(),
+        };
+        Shape {
+            tool: self.tool(),
+            subject: subject.as_bytes().to_vec(),
         }
     }
 

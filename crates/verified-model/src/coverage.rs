@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use stateright::Model as _;
 use verified_core::Event;
 use verified_domain::{
-    Exit, Failure, Limit, Record, Request, Rerun, Reset, Tool, TurnOutcome, Unstarted, named,
+    Exit, Failure, Limit, Record, Request, Reset, Tool, TurnOutcome, Unstarted, named,
 };
 
 use crate::harness::{Action, Harness, Kind};
@@ -27,15 +27,17 @@ use crate::world::{Job, World};
 pub enum Class {
     Safe,
     Unsafe,
+    Keyed,
     /// An unknown tool or arguments that did not parse: it never runs.
     Invalid,
 }
 
 impl Class {
     const fn of(tool: Tool) -> Self {
-        match tool.rerun() {
-            Rerun::Safe => Self::Safe,
-            Rerun::Unsafe => Self::Unsafe,
+        match tool.class() {
+            verified_domain::Class::Safe => Self::Safe,
+            verified_domain::Class::Unsafe => Self::Unsafe,
+            verified_domain::Class::Keyed => Self::Keyed,
         }
     }
 }
@@ -242,6 +244,8 @@ fn decided(after: &World, keys: &mut BTreeSet<Key>) {
                 }
             }
             Record::TurnStarted { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
             | Record::StepFinished { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }

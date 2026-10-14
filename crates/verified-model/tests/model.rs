@@ -6,7 +6,7 @@ use stateright::{Checker as _, Expectation, Model as _};
 use verified_core::{Event, ModelExit, Verdict};
 use verified_domain::{
     Abstract, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured, MessageId, Proposal,
-    Record, Request, Rerun, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Record, Request, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::Divergence;
@@ -167,19 +167,28 @@ fn leaving_an_unsafe_call_dispatched_after_a_crash_is_caught() {
     }
 }
 
+/// A3: a grant names a rule in force that fits its call. A shell that
+/// approves what it should ask about, by the first rule in force (the
+/// default `read: allow`), is caught by the audit, and the core refuses
+/// the log too.
 #[test]
-fn approval_by_policy_of_an_edit_is_caught() {
+fn approval_by_a_rule_that_does_not_match_is_caught() {
     let checker = Harness {
-        bug: Some(Bug::PolicyApprovesAll),
+        bug: Some(Bug::RuleApprovesAll),
         ..suite::with_crashes(vec![vec![Tool::Edit]], 1)
     }
     .checker()
     .spawn_bfs()
     .join();
-    assert!(
-        checker.discovery("every durable prefix recovers").is_some(),
-        "the core refuses a log in which policy approved the edit"
-    );
+    for name in [
+        "every grant is the user's or a rule in force that fits",
+        "every durable prefix recovers",
+    ] {
+        assert!(
+            checker.discovery(name).is_some(),
+            "the edit granted by `read: allow` is caught: {name}"
+        );
+    }
 }
 
 #[test]
@@ -448,17 +457,17 @@ fn a_trace_carries_real_ids_and_sizes() {
         turn,
         text: size(2_000),
     };
-    // Boot is record 0 in epoch 1; the turn's first model call is licensed
-    // by its `StepStarted` (record 2), two batches are records 3 and 4, and
-    // the read is dispatched by record 7, after `StepFinished` and
-    // `Approved`.
+    // Boot is records 0 and 1 in epoch 1 (the epoch, the default rules);
+    // the turn's first model call is licensed by its `StepStarted` (record
+    // 3), two batches are records 4 and 5, and the read is dispatched by
+    // record 8, after `StepFinished` and `Approved`.
     let model = EffectId {
         epoch: Epoch(1),
-        seq: 2,
+        seq: 3,
     };
     let read = EffectId {
         epoch: Epoch(1),
-        seq: 7,
+        seq: 8,
     };
     let call = Proposal::<Abstract> {
         id: CallId::parse("toolu_01XFDUDYJgAACzvnptvVoYEL").expect("a protocol id"),
@@ -827,13 +836,13 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
             }
         })
         .collect();
-    let run = |rerun: Rerun| {
+    let run = |class: verified_domain::Class| {
         runs.iter()
             .copied()
-            .find(|(_, _, tool)| tool.rerun() == rerun)
+            .find(|(_, _, tool)| tool.class() == class)
             .expect("the path runs a tool of each class")
     };
-    let (ran, id, _) = run(Rerun::Safe);
+    let (ran, id, _) = run(verified_domain::Class::Safe);
 
     // A completion the model does not enable there: the tool reports
     // before its run returned. The model's next state alone would take it.
@@ -856,7 +865,7 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
     assert!(found.why.contains("changes nothing"), "{found:?}");
 
     // An `Unsafe` run acting on the world twice before it returns.
-    let (ran, id, _) = run(Rerun::Unsafe);
+    let (ran, id, _) = run(verified_domain::Class::Unsafe);
     let mut twice = trace.clone();
     twice.insert(ran, Observed::Mutated(id));
     twice.insert(ran, Observed::Mutated(id));

@@ -1015,6 +1015,8 @@ fn still_running(log: &[Record<Parsed>]) -> Vec<TurnId> {
             Record::TurnStarted { turn, .. } => running.push(*turn),
             Record::TurnEnded { turn, .. } => running.retain(|open| open != turn),
             Record::StepStarted { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
             | Record::StepFinished { .. }

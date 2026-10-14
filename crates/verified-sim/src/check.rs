@@ -102,6 +102,8 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                     Record::Dispatched { .. } => call.effects.push(seq),
                     Record::ToolResult { exit, .. } => call.results.push(*exit),
                     Record::Approved { .. }
+                    | Record::Born { .. }
+                    | Record::RulesLoaded { .. }
                     | Record::TurnStarted { .. }
                     | Record::StepStarted { .. }
                     | Record::ModelOutput { .. }
@@ -112,7 +114,9 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                     | Record::EpochBumped { .. } => {}
                 }
             }
-            Record::TurnStarted { .. }
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::TurnStarted { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }

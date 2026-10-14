@@ -6,9 +6,11 @@
 //! Stream offsets are record seqs; a record may project to no chunks.
 
 use serde_json::json;
+use verified_core::rules::grant;
 use verified_domain::id::{ApprovalId, CallId, PartId, TurnId};
 use verified_domain::{
-    Approver, Exit, Failure, Limit, ModelFault, Record, Request, Rerun, TurnOutcome, Unstarted,
+    ActorName, Exit, Failure, Grant, Limit, ModelFault, Payload as _, Record, Request, Rules,
+    TurnOutcome, Unstarted,
 };
 use verified_wire::chunk::{
     FinishReason, TurnEndReason, TurnEndedData, TurnStartedData, UiChunk, UserMessageData,
@@ -46,6 +48,10 @@ struct Turn {
 pub struct Projector {
     model: String,
     turn: Option<Turn>,
+    /// The actor's name and the rules in force: a call no rule grants asks
+    /// the user.
+    name: Option<ActorName>,
+    rules: Option<Rules>,
 }
 
 fn part_id(step: u32, block: u32) -> PartId {
@@ -78,7 +84,12 @@ impl Projector {
     /// A projector for a daemon talking to `model`.
     #[must_use]
     pub const fn new(model: String) -> Self {
-        Self { model, turn: None }
+        Self {
+            model,
+            turn: None,
+            name: None,
+            rules: None,
+        }
     }
 
     /// The chunks one record becomes, in order.
@@ -148,9 +159,12 @@ impl Projector {
                     for proposal in calls {
                         let id = proposal.id.clone();
                         let (reason, asks) = match &proposal.request {
-                            Request::Run { args } => {
-                                (None, matches!(args.tool().rerun(), Rerun::Unsafe))
-                            }
+                            Request::Run { args } => (
+                                None,
+                                self.rules.as_ref().is_none_or(|rules| {
+                                    grant(rules, self.name.as_ref(), &Parsed::shape(args)).is_none()
+                                }),
+                            ),
                             Request::Invalid { reason } => (Some(reason.clone()), false),
                         };
                         if asks && !turn.cancelling {
@@ -168,11 +182,11 @@ impl Projector {
             Record::Approved { call, by } => {
                 if let Some(slot) = self.turn.as_ref().and_then(|turn| turn.calls.get(call.0)) {
                     let id = slot.id.clone();
-                    if matches!(by, Approver::Policy) {
+                    if let Grant::Rule { rule, .. } = by {
                         chunks.push(UiChunk::ToolApprovalRequest {
                             approval_id: approval_id(&id),
                             tool_call_id: id.clone(),
-                            reason: Some("read-only".to_owned()),
+                            reason: Some(format!("allowed by rule {}", rule.saturating_add(1))),
                             is_automatic: Some(true),
                         });
                     }
@@ -208,6 +222,8 @@ impl Projector {
                     end_chunks(id, *outcome, FinishReason::Stop, &mut chunks);
                 }
             }
+            Record::Born { born } => self.name = Some(born.name.clone()),
+            Record::RulesLoaded { rules, .. } => self.rules = Some(rules.clone()),
             Record::Dispatched { .. } | Record::EpochBumped { .. } => {}
         }
         chunks

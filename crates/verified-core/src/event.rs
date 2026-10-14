@@ -5,7 +5,7 @@
 use vstd::prelude::*;
 
 use verified_domain::{
-    CallId, EffectId, Exit, Measured, MessageId, ModelFault, Payload, Proposal, TurnId,
+    CallId, EffectId, Exit, Measured, MessageId, ModelFault, Payload, Proposal, Rules, TurnId,
 };
 
 verus! {
@@ -26,6 +26,15 @@ pub enum ModelExit<P: Payload> {
     /// core refuses a response that reuses a call id.
     Finished(Vec<Proposal<P>>),
     Failed(ModelFault),
+}
+
+/// The rules the shell read for `Core::resume`, with the text of the file
+/// they came from (`None`: there is no rules file, so the default rules).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[verifier::external_derive]
+pub struct Loaded<P: Payload> {
+    pub rules: Rules,
+    pub file: Option<Measured<P::Text>>,
 }
 
 /// One input to `Core::decide`.
@@ -55,3 +64,14 @@ pub enum Event<P: Payload> {
 }
 
 } // verus!
+
+impl<P: Payload> Loaded<P> {
+    /// No rules file: the default rules, `read: allow`.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            rules: Rules::default(),
+            file: None,
+        }
+    }
+}

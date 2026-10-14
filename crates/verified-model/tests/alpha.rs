@@ -6,7 +6,7 @@
 use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use proptest::prelude::*;
-use verified_core::{Core, Decision, Effect, Event, ModelExit, Verdict};
+use verified_core::{Core, Decision, Effect, Event, Loaded, ModelExit, Verdict};
 use verified_domain::{
     CallId, EffectId, Epoch, Exit, Limits, LimitsConfig, MessageId, Millis, ModelFault, Record,
     ToolName, TurnId, UnixMillis, Unstarted,
@@ -288,17 +288,20 @@ proptest! {
         let mut core: Core<Parsed> = Core::new(limits());
         let mut log: Vec<Record<Parsed>> = Vec::new();
         let mut seen = Seen::default();
-        let boot = core.resume();
-        prop_assert_eq!(alpha::decision(&boot), alpha::decision(&abstracted(&log).resume()));
+        let boot = core.resume(Some(Loaded::defaults()));
+        prop_assert_eq!(
+            alpha::decision(&boot),
+            alpha::decision(&abstracted(&log).resume(Some(Loaded::defaults())))
+        );
         seen.note(&boot.effects);
         persist(&mut core, &mut log, boot);
         for choice in &choices {
             let decision = if matches!(choice, Choice::Crash) {
                 core = Core::recover(limits(), &log).expect("the log recovers");
-                let resumed = core.resume();
+                let resumed = core.resume(None);
                 prop_assert_eq!(
                     alpha::decision(&resumed),
-                    alpha::decision(&abstracted(&log).resume()),
+                    alpha::decision(&abstracted(&log).resume(None)),
                     "resume commutes with α"
                 );
                 resumed

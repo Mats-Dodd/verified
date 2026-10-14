@@ -15,6 +15,8 @@ pub mod id;
 pub mod limits;
 pub mod payload;
 pub mod record;
+pub mod rules;
+pub mod shape;
 
 pub use id::{
     ApprovalId, CallId, CallIx, EffectId, Epoch, IdEntropy, IdError, MessageId, PartId, SessionId,
@@ -23,6 +25,8 @@ pub use id::{
 pub use limits::{Limits, LimitsConfig, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit};
 pub use record::{
-    Approver, Exit, Failure, Limit, ModelFault, Proposal, Record, Request, Rerun, Reset, Tool,
-    TurnOutcome, Unstarted, named,
+    Class, Exit, Failure, Limit, ModelFault, Proposal, Record, Request, Reset, Tool, TurnOutcome,
+    Unstarted, named,
 };
+pub use rules::{ActorName, Born, Grant, NameError, Pattern, Rule, Rules};
+pub use shape::Shape;

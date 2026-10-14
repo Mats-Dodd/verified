@@ -173,6 +173,8 @@ impl Builder {
             }
             Record::TurnEnded { .. } => self.close_step(),
             Record::Approved { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
             | Record::Dispatched { .. }
             | Record::CancelRequested { .. }
             | Record::EpochBumped { .. } => {}

@@ -16,6 +16,9 @@ use serde::de::DeserializeOwned;
 use vstd::prelude::*;
 
 use crate::record::Tool;
+use crate::shape::Shape;
+#[cfg(verus_only)]
+use crate::shape::ShapeView;
 
 verus! {
 
@@ -33,14 +36,20 @@ pub trait Payload {
     /// What a tool returned.
     type Output: Clone + fmt::Debug + PartialEq + Eq + Hash;
 
-    /// The tool `args` are for, as the proofs see it.
-    spec fn spec_tool(args: &Self::Args) -> Tool;
+    /// The tool and subject of `args`, as the proofs see them.
+    spec fn spec_shape(args: &Self::Args) -> ShapeView;
 
-    /// The tool `args` are for: arguments name their tool, so a call cannot
-    /// say one tool and carry another's arguments.
+    /// The tool and subject of `args`: arguments name their tool, so a call
+    /// cannot say one tool and carry another's arguments.
+    fn shape(args: &Self::Args) -> (shape: Shape)
+        ensures
+            shape@ == Self::spec_shape(args),
+    ;
+
+    /// The tool `args` are for.
     fn tool(args: &Self::Args) -> (tool: Tool)
         ensures
-            tool == Self::spec_tool(args),
+            tool == Self::spec_shape(args).tool,
     ;
 }
 
@@ -59,7 +68,7 @@ pub struct Measured<T> {
 pub struct Unit;
 
 /// The payload the model checker runs: every slot empty, and a call's
-/// arguments only its tool.
+/// arguments only its tool (its subject is empty).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[verifier::external_derive]
 pub struct Abstract;
@@ -71,8 +80,14 @@ impl Payload for Abstract {
     type Reason = Unit;
     type Output = Unit;
 
-    open spec fn spec_tool(args: &Tool) -> Tool {
-        *args
+    open spec fn spec_shape(args: &Tool) -> ShapeView {
+        ShapeView { tool: *args, subject: Seq::empty() }
+    }
+
+    fn shape(args: &Tool) -> (shape: Shape) {
+        let shape = Shape { tool: *args, subject: Vec::new() };
+        assert(shape@ =~= Self::spec_shape(args));
+        shape
     }
 
     fn tool(args: &Tool) -> (tool: Tool) {

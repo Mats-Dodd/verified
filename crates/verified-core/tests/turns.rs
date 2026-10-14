@@ -11,9 +11,9 @@ use verified_core::{
     Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Verdict, Violation,
 };
 use verified_domain::{
-    Abstract, Approver, CallId, CallIx, EffectId, Epoch, Exit, Failure, Limit, Limits,
-    LimitsConfig, Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request,
-    Reset, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Abstract, CallId, CallIx, EffectId, Epoch, Exit, Failure, Grant, Limit, Limits, LimitsConfig,
+    Measured, MessageId, Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules,
+    Shape, StepId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,12 +86,23 @@ struct Driver {
 }
 
 impl Driver {
+    /// A core whose log holds the default rules (`read: allow`), as the
+    /// shell's first boot records them.
     fn new(limits: Limits) -> Self {
-        Self {
+        let mut driver = Self {
             core: Core::new(limits.clone()),
             limits,
             log: Vec::new(),
-        }
+        };
+        driver.load(Rules::default());
+        driver
+    }
+
+    /// Records `rules` as the rules in force.
+    fn load(&mut self, rules: Rules) {
+        let record = Record::RulesLoaded { rules, file: None };
+        self.core.apply(&record).expect("rules always load");
+        self.log.push(record);
     }
 
     fn commit(&mut self, decision: Decision<Abstract>) -> (Outcome, Vec<Effect<Abstract>>) {
@@ -112,7 +123,7 @@ impl Driver {
     /// Crash and recover from the durable log, then resume.
     fn crash(&mut self) -> Vec<Effect<Abstract>> {
         self.core = Core::recover(self.limits.clone(), &self.log).expect("the log recovers");
-        let decision = self.core.resume();
+        let decision = self.core.resume(None);
         self.commit(decision).1
     }
 
@@ -242,7 +253,7 @@ fn text_turn_completes() {
         call,
         EffectId {
             epoch: Epoch(0),
-            seq: 1
+            seq: 2
         },
         "the model call is named by its StepStarted record"
     );
@@ -255,7 +266,7 @@ fn text_turn_completes() {
     assert_eq!(outcome, Outcome::Accepted, "the model finished");
     assert!(effects.is_empty(), "nothing runs after the turn ends");
     assert_eq!(
-        driver.log,
+        driver.since(1),
         vec![
             Record::TurnStarted {
                 turn: turn(1),
@@ -345,7 +356,7 @@ fn safe_tool_is_auto_approved_and_logged() {
             },
             Record::Approved {
                 call: CallIx(0),
-                by: Approver::Policy
+                by: Grant::Rule { rule: 0, rules: 0 }
             },
             Record::Dispatched { call: CallIx(0) },
         ],
@@ -394,7 +405,7 @@ fn mutating_tool_waits_for_the_user() {
         vec![
             Record::Approved {
                 call: CallIx(0),
-                by: Approver::User
+                by: Grant::User
             },
             Record::Dispatched { call: CallIx(0) },
         ],
@@ -479,7 +490,7 @@ fn approved_calls_run_at_once_beside_anything() {
         vec![
             Record::Approved {
                 call: CallIx(1),
-                by: Approver::User
+                by: Grant::User
             },
             Record::Dispatched { call: CallIx(1) },
         ],
@@ -1171,7 +1182,7 @@ fn a_log_claiming_more_than_v_knows_is_corrupt() {
         },
         Record::Approved {
             call: CallIx(0),
-            by: Approver::User,
+            by: Grant::User,
         },
         Record::Dispatched { call: CallIx(0) },
     ];
@@ -1328,29 +1339,70 @@ fn a_log_repeating_a_message_is_corrupt() {
     );
 }
 
+/// A3, on the log: a grant names a rule in force that fits the call.
 #[test]
-fn policy_approves_only_safe_calls() {
-    let mut log = proposed(vec![propose("edit", Tool::Edit)]);
+fn a_grant_names_a_rule_in_force_that_fits() {
+    let mut log = vec![Record::RulesLoaded {
+        rules: Rules::default(),
+        file: None,
+    }];
+    log.extend(proposed(vec![propose("edit", Tool::Edit)]));
     log.push(Record::Approved {
         call: CallIx(0),
-        by: Approver::Policy,
+        by: Grant::Rule { rule: 0, rules: 0 },
     });
     assert_eq!(
         Core::recover(small_limits(), &log),
         Err(Corrupt {
-            seq: 3,
-            violation: Violation::WrongApprover
+            seq: 4,
+            violation: Violation::WrongGrant
         }),
-        "an edit needs the user"
+        "`read: allow` does not grant an edit"
     );
-    let mut read = proposed(vec![propose("read", Tool::Read)]);
-    read.push(Record::Approved {
+    let mut read = vec![Record::RulesLoaded {
+        rules: Rules::default(),
+        file: None,
+    }];
+    read.extend(proposed(vec![propose("read", Tool::Read)]));
+    let mut granted = read.clone();
+    granted.push(Record::Approved {
         call: CallIx(0),
-        by: Approver::Policy,
+        by: Grant::Rule { rule: 0, rules: 0 },
     });
     assert!(
-        Core::recover(small_limits(), &read).is_ok(),
-        "a read is approved by policy"
+        Core::recover(small_limits(), &granted).is_ok(),
+        "`read: allow` grants a read"
+    );
+    for by in [
+        Grant::Rule { rule: 1, rules: 0 },
+        Grant::Rule { rule: 0, rules: 1 },
+    ] {
+        let mut wrong = read.clone();
+        wrong.push(Record::Approved {
+            call: CallIx(0),
+            by,
+        });
+        assert_eq!(
+            Core::recover(small_limits(), &wrong),
+            Err(Corrupt {
+                seq: 4,
+                violation: Violation::WrongGrant
+            }),
+            "{by:?} names no rule in force"
+        );
+    }
+    let mut unruled = proposed(vec![propose("read", Tool::Read)]);
+    unruled.push(Record::Approved {
+        call: CallIx(0),
+        by: Grant::Rule { rule: 0, rules: 0 },
+    });
+    assert_eq!(
+        Core::recover(small_limits(), &unruled),
+        Err(Corrupt {
+            seq: 3,
+            violation: Violation::WrongGrant
+        }),
+        "with no rules in force, only the user grants"
     );
 }
 
@@ -1366,7 +1418,7 @@ fn a_log_dispatching_calls_together_recovers() {
         for index in 0..2 {
             log.push(Record::Approved {
                 call: CallIx(index),
-                by: Approver::User,
+                by: Grant::User,
             });
         }
         log.push(Record::Dispatched { call: CallIx(0) });
@@ -1392,6 +1444,10 @@ impl Payload for Text {
     type Args = Tool;
     type Reason = String;
     type Output = String;
+
+    fn shape(args: &Tool) -> Shape {
+        Abstract::shape(args)
+    }
 
     fn tool(args: &Tool) -> Tool {
         *args
@@ -1419,7 +1475,7 @@ fn record_json_shape() {
         },
         Record::Approved {
             call: CallIx(0),
-            by: Approver::User,
+            by: Grant::User,
         },
         Record::ToolResult {
             call: CallIx(0),

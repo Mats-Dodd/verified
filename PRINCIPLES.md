@@ -49,8 +49,9 @@ sandbox, which is then the thing that controls that part of the world.
     before sending (`send`, `spawn`, a stop). It is started again, and takes
     effect once.
 - **Grant.** Your permission for one effect: given live (an approval
-  command) or in advance (a rule in a rules file you wrote, matched on the
-  actor, the tool and its arguments).
+  command) or in advance (a rule in the rules file you wrote, `v.toml`,
+  matched on the actor's own name, the tool and its subject: the path or
+  the command). With no rules file, the one rule is `read: allow`.
 - **Envelope.** What lands in a mailbox: `{ id, from, to, reply_to?, body }`.
   `reply_to` is metadata for the model; no one is obliged to answer.
 - **Outcome.** How an effect ended, saying no more than v knows:
@@ -130,6 +131,7 @@ Below, each promise is split into clauses. A clause has a status:
   that check fail. It is not yet a promise.
 - **Planned**: designed, not built. It is not a promise; it says what the
   check and the planted bug must be when it is built.
+- **Retired**: superseded by another clause, kept so references resolve.
 
 ### A. Authorized
 
@@ -139,9 +141,9 @@ intent durable before it starts. A cancel revokes the grant.**
 | # | Clause | Status | Strongest check | Planted bug |
 |---|---|---|---|---|
 | A1 | A tool starts only after its call's `Approved` and `Dispatched` records are durable, in the current epoch. | Upheld | Proved (`call_ok`, `licensed`, `decided`). Trace-checked. | replay `running_tools_before_their_dispatch_is_durable_fails_the_replay` |
-| A2 | Policy approves only `Safe` calls; an `Unsafe` call needs an approval command. | Upheld (until A3 replaces it) | Proved (`approver_fits`). Model-checked: `spec_apply` refuses a policy approval of an `Unsafe` call. | Stateright `approval_by_policy_of_an_edit_is_caught` |
-| A3 | Every `Approved` record names your command or a rule, with the rules file's version, that matches the call; the rules file's content is in the log. Nothing else produces a grant, and who spawned an actor is never an input to one. | Planned | Prove: rule matching is a pure function in the core over data in the log. | A grant for a call no rule matches; a grant that consults the spawner. |
-| A4 | Every effect, not only tools (`send`, `spawn`, timers, stops), starts only under a durable grant and a durable `Dispatched`. | Planned | Prove A1's lemmas for every effect kind. Trace-check. | A `send` delivered before its `Dispatched` is durable. |
+| A2 | Retired, superseded by A3: the class of a call no longer decides its approval; every grant is the user's command or a rule. Its plant moved to A3. | Retired | | |
+| A3 | Every `Approved` record names your command or a rule, with the version of the rules (the seq of their `RulesLoaded` record), that matches the call; the rules' content is in the log. Nothing else produces a grant, and who spawned an actor is never an input to one. | Upheld | Proved (`rules::grant` returns the first rule that fits; `spec_apply` refuses an `Approved` whose grant does not fit (`grant_fits`), so `decided` forces `decide` to grant only by a fitting rule; the matcher's signature is the rules, the actor's own name and the call's shape). Model-checked ("every grant is the user's or a rule in force that fits"; α drops subjects, so the model checks patterns only as `Any`). Property-tested (`grant_is_the_first_fitting_rule`). The shell reads no rules file yet: it records the default rules (`read: allow`) at the first boot. | Stateright `approval_by_a_rule_that_does_not_match_is_caught`; Verus mutations recorded in the commit that admitted it |
+| A4 | Every effect, not only tools (`send`, `spawn`, timers, stops), starts only under a durable grant and a durable `Dispatched`. | Planned | Every tool kind (`read`, `edit`, `bash`, `spawn`, `send`, `wake`, `tasks`, `cancel`) already passes the one gate, a grant (A3) then a durable `Dispatched`, and `runs_ok` proves every `RunTool` licensed whatever its kind. It stays Planned because the effects that are not tool runs (a stop, a delivery to another actor's log) do not exist yet; they land with actors. | A `send` delivered before its `Dispatched` is durable. |
 | A5 | Once a cancel of a turn is durable, nothing under it starts: no step, retry, approval or dispatch until the turn ends, and a repeated cancel signals no run again. Nothing starting for a stopped actor is the same guard, and is Planned until stops exist. | Upheld (turns); Planned (stopped actors) | Proved (`lemma_cancel_revokes`, `lemma_nothing_starts_after_a_cancel`: `spec_apply` refuses each start under a cancel, and `decided` forces `decide` to respect it). | Verus mutation recorded in the commit that admitted it (`StepStarted` without its cancel guard) |
 
 ### O. Once
@@ -198,7 +200,7 @@ Without new input, the system goes quiet within its limits.**
 | B3 | Every turn ends, even on a full log: a reserve lets the running turn close. | Held | Simulated (`a_full_log_ends_the_running_turn_and_replays`); not model-checked (BFS never fills a log). | A full log that refuses the turn's closing records. |
 | B4 | Without new user input the system reaches quiescence: chatter between actors is capped by global limits on messages, turns, actors and depth. Stopping an actor stops everything it spawned. | Planned | Model-check an `eventually quiescent` property under the limits. DST with chattering actors. | A stop that does not reach a child; a missing message limit. |
 
-Old numbers, for code comments that still use them: U1 is A1, U2 is A2, U3
+Old numbers, for code comments that still use them: U1 is A1, U2 is A2 (retired), U3
 is O1, U4 is H1, U5 is L1, U6 is L2, U7 is O2, U8 is H2.
 
 ## Candidates
@@ -270,10 +272,13 @@ Each of these weakens a promise above. Until it is fixed, read that promise
 with this caveat.
 
 - **Approval commands are unauthenticated** (weakens A). The daemon listens
-  on localhost TCP, and any local process can send an approval. A2 proves
-  that policy never approves an `Unsafe` call; A3 will prove that every
-  grant names your command or your rule. Neither proves that the command
-  came from you.
+  on localhost TCP, and any local process can send an approval. A3 proves
+  that every grant names your command or your rule. It does not prove that
+  the command came from you.
+- **A rule naming an actor matches any actor that takes that name**
+  (weakens A3, by design). Names are labels, and an agent that spawns a
+  child chooses its name; you approved that `spawn` or wrote the rule that
+  allows it.
 - **The rules file is yours to get wrong** (weakens A, by design). A rule
   that allows `bash` allows it for every actor, including ones agents
   spawned. v proves a grant matches a rule, not that the rule was wise.
