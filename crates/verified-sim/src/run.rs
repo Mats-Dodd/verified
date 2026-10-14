@@ -8,7 +8,7 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use turmoil::barriers::{Barrier as SimBarrier, Reaction, Triggered};
-use verified_domain::Record;
+use verified_domain::{ActorId, Record};
 use verified_model::{Mismatch, Observed, Replayed};
 use verified_server::shell::Planted;
 use verified_server::shim::{Barrier, Observation};
@@ -39,8 +39,8 @@ pub struct Outcome {
     pub entries: Vec<Stamped>,
     /// Every world invariant broken.
     pub violations: Vec<Violation>,
-    /// The run as the model replays it.
-    pub observed: Vec<Observed>,
+    /// The run as the model replays it, each fact with its actor.
+    pub observed: Vec<(ActorId, Observed)>,
     /// What the replay walked through, or why the run is no path of the
     /// model.
     pub replayed: Result<Replayed, Mismatch>,
@@ -175,7 +175,7 @@ fn poll_once<F: Future>(future: F) -> Option<F::Output> {
 const fn aimed_at(aim: Aim, point: &Barrier) -> bool {
     matches!(
         (aim, point),
-        (Aim::Dispatched, Barrier::Dispatched(_))
+        (Aim::Dispatched, Barrier::Dispatched { .. })
             | (Aim::ToolRan, Barrier::ToolRan { .. })
             | (Aim::GroupWritten, Barrier::GroupWritten { .. })
     )
@@ -194,7 +194,7 @@ impl Faults {
             hold,
             barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
                 Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
-                Hold::CancelledFirst => matches!(point, Barrier::Dispatched(_)),
+                Hold::CancelledFirst => matches!(point, Barrier::Dispatched { .. }),
             }),
             waiting: Vec::new(),
         });
@@ -467,7 +467,7 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
         faults.tick(&mut sim, &ledger);
     }
     faults.heal(&mut sim, &ledger);
-    let recovered = ledger.recoveries();
+    let crashed = ledger.mark();
     crash_daemon(
         &mut sim,
         Links {
@@ -478,7 +478,7 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
     ledger.record_at(sim.elapsed(), Entry::Fault("final crash".to_owned()));
     sim.bounce(DAEMON);
     let mut steps = 0;
-    while ledger.recoveries() == recovered {
+    while !ledger.recovered_since(crashed) {
         if steps == RECOVERY_STEPS {
             return Err(failed(
                 seed,

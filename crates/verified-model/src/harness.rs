@@ -290,6 +290,8 @@ pub struct Harness {
     /// The rules file every actor's shell loads (`None`: there is none, so
     /// the default rules).
     pub rules: Option<Rules>,
+    /// The size of that file's text, as its `RulesLoaded` measures it.
+    pub file_bytes: u64,
 }
 
 /// The time every bounded id is minted at.
@@ -455,6 +457,7 @@ impl Harness {
         Self {
             limits,
             rules: bounded.rules.clone(),
+            file_bytes: 1,
             domain: Domain::Bounded(bounded),
             bug: None,
             born: born(),
@@ -490,6 +493,7 @@ impl Harness {
             born: born(),
             others: Vec::new(),
             rules: None,
+            file_bytes: 1,
         }
     }
 
@@ -510,6 +514,23 @@ impl Harness {
     #[must_use]
     pub fn with_rules(self, rules: Option<Rules>) -> Self {
         Self { rules, ..self }
+    }
+
+    /// This harness, its shells loading what a trace's resume recorded:
+    /// `rules` from a file of this size, or with no file the defaults.
+    #[must_use]
+    pub fn with_loaded(self, rules: Rules, file: Option<Measured<Unit>>) -> Self {
+        match file {
+            Some(file) => Self {
+                rules: Some(rules),
+                file_bytes: file.bytes,
+                ..self
+            },
+            None => Self {
+                rules: None,
+                ..self
+            },
+        }
     }
 
     /// Actors the world may hold.
@@ -567,7 +588,7 @@ impl Harness {
         match &self.rules {
             Some(rules) => Loaded {
                 rules: rules.clone(),
-                file: Some(size(1)),
+                file: Some(size(self.file_bytes)),
             },
             None => Loaded::defaults(),
         }

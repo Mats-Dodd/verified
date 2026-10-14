@@ -484,25 +484,35 @@ pub mod crash {
 /// (`turmoil::barriers`). Without the `sim` feature they compile to nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barrier {
-    /// A tool call's `Dispatched` record is durable and applied; the run
-    /// with this id has not started.
-    Dispatched(verified_domain::EffectId),
+    /// A tool call of `actor` has its `Dispatched` record durable and
+    /// applied; the run with this id has not started.
+    Dispatched {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+    },
     /// A tool's run returned, its side effect (if any) done; its `ToolDone`
     /// has not been sent. `stopped`: the run reports it was stopped
     /// (`NotStarted`), so it acted only if it mutated before that.
     ToolRan {
+        actor: verified_domain::ActorId,
         id: verified_domain::EffectId,
         stopped: bool,
     },
     /// A group commit's bytes are written but not yet synced.
     GroupWritten { bytes: usize },
-    /// A delivery to another actor (a `send`, a `spawn`, a stop) with this
-    /// id is about to ask its recipient: its `Dispatched` or `StopSent` is
-    /// durable.
-    Delivering(verified_domain::EffectId),
+    /// A delivery of `actor` to another actor (a `send`, a `spawn`, a stop)
+    /// with this id is about to ask its recipient: its `Dispatched` or
+    /// `StopSent` is durable.
+    Delivering {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+    },
     /// The recipient answered that delivery (its `Delivered` durable, or a
     /// refusal); the sender's `ToolDone` has not been sent.
-    Delivered(verified_domain::EffectId),
+    Delivered {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+    },
 }
 
 /// Triggers `point` for a simulation's barriers. Under `sim` it is first

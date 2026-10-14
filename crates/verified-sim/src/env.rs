@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use verified_domain::{EffectId, Millis};
+use verified_domain::{ActorId, EffectId, Millis};
 use verified_server::env::{
     BashGrant, DirEntry, EditGrant, Env, EnvError, ExecOptions, ExitStatus, Kept, LocalEnv,
     Stopped, Written,
@@ -52,8 +52,13 @@ impl SimEnv {
         }
     }
 
-    fn mutated(&self, call: Option<String>, effect: EffectId, op: Op) {
-        self.ledger.record(Entry::Mutation { call, effect, op });
+    fn mutated(&self, actor: ActorId, call: Option<String>, effect: EffectId, op: Op) {
+        self.ledger.record(Entry::Mutation {
+            actor,
+            call,
+            effect,
+            op,
+        });
     }
 }
 
@@ -75,6 +80,7 @@ impl Env for SimEnv {
     /// the write returns.
     async fn write(&self, edit: &EditGrant<'_>, contents: &[u8]) -> Result<Written, EnvError> {
         self.mutated(
+            edit.actor(),
             Some(edit.id().as_str().to_owned()),
             edit.effect(),
             Op::Write {
@@ -84,6 +90,7 @@ impl Env for SimEnv {
         );
         let written = self.files.write(edit, contents).await?;
         self.ledger.record(Entry::Wrote {
+            actor: edit.actor(),
             effect: edit.effect(),
         });
         Ok(written)
@@ -97,6 +104,7 @@ impl Env for SimEnv {
     ) -> Result<(ExitStatus, Kept), EnvError> {
         let script = bash.command().as_str().trim();
         self.mutated(
+            bash.actor(),
             Some(bash.id().as_str().to_owned()),
             bash.effect(),
             Op::Exec {

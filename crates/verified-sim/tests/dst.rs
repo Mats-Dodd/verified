@@ -284,7 +284,11 @@ fn running_a_tool_twice_in_one_dispatch_fails_the_replay() {
         outcome
             .observed
             .get(..divergence.index)
-            .is_some_and(|before| before.contains(&Observed::Mutated(id)))
+            .is_some_and(|before| {
+                before.iter().any(|(actor, observed)| {
+                    *actor == divergence.actor && *observed == Observed::Mutated(id)
+                })
+            })
     });
     assert!(caught, "no seed's replay caught a second act");
 }
@@ -381,7 +385,7 @@ fn a_property_breaks_on_a_dst_run_through_a_planted_model() {
         bug: Some(Bug::RerunUnsafe),
         ..model::harness(hosts::limits().core, &outcome.observed)
     };
-    let broken = match verified_model::replay(&harness, &outcome.observed) {
+    let broken = match verified_model::replay_actors(&harness, &outcome.observed) {
         Err(Mismatch::Violated { property, .. }) => Some(property),
         Ok(_) | Err(Mismatch::Diverged(_)) => None,
     };
@@ -493,7 +497,8 @@ fn a_full_log_fails_stop_and_replays() {
                 Entry::Shell(Observation::Passed(barrier)) => {
                     assert!(!halted, "seed {seed}: {barrier:?} after a refusal");
                 }
-                Entry::Created
+                Entry::Created { .. }
+                | Entry::Listed { .. }
                 | Entry::Recovered { .. }
                 | Entry::Mutation { .. }
                 | Entry::Wrote { .. }

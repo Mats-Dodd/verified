@@ -142,10 +142,10 @@ impl Registry {
         self.make(root(actor)).await
     }
 
-    /// Creates the actor `born` names (durably; its first resume records
-    /// its birth before it takes any input) or finds it: `Exists` on a
-    /// repeat, as a `Keyed` spawn run again after a crash finds it. One a
-    /// crash left unborn is born before this returns.
+    /// Creates the actor `born` names (durably), then delivers its birth,
+    /// or finds it: `Exists` on a repeat, as a `Keyed` spawn run again
+    /// after a crash finds it. One a crash left unborn is born before this
+    /// returns.
     ///
     /// # Errors
     /// Too many actors, a log that could not be created, or shutdown.
@@ -165,8 +165,8 @@ impl Registry {
         let (outcome, handle, unborn) = answer
             .await
             .map_err(|_dropped| CreateError::Unavailable)??;
-        // An actor whose log a crash left unborn is born now. The caller
-        // waits on the actor, never the registry.
+        // A child just created, or one whose log a crash left unborn, is
+        // born now. The caller waits on the actor, never the registry.
         if unborn {
             handle
                 .born(born)
@@ -335,13 +335,21 @@ impl RegistryTask {
             return Err(CreateError::Full { limit });
         }
         let log = self.store.create(actor).await?;
+        // A root's first resume records its birth, before it takes any
+        // input. A child's log is created first and its spawn then
+        // delivers its birth, as a step of its own (the order the model
+        // checks): a crash between them leaves it unborn, and the spawn
+        // run again births it.
+        let root = born.parent.is_none();
         let handle = self
-            .spawn_session(actor, log, Vec::new(), Some(born))
+            .spawn_session(actor, log, Vec::new(), root.then(|| born.clone()))
             .unwrap_or_else(|error| {
                 crate::defect(&format!("an empty log always replays: {error}"))
             });
-        // Its first resume records the birth, before it takes any input.
-        Ok((WireOutcome::Created, handle, false))
+        if let Some(entry) = self.actors.get_mut(&actor) {
+            entry.born = Some(born);
+        }
+        Ok((WireOutcome::Created, handle, !root))
     }
 
     async fn run(mut self, mut inbox: mpsc::Receiver<RegistryInput>) {

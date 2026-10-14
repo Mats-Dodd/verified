@@ -55,13 +55,18 @@ impl WatchedStore {
 #[async_trait]
 impl LogStore for WatchedStore {
     async fn list(&self) -> Result<Vec<ActorId>, LogError> {
-        self.inner.list().await
+        let actors = self.inner.list().await?;
+        self.ledger.record(Entry::Listed {
+            actors: actors.clone(),
+        });
+        Ok(actors)
     }
 
     async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
         let log = self.inner.create(session).await?;
-        self.ledger.record(Entry::Created);
+        self.ledger.record(Entry::Created { actor: session });
         Ok(Box::new(WatchedLog {
+            actor: session,
             inner: log,
             ledger: self.ledger.clone(),
             clock: Arc::clone(&self.clock),
@@ -74,9 +79,11 @@ impl LogStore for WatchedStore {
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
         let (log, records) = self.inner.open(session).await?;
         self.ledger.record(Entry::Recovered {
+            actor: session,
             records: records.clone(),
         });
         let watched = WatchedLog {
+            actor: session,
             inner: log,
             ledger: self.ledger.clone(),
             clock: Arc::clone(&self.clock),
@@ -85,8 +92,9 @@ impl LogStore for WatchedStore {
     }
 }
 
-/// One session's log, watched.
+/// One actor's log, watched.
 struct WatchedLog {
+    actor: ActorId,
     inner: Box<dyn Log>,
     ledger: Ledger,
     clock: Arc<dyn Clock>,
@@ -109,6 +117,7 @@ impl Log for WatchedLog {
         self.clock.sleep(SYNC_LATENCY).await;
         self.inner.append(records).await?;
         self.ledger.record(Entry::Acked {
+            actor: self.actor,
             first,
             records: records.to_vec(),
         });

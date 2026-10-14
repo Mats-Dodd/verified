@@ -183,6 +183,7 @@ pub enum Grant<'call> {
 /// An approved `edit`: replace `old` by `new` in `path`.
 #[derive(Debug)]
 pub struct EditGrant<'call> {
+    actor: ActorId,
     id: &'call CallId,
     effect: EffectId,
     path: &'call ProjectPath,
@@ -194,6 +195,7 @@ pub struct EditGrant<'call> {
 /// An approved `bash`: run `command`.
 #[derive(Debug, Clone, Copy)]
 pub struct BashGrant<'call> {
+    actor: ActorId,
     id: &'call CallId,
     effect: EffectId,
     command: &'call Command,
@@ -209,6 +211,7 @@ impl<'call> Grant<'call> {
         match call.args() {
             ToolArgs::Read { path } => Some(Self::Read(path)),
             ToolArgs::Edit { path, old, new } => Some(Self::Edit(EditGrant {
+                actor: session,
                 id: call.id(),
                 effect,
                 path,
@@ -217,6 +220,7 @@ impl<'call> Grant<'call> {
                 staged: Sibling::staged(session, effect.seq),
             })),
             ToolArgs::Bash { command, .. } => Some(Self::Bash(BashGrant {
+                actor: session,
                 id: call.id(),
                 effect,
                 command,
@@ -231,6 +235,12 @@ impl<'call> Grant<'call> {
 }
 
 impl EditGrant<'_> {
+    /// The actor whose call this is.
+    #[must_use]
+    pub const fn actor(&self) -> ActorId {
+        self.actor
+    }
+
     /// The approved call.
     #[must_use]
     pub const fn id(&self) -> &CallId {
@@ -271,6 +281,12 @@ impl EditGrant<'_> {
 }
 
 impl BashGrant<'_> {
+    /// The actor whose call this is.
+    #[must_use]
+    pub const fn actor(&self) -> ActorId {
+        self.actor
+    }
+
     /// The approved call.
     #[must_use]
     pub const fn id(&self) -> &CallId {

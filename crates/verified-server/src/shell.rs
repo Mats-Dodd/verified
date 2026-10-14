@@ -1174,12 +1174,12 @@ impl Session {
                     reply_to: None,
                     body: Body::Stop,
                 };
-                let registry = self.registry.clone();
+                let (registry, actor) = (self.registry.clone(), self.id);
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
-                    barrier(Barrier::Delivering(id)).await;
+                    barrier(Barrier::Delivering { actor, id }).await;
                     let (exit, said) = outbox::stop(&registry, envelope).await;
-                    barrier(Barrier::Delivered(id)).await;
+                    barrier(Barrier::Delivered { actor, id }).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
@@ -1245,12 +1245,12 @@ impl Session {
             }
             ToolArgs::Spawn { .. } | ToolArgs::Send { .. } => {
                 let work = self.outbound(&call);
-                let registry = self.registry.clone();
+                let (registry, actor) = (self.registry.clone(), self.id);
                 let inbox = self.inbox.clone();
                 self.seams.tasks.spawn(async move {
-                    barrier(Barrier::Delivering(id)).await;
+                    barrier(Barrier::Delivering { actor, id }).await;
                     let (exit, said) = outbox::deliver(&registry, work).await;
-                    barrier(Barrier::Delivered(id)).await;
+                    barrier(Barrier::Delivered { actor, id }).await;
                     let output = measure(ToolOutput::complete(said));
                     report(&inbox, Event::ToolDone { id, exit, output }).await;
                 });
@@ -1470,7 +1470,7 @@ async fn run_tool(
     cancel: CancellationToken,
     config: Arc<ShellConfig>,
 ) {
-    barrier(Barrier::Dispatched(id)).await;
+    barrier(Barrier::Dispatched { actor: session, id }).await;
     #[cfg(feature = "sim")]
     if config.planted == Planted::RunTwice {
         let (_, _) = tool::run(env.as_ref(), session, &call, &cancel, &config.limits).await;
@@ -1485,6 +1485,7 @@ async fn run_tool(
         exit
     };
     barrier(Barrier::ToolRan {
+        actor: session,
         id,
         stopped: matches!(exit, Exit::NotStarted(_)),
     })

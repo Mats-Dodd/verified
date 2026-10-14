@@ -13,15 +13,17 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::watch;
+use verified_domain::Address;
 use verified_domain::Millis;
+use verified_domain::id::UnixMillis;
 use verified_tui::app::{App, Start};
 use verified_tui::seam::{Clock as _, TcpDialer};
 use verified_tui::tea::Seams;
 use verified_tui::terminal::{Keyboard, KeyboardError, TestScreen, scripted};
 use verified_tui::view::Connection;
 use verified_tui::{Limits, new_session};
-use verified_wire::command::Verdict;
-use verified_wire::transcript::{Part, ToolState};
+use verified_wire::command::{ActorState, Verdict};
+use verified_wire::transcript::{Mail, Part, ToolState, TranscriptTurn};
 
 use crate::clock::SimClock;
 use crate::entropy::SeededEntropy;
@@ -51,7 +53,11 @@ const OVER: &str = "restart verified for a new session";
     reason = "a snapshot of the app's yes/no observers, one field each, for the scripted user to read"
 )]
 struct Seen {
-    turns: usize,
+    /// The user's messages the root holds: carried by a step, or queued.
+    delivered: usize,
+    /// Every other actor, as last listed, is quiet: no turn running, no
+    /// approval waiting, no task running.
+    others_quiet: bool,
     running: bool,
     running_text: bool,
     tool_running: bool,
@@ -73,7 +79,7 @@ struct Seen {
 impl Seen {
     fn of(app: &App) -> Self {
         let running = app.transcript().running();
-        let reply = running.and_then(verified_wire::transcript::TranscriptTurn::reply);
+        let reply = running.and_then(TranscriptTurn::reply);
         let parts: &[Part] = reply.as_ref().map_or(&[], |reply| reply.parts);
         let running_text = parts
             .iter()
@@ -86,8 +92,30 @@ impl Seen {
         // (a full log fails stop): what it folded is then final too.
         let quiet =
             app.caught_up() && app.settled() && (running.is_none() || over) && !app.creating();
+        let user = |mail: &Mail| mail.from == Address::User;
+        let delivered = app
+            .transcript()
+            .turns()
+            .iter()
+            .flat_map(TranscriptTurn::inputs)
+            .filter(|input| user(&input.mail))
+            .count()
+            .saturating_add(
+                app.transcript()
+                    .queued()
+                    .iter()
+                    .filter(|mail| user(mail))
+                    .count(),
+            );
+        let others_quiet = app.actors().iter().all(|actor| {
+            actor.actor_id == app.actor()
+                || (!matches!(actor.state, ActorState::Running { .. })
+                    && actor.approvals.is_empty()
+                    && actor.tasks == 0)
+        });
         Self {
-            turns: app.transcript().turns().len(),
+            delivered,
+            others_quiet,
             running: running.is_some(),
             running_text,
             tool_running,
@@ -116,6 +144,11 @@ impl Seen {
         self.caught_up && self.settled && !self.running && !self.creating
     }
 }
+
+/// How long every actor must look quiet before the user believes it: past
+/// two refreshes of the actor list, so a listing taken before the last
+/// change cannot fool it.
+const QUIET_FOR: Millis = Millis::new(2_500);
 
 /// Why the scripted user stopped early.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -172,12 +205,16 @@ impl User {
         Ok(())
     }
 
-    /// Plays turn `index` of the plan; `false` when the TUI says the
-    /// session takes no more.
-    async fn play_turn(&mut self, index: usize, turn: &TurnPlan) -> Result<bool, ScriptError> {
+    /// Plays turn `index` of the plan, the `typed` message the user sends;
+    /// `false` when the TUI says the session takes no more.
+    async fn play_turn(
+        &mut self,
+        (index, typed): (usize, &mut usize),
+        turn: &TurnPlan,
+    ) -> Result<bool, ScriptError> {
         loop {
             let seen = self.glance().await?;
-            if seen.quiet() && seen.turns == index && !seen.draft {
+            if seen.quiet() && seen.delivered == *typed && !seen.draft {
                 break;
             }
             self.unstick(&seen).await?;
@@ -186,6 +223,7 @@ impl User {
             .record(Entry::User(format!("send {index}: {}", turn.text)));
         self.press(Keyboard::paste(turn.text.clone())).await?;
         self.press(Keyboard::enter()).await?;
+        *typed = typed.saturating_add(1);
         let mut cancelled = false;
         let mut prompts = 0usize;
         let mut last = u64::MAX;
@@ -209,7 +247,7 @@ impl User {
                     .await?;
                 continue;
             }
-            if seen.turns > index && !seen.running && seen.settled {
+            if seen.delivered >= *typed && !seen.running && seen.settled {
                 return Ok(true);
             }
             self.unstick(&seen).await?;
@@ -264,22 +302,38 @@ impl User {
 
     async fn play(mut self, plan: &[TurnPlan]) -> Result<(), ScriptError> {
         let mut over = false;
+        let mut typed = 0usize;
         for (index, turn) in plan.iter().enumerate() {
-            if !self.play_turn(index, turn).await? {
+            if !self.play_turn((index, &mut typed), turn).await? {
                 self.ledger.record(Entry::GaveUp { turn: index });
                 over = true;
                 break;
             }
         }
+        let mut quiet_since: Option<UnixMillis> = None;
         loop {
             let seen = self.glance().await?;
             // Caught up for real: what the TUI folded is everything the
             // daemon acknowledged (a TUI still "live" on a connection to a
             // crashed daemon learns otherwise only at its idle timeout).
-            let current = seen.offset == self.ledger.logged();
-            if let (true, true, Some(transcript)) =
-                (over || seen.turns == plan.len(), current, seen.transcript)
-            {
+            let current = self
+                .ledger
+                .root()
+                .is_some_and(|root| seen.offset == self.ledger.logged(root));
+            let now = self.clock.now();
+            quiet_since = if seen.others_quiet && seen.transcript.is_some() {
+                quiet_since.or(Some(now))
+            } else {
+                None
+            };
+            let settled = quiet_since
+                .is_some_and(|since| now.get().saturating_sub(since.get()) >= QUIET_FOR.get());
+            if let (true, true, true, Some(transcript)) = (
+                over || seen.delivered >= typed,
+                current,
+                settled,
+                seen.transcript,
+            ) {
                 self.ledger.record(Entry::Caught {
                     offset: seen.offset,
                     transcript,
