@@ -8,8 +8,13 @@
 //! prefix = "cargo test"  # optional; or `exact = "..."`; absent = any subject
 //! ```
 //!
-//! The file is read through the [`Env`] seam at boot and before each of your
-//! messages; there is no watching. It is parsed here, once, into the core's
+//! A subject is the call's path, command, child's name or recipient, as
+//! bytes. `exact` must equal it and `prefix` must start it, nothing more:
+//! a `bash` prefix of `cargo test` also allows `cargo test; rm -rf ~`.
+//!
+//! The file is read through the [`Env`] seam at boot, before every
+//! delivery to an actor and before each model response is settled; there
+//! is no watching. It is parsed here, once, into the core's
 //! [`Rules`], and recorded in the log with its text whenever it differs from
 //! the text in force (`RulesLoaded`), so the log alone says which rules
 //! granted what. With no file the one rule is the default, `read: allow`. A

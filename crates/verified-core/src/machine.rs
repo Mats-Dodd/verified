@@ -2256,6 +2256,12 @@ impl<P: Payload> Core<P> {
         self.mailbox.len()
     }
 
+    /// The turns started so far, which `Limits::turns_per_actor` bounds.
+    #[must_use]
+    pub const fn turns(&self) -> u64 {
+        self.turns
+    }
+
     /// A scratch copy to plan on: same state, same view.
     #[expect(clippy::manual_map, reason = "Verus has no closures, so no `Option::map`")]
     fn scratch(&self) -> (copy: Core<P>)

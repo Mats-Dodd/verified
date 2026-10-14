@@ -21,7 +21,7 @@ use verified_model::{Harness, Mismatch, Observed, Replayed, alpha};
 use verified_server::payload::Parsed;
 use verified_server::shim::{Barrier, Observation};
 
-use crate::ledger::{Entry, Stamped, root};
+use crate::ledger::{Entry, Op, Stamped, root};
 
 fn records(records: &[Record<Parsed>]) -> Vec<Record<verified_domain::Abstract>> {
     records.iter().map(record).collect()
@@ -51,8 +51,14 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
                     records: records(synced),
                 },
             )),
-            Entry::Mutation { actor, effect, .. } => {
+            Entry::Mutation {
+                actor, effect, op, ..
+            } => {
                 trace.push((*actor, Observed::Mutated(*effect)));
+                // The fake shell's `hang` never returns, whatever it is told.
+                if matches!(op, Op::Exec { command } if command == "hang") {
+                    trace.push((*actor, Observed::Hung(*effect)));
+                }
             }
             Entry::Read { from, next, .. } => {
                 if let Some(root) = root {
@@ -166,6 +172,7 @@ pub fn harness(limits: Limits, trace: &[(ActorId, Observed)]) -> Harness {
         | Observed::Dispatched(_)
         | Observed::Mutated(_)
         | Observed::Ran { .. }
+        | Observed::Hung(_)
         | Observed::Read(_) => None,
     });
     let mut born = None;

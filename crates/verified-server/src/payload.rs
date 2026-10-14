@@ -957,3 +957,118 @@ mod tests {
         );
     }
 }
+
+/// A2's subject half: a rule's `exact` or `prefix` is matched against the
+/// call's subject, which must be exactly the command or path the log
+/// records and the approval shows.
+#[cfg(test)]
+mod subjects {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+    use verified_core::rules::grant;
+    use verified_domain::{Pattern, Rule, Rules, Shape, Tool};
+
+    use super::{Command, ProjectPath, ToolArgs};
+
+    /// The one rule `tool`, `subject`.
+    fn only(tool: Tool, subject: Pattern) -> Rules {
+        Rules {
+            rules: vec![Rule {
+                actor: None,
+                tool,
+                subject,
+            }],
+        }
+    }
+
+    /// Checked through the matcher, for calls whose subjects `shape`
+    /// derives: an `exact` rule of a command or path grants exactly that
+    /// call, never one that runs more or names a sibling, and a `prefix`
+    /// rule grants what it starts. What broke, if anything.
+    fn subjects_match(shape: fn(&ToolArgs) -> Shape) -> Result<(), String> {
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let calls = (
+            "[a-z]{1,8}( [a-z0-9./-]{1,8}){0,3}",
+            any::<bool>(),
+            "[a-z]{1,8}(/[a-z]{1,8}){0,2}",
+        );
+        runner
+            .run(&calls, |(command, background, path)| {
+                let more = format!("{command}; rm x");
+                let grants = |text: &str, rules: &Rules| {
+                    let args = ToolArgs::Bash {
+                        command: Command::parse(text.to_owned()).expect("a command"),
+                        background,
+                    };
+                    grant(rules, None, &shape(&args)).is_some()
+                };
+                let exact = only(Tool::Bash, Pattern::Exact(command.clone().into_bytes()));
+                prop_assert!(grants(&command, &exact), "exact {command:?}");
+                prop_assert!(!grants(&more, &exact), "exact {command:?} grants {more:?}");
+                let prefix = only(Tool::Bash, Pattern::Prefix(command.clone().into_bytes()));
+                prop_assert!(grants(&more, &prefix), "prefix {command:?} of {more:?}");
+                let sibling = format!("{path}x");
+                for (tool, read) in [(Tool::Read, true), (Tool::Edit, false)] {
+                    let call = |text: &str| {
+                        let path = ProjectPath::parse(text).expect("a path");
+                        if read {
+                            ToolArgs::Read { path }
+                        } else {
+                            ToolArgs::Edit {
+                                path,
+                                old: String::new(),
+                                new: String::new(),
+                            }
+                        }
+                    };
+                    let rules = only(tool, Pattern::Exact(path.clone().into_bytes()));
+                    prop_assert!(grant(&rules, None, &shape(&call(&path))).is_some());
+                    prop_assert!(
+                        grant(&rules, None, &shape(&call(&sibling))).is_none(),
+                        "exact {path:?} grants {sibling:?}"
+                    );
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_rule_matches_the_recorded_command_or_path() {
+        subjects_match(ToolArgs::shape).expect("subjects are what the log records");
+    }
+
+    /// The planted bug: a command's subject is its first word, as if the
+    /// shell parsed the command. The check must catch it.
+    #[test]
+    fn a_subject_cut_at_the_first_word_is_caught() {
+        let first_word = |args: &ToolArgs| match args {
+            ToolArgs::Bash {
+                command,
+                background,
+            } => Shape::Bash {
+                subject: command
+                    .as_str()
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec(),
+                background: *background,
+            },
+            ToolArgs::Read { .. }
+            | ToolArgs::Edit { .. }
+            | ToolArgs::Spawn { .. }
+            | ToolArgs::Send { .. }
+            | ToolArgs::Wake { .. }
+            | ToolArgs::Tasks
+            | ToolArgs::Cancel { .. } => args.shape(),
+        };
+        let broken = subjects_match(first_word).expect_err("the check catches the cut subject");
+        assert!(broken.contains("exact"), "{broken}");
+    }
+}

@@ -66,6 +66,9 @@ pub enum Observed {
     /// here only if it never mutated and was not `stopped` (it reports
     /// `NotStarted`: it saw its cancel before acting).
     Ran { id: EffectId, stopped: bool },
+    /// A tool run will never return: it ignores its cancel and its kill,
+    /// so only v's deadline resolves it (B2).
+    Hung(EffectId),
     /// The client folded the record at this offset of the first root's
     /// log. Only the offset: what it folded there is the simulation's I6
     /// to check, not the replay's.
@@ -85,6 +88,7 @@ impl Observed {
             | Self::Dispatched(_)
             | Self::Mutated(_)
             | Self::Ran { .. }
+            | Self::Hung(_)
             | Self::Read(_) => None,
         }
     }
@@ -415,6 +419,16 @@ fn means(
                 "effect {id:?} returned, but it is no tool run the model started"
             )),
         },
+        Observed::Hung(id) => match actor.flights.get(id) {
+            Some(Flight {
+                job: Job::Tool { .. },
+                hung: false,
+                ..
+            }) => Ok(vec![Action::Hang(slot, *id)]),
+            Some(_) | None => Err(format!(
+                "effect {id:?} hangs, but it is no tool run the model has in flight"
+            )),
+        },
         Observed::Read(seq) => {
             let at = usize::try_from(*seq).map_err(|error| error.to_string())?;
             // The client reconnects only when it must: its connection is
@@ -506,7 +520,10 @@ fn agrees(before: &World, after: World, slot: Slot, observed: &Observed) -> Resu
                 ))
             }
         }
-        Observed::Dispatched(_) | Observed::Mutated(_) | Observed::Ran { .. } => Ok(after),
+        Observed::Dispatched(_)
+        | Observed::Mutated(_)
+        | Observed::Ran { .. }
+        | Observed::Hung(_) => Ok(after),
     }
 }
 

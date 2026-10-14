@@ -1022,17 +1022,22 @@ impl Harness {
                 actions.push(Action::Execute(slot, *id));
             }
         }
-        if let Domain::Bounded(bounded) = &self.domain {
-            for (id, flight) in &actor.orphans {
-                if matches!(flight.job, Job::Tool { .. }) && !flight.executed {
-                    actions.push(Action::OrphanExecute(slot, *id));
-                }
-            }
-            if state.hangs < bounded.max_hangs {
-                for (id, flight) in &actor.flights {
-                    if matches!(flight.job, Job::Tool { .. }) && !flight.hung {
-                        actions.push(Action::Hang(slot, *id));
+        let hangs = match &self.domain {
+            Domain::Bounded(bounded) => {
+                for (id, flight) in &actor.orphans {
+                    if matches!(flight.job, Job::Tool { .. }) && !flight.executed {
+                        actions.push(Action::OrphanExecute(slot, *id));
                     }
+                }
+                state.hangs < bounded.max_hangs
+            }
+            // A trace's run hangs where the run was seen to.
+            Domain::Trace(_) => true,
+        };
+        if hangs {
+            for (id, flight) in &actor.flights {
+                if matches!(flight.job, Job::Tool { .. }) && !flight.hung {
+                    actions.push(Action::Hang(slot, *id));
                 }
             }
         }

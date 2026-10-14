@@ -130,12 +130,12 @@ fn tool_definition(tool: Tool) -> Value {
             json!(["path"]),
         ),
         Tool::Edit => (
-            "Replace the single occurrence of `old` with `new` in a project file. Include enough context in `old` to make it unique. Asks the user first.",
+            "Replace the single occurrence of `old` with `new` in a project file. Include enough context in `old` to make it unique.",
             json!({"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}),
             json!(["path", "old", "new"]),
         ),
         Tool::Bash => (
-            "Run a shell command in the project root and return its combined output and exit status. With `background`, it runs on as a task: the call returns its task id at once, and you are told when it ends. Asks the user first.",
+            "Run a shell command in the project root and return its combined output and exit status. With `background`, it runs on as a task: the call returns its task id at once, and you are told when it ends.",
             json!({"command": {"type": "string"}, "background": {"type": "boolean"}}),
             json!(["command"]),
         ),

@@ -98,6 +98,10 @@ impl MemEnv {
 #[async_trait]
 impl Env for MemEnv {
     async fn read(&self, path: &ProjectPath, _limit: u64) -> Result<Vec<u8>, EnvError> {
+        if path.as_str() == "hang" {
+            // A read that never returns.
+            core::future::pending::<()>().await;
+        }
         self.files
             .lock()
             .expect("unpoisoned")
@@ -1256,8 +1260,10 @@ async fn eventually_refused(handle: &ActorHandle) -> Option<CommandError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Act {
     Append,
-    /// Refuse it, as a full disk would.
+    /// Refuse it, as the log's own cap would.
     Refuse,
+    /// Refuse it, as a full disk would.
+    NoSpace,
     /// Never return: the daemon is stuck there until it crashes.
     Stall,
     /// Append it after a while.
@@ -1333,6 +1339,12 @@ impl Log for WatchedLog {
                     limit: 0,
                 });
             }
+            Act::NoSpace => {
+                return Err(LogError::NoSpace {
+                    path: "watched".to_owned(),
+                    source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                });
+            }
             Act::Stall => core::future::pending::<()>().await,
             Act::Slow => SystemClock.sleep(Millis::new(200)).await,
         }
@@ -1368,7 +1380,7 @@ impl LogStore for Watched {
 /// L3's fail-stop, checked: an approved `bash` whose `Dispatched` the log
 /// refuses. What broke it, if anything: the approval acknowledged, the
 /// command run, or anything appended after the refusal.
-async fn fail_stop(planted: Planted) -> Result<(), String> {
+async fn fail_stop(planted: Planted, refusal: Act) -> Result<(), String> {
     let disk = MemDisk::new();
     let env = Arc::new(MemEnv::default());
     let limits = limits();
@@ -1376,12 +1388,12 @@ async fn fail_stop(planted: Planted) -> Result<(), String> {
     let (store, _) = Watched::new(
         &disk,
         &limits,
-        Arc::new(|_, records: &[Record<Parsed>]| {
+        Arc::new(move |_, records: &[Record<Parsed>]| {
             if records
                 .iter()
                 .any(|record| matches!(record, Record::Dispatched { .. }))
             {
-                Act::Refuse
+                refusal
             } else {
                 Act::Append
             }
@@ -1432,9 +1444,18 @@ async fn fail_stop(planted: Planted) -> Result<(), String> {
 /// is appended (L3).
 #[tokio::test]
 async fn a_refused_append_fails_stop() {
-    fail_stop(Planted::None)
+    fail_stop(Planted::None, Act::Refuse)
         .await
         .expect("nothing acts or is acknowledged after a refused append");
+}
+
+/// A full disk is a refused append too: the session fails stop, and the
+/// daemon lives on.
+#[tokio::test]
+async fn a_full_disk_fails_stop() {
+    fail_stop(Planted::None, Act::NoSpace)
+        .await
+        .expect("nothing acts or is acknowledged once the disk is full");
 }
 
 /// The planted bug for L3's fail-stop: a shell that starts a decision's
@@ -1442,7 +1463,7 @@ async fn a_refused_append_fails_stop() {
 #[cfg(feature = "sim")]
 #[tokio::test]
 async fn acting_after_a_refused_append_is_caught() {
-    let broken = fail_stop(Planted::ActAfterRefusal)
+    let broken = fail_stop(Planted::ActAfterRefusal, Act::Refuse)
         .await
         .expect_err("the check catches a shell that acts after a refused append");
     assert!(broken.contains("acted"), "{broken}");
@@ -1785,6 +1806,93 @@ async fn waiting_on_a_run_that_never_reports_is_caught() {
         .await
         .expect_err("the check catches a run waited on for good");
     assert!(broken.contains("past its deadline"), "{broken}");
+}
+
+/// B2 beyond `bash`, checked: a `read` and an `edit` whose file never
+/// answers, a `send` whose recipient's append never returns, and a `spawn`
+/// whose child's birth never does. What broke, if anything: a call not
+/// resolved `Unknown` within two seconds of its deadline.
+async fn stalls(planted: Planted) -> Result<(), String> {
+    let env = Arc::new(MemEnv::holding("a.txt", "x", true));
+    env.set_rules(Some(
+        "[[allow]]\ntool = \"read\"\n[[allow]]\ntool = \"edit\"\n[[allow]]\ntool = \"send\"\n\
+         [[allow]]\ntool = \"spawn\"\n",
+    ));
+    let mut limits = limits();
+    limits.deadline_slack = Millis::new(50);
+    limits.deliver_deadline = Millis::new(50);
+    let (from, to) = (session_id(), other_id());
+    let (store, _) = Watched::new(
+        &MemDisk::new(),
+        &limits,
+        Arc::new(move |actor, records: &[Record<Parsed>]| {
+            let stalled = records.iter().any(|record| {
+                matches!(record, Record::Delivered { envelope }
+                    if actor == to && envelope.from == verified_domain::Address::Actor(from))
+                    || matches!(record, Record::Born { born } if born.parent.is_some())
+            });
+            if stalled { Act::Stall } else { Act::Append }
+        }),
+    );
+    let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
+    let (_, handle) = daemon.registry.create(from).await.expect("created");
+    let (_, _recipient) = daemon.registry.create(to).await.expect("created");
+    handle
+        .send_message(send(
+            1,
+            &format!("read hang ; edit a.txt x y ; send {to} hi ; spawn helper hello"),
+        ))
+        .await
+        .expect("accepted");
+    let unknown = |log: &[Record<Parsed>]| {
+        log.iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    Record::ToolResult {
+                        exit: Exit::Unknown,
+                        output: None,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    let waited = within(
+        Duration::from_secs(2),
+        until_log(&handle, |log| unknown(log) == 4),
+    )
+    .await;
+    let log = records(&handle).await;
+    daemon.tasks.shutdown().cancel();
+    match waited {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "{} of 4 stalled calls resolved by their deadlines, the rest were waited on past \
+             them: {log:?}",
+            unknown(&log)
+        )),
+    }
+}
+
+/// Every in-flight effect resolves by its deadline (B2), whatever it waits
+/// on: a file, or another actor's log.
+#[tokio::test]
+async fn reads_edits_and_deliveries_resolve_by_their_deadlines() {
+    stalls(Planted::None)
+        .await
+        .expect("every stalled call resolves by its deadline");
+}
+
+/// The planted bug for B2 beyond `bash`: no deadline is armed. The check
+/// must catch the waits.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn waiting_on_a_stalled_file_or_delivery_is_caught() {
+    let broken = stalls(Planted::NoDeadline)
+        .await
+        .expect_err("the check catches the waits");
+    assert!(broken.contains("0 of 4"), "{broken}");
 }
 
 /// Rules that let every actor spawn and send without asking.
@@ -2478,4 +2586,160 @@ async fn a_message_to_an_unborn_actor_is_refused() {
         listed.iter().all(|listed| listed.actor != child),
         "an unborn log is no actor: {listed:?}"
     );
+}
+
+/// A2: the rules file is read before every delivery and before each model
+/// response is settled, not only before your messages. A rule you remove
+/// stops granting to every actor, a spawned child included, from its next
+/// delivery on: the child's `bash` asks, and nothing runs.
+#[tokio::test]
+async fn a_removed_rule_stops_granting_to_a_child() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some(MAIL));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "spawn helper hello"))
+        .await
+        .expect("accepted");
+    let log = until_log(&handle, |log| {
+        result_saying(log, "spawned helper").is_some()
+    })
+    .await;
+    let child = other(&log);
+    let child_handle = daemon.registry.lookup(child).await.expect("hosted");
+    until_log(&child_handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::TurnEnded { .. }))
+    })
+    .await;
+    // You remove `bash`; `spawn` and `send` stay allowed.
+    env.set_rules(Some(
+        "[[allow]]\ntool = \"spawn\"\n[[allow]]\ntool = \"send\"\n",
+    ));
+    handle
+        .send_message(send(2, &format!("send {child} bash danger")))
+        .await
+        .expect("accepted");
+    let rules_loaded = |log: &[Record<Parsed>]| {
+        log.iter()
+            .filter(|record| matches!(record, Record::RulesLoaded { .. }))
+            .count()
+    };
+    let child_log = within(
+        Duration::from_secs(5),
+        until_log(&child_handle, |log| {
+            rules_loaded(log) >= 2
+                && log
+                    .iter()
+                    .filter(|record| matches!(record, Record::StepFinished { .. }))
+                    .count()
+                    >= 2
+        }),
+    )
+    .await;
+    SystemClock.sleep(Millis::new(200)).await;
+    let ran = env.commands();
+    daemon.tasks.shutdown().cancel();
+    assert!(child_log.is_ok(), "the child reads the rules file again");
+    assert!(
+        !ran.iter().any(|(command, _)| command == "danger"),
+        "a bash you no longer allow ran under the removed rule: {ran:?}"
+    );
+}
+
+/// L3: an error never answers a message the log holds. A message to an
+/// idle actor at its limit of turns would start no turn: it is refused
+/// before anything is recorded, and a retry is refused the same way.
+#[tokio::test]
+async fn a_message_past_the_turn_limit_is_refused_and_not_recorded() {
+    let mut limits = limits();
+    limits.core = Limits::new(LimitsConfig {
+        turns_per_actor: core::num::NonZeroUsize::new(1).expect("one"),
+        retry_schedule: vec![Millis::new(1)],
+        ..LimitsConfig::v0()
+    });
+    let daemon = boot_with(&MemDisk::new(), Arc::new(MemEnv::default()), limits).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let first = handle
+        .send_message(send(1, "hello"))
+        .await
+        .expect("accepted");
+    until(&handle, ended(first.turn_id)).await;
+    let held = |log: &[Record<Parsed>]| {
+        log.iter().any(|record| {
+            matches!(record, Record::Delivered { envelope }
+                if envelope.id == verified_domain::EnvelopeId::User(message_id(2)))
+        })
+    };
+    for attempt in 0..2u8 {
+        let answer = handle.send_message(send(2, "again")).await;
+        assert!(
+            matches!(
+                answer,
+                Err(CommandError::Rejected(Rejection::ActorFull { .. }))
+            ),
+            "attempt {attempt}: {answer:?}"
+        );
+        assert!(
+            !held(&records(&handle).await),
+            "attempt {attempt}: refused, yet durable"
+        );
+    }
+    daemon.tasks.shutdown().cancel();
+}
+
+/// A2 for subjects, end to end: an `exact` rule grants its command alone.
+/// A command that runs more, or another one, asks; nothing it did not
+/// grant runs before you answer.
+#[tokio::test]
+async fn an_exact_rule_grants_its_command_alone() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some("[[allow]]\ntool = \"bash\"\nexact = \"echo a\"\n"));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let asked = |chunks: &[UiChunk]| {
+        chunks
+            .iter()
+            .filter(|chunk| matches!(chunk, UiChunk::ToolApprovalRequest { .. }))
+            .count()
+    };
+    for (seed, command) in [(1u8, "echo a; rm x"), (2, "echo b")] {
+        let reply = handle
+            .send_message(send(seed, &format!("bash {command}")))
+            .await
+            .expect("accepted");
+        let chunks = until(&handle, |chunks| {
+            asked(chunks) >= usize::from(seed) || ended(reply.turn_id)(chunks)
+        })
+        .await;
+        assert_eq!(
+            asked(&chunks),
+            usize::from(seed),
+            "{command:?} asks: {:?}",
+            env.commands()
+        );
+        handle
+            .cancel(Cancel {
+                turn_id: reply.turn_id,
+            })
+            .await
+            .expect("cancelled");
+        until(&handle, ended(reply.turn_id)).await;
+    }
+    assert!(env.commands().is_empty(), "{:?}", env.commands());
+    let reply = handle
+        .send_message(send(3, "bash echo a"))
+        .await
+        .expect("accepted");
+    until(&handle, ended(reply.turn_id)).await;
+    assert_eq!(
+        env.commands()
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>(),
+        ["echo a"],
+        "the rule's own command runs without asking"
+    );
+    daemon.tasks.shutdown().cancel();
 }

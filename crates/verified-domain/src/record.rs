@@ -132,7 +132,7 @@ pub enum ModelFault {
     /// The model's response (or a batch of it) is longer than the log's line
     /// bound: it is too large to record.
     TooLarge,
-    /// The call was stopped (an interrupt, or a full log ending the turn).
+    /// The call was stopped (an interrupt, or a stop of its actor).
     Cancelled,
 }
 

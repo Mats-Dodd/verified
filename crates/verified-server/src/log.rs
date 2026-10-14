@@ -57,6 +57,14 @@ pub enum LogError {
         length: u64,
         limit: u64,
     },
+    /// The disk is full, or the quota spent: whatever of the group was
+    /// written was cut off again, so the log holds what was acknowledged.
+    #[error("log {path}: no space left: {source}")]
+    NoSpace {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("log {path}: {source}")]
     Io {
         path: String,
@@ -84,13 +92,13 @@ pub enum LogError {
 }
 
 impl LogError {
-    /// Whether the append was refused because the log is full: nothing was
-    /// written, the log still holds exactly what was acknowledged, and the
-    /// session goes on.
+    /// Whether the append was refused because the log is full (its own
+    /// file cap, or the disk): nothing was written, the log still holds
+    /// exactly what was acknowledged, and the session fails stop.
     #[must_use]
     pub const fn refused(&self) -> bool {
         match self {
-            Self::Full { .. } => true,
+            Self::Full { .. } | Self::NoSpace { .. } => true,
             Self::LineTooLong { .. }
             | Self::Io { .. }
             | Self::TooLarge { .. }
@@ -99,6 +107,15 @@ impl LogError {
             | Self::BadName { .. } => false,
         }
     }
+}
+
+/// Whether `error` says the disk has no room: it is full, or the quota is
+/// spent.
+fn no_space(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }
 
 fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> LogError + use<> {
@@ -478,7 +495,21 @@ impl Log for FileLog {
         };
         #[cfg(not(feature = "sim"))]
         let appended = fs::append_synced(&mut self.file, &bytes).await;
-        appended.map_err(io_error(&self.path))?;
+        if let Err(error) = appended {
+            if !no_space(&error) {
+                return Err(io_error(&self.path)(error));
+            }
+            // Storage is the world: a full disk refuses the group. Cut off
+            // what of it was written, or, if that fails too, crash: the
+            // log's tail is then unknown, and recovery reads it.
+            fs::truncate(&self.file, self.length)
+                .await
+                .map_err(io_error(&self.path))?;
+            return Err(LogError::NoSpace {
+                path: self.path.display().to_string(),
+                source: error,
+            });
+        }
         self.next = advance(self.next, records);
         self.length = self.length.saturating_add(to_u64(bytes.len()));
         Ok(())
@@ -771,12 +802,37 @@ mod tests {
     use verified_domain::{Epoch, Record};
 
     use super::{
-        LogError, LogStore as _, MemDisk, MemLogStore, ScanError, crc32c, encode_frame, scan,
-        to_u64,
+        LogError, LogStore as _, MemDisk, MemLogStore, ScanError, crc32c, encode_frame, no_space,
+        scan, to_u64,
     };
     use crate::payload::{Parsed, measure};
 
     const MAX_LINE: usize = 1 << 16;
+
+    /// Storage is the world (L3): a full disk or a spent quota refuses an
+    /// append, as the log's own cap does; any other IO error crashes.
+    #[test]
+    fn a_full_disk_refuses_and_other_errors_crash() {
+        use std::io::{Error, ErrorKind};
+        for (kind, full) in [
+            (ErrorKind::StorageFull, true),
+            (ErrorKind::QuotaExceeded, true),
+            (ErrorKind::PermissionDenied, false),
+            (ErrorKind::Other, false),
+        ] {
+            assert_eq!(no_space(&Error::from(kind)), full, "{kind:?}");
+        }
+        let refused = LogError::NoSpace {
+            path: "log".to_owned(),
+            source: Error::from(ErrorKind::StorageFull),
+        };
+        assert!(refused.refused(), "a full disk fails stop");
+        let crashed = LogError::Io {
+            path: "log".to_owned(),
+            source: Error::from(ErrorKind::Other),
+        };
+        assert!(!crashed.refused(), "another error crashes");
+    }
 
     fn epochs(count: u64) -> Vec<Record<Parsed>> {
         (0..count)

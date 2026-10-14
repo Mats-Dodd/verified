@@ -903,23 +903,18 @@ impl Session {
                     | Event::ModelParts { .. }
                     | Event::Woke { .. } => {}
                 }
+                // A model's response is settled under the rules file as it
+                // is now: its calls are granted then (A2).
+                if matches!(event, Event::ModelDone { .. })
+                    && let Persisted::Refused = self.reload_rules().await?
+                {
+                    return Ok(());
+                }
                 if let Persisted::Done(_, effects) = self.decide(event).await? {
                     self.start_effects(effects);
                 }
             }
             Input::Deliver { envelope, reply } => {
-                // Your messages are read with the rules file as it is then.
-                let yours = matches!(
-                    (&envelope.from, &envelope.body),
-                    (Address::User, Body::Text(_))
-                );
-                if yours
-                    && let Some(Loaded { rules, file }) = self.rules_changed().await
-                    && let Persisted::Refused = self.decide(Event::Rules { rules, file }).await?
-                {
-                    answer(reply, Outcome::Rejected(CoreRejection::Limit));
-                    return Ok(());
-                }
                 // The planted defect: acknowledge before the append.
                 #[cfg(feature = "sim")]
                 let reply = if self.config.planted == Planted::AckBeforeAppend {
@@ -930,7 +925,7 @@ impl Session {
                 };
                 #[cfg(not(feature = "sim"))]
                 let reply = Some(reply);
-                let (outcome, effects) = match self.decide(Event::Deliver { envelope }).await? {
+                let (outcome, effects) = match self.deliver(envelope).await? {
                     Persisted::Done(outcome, effects) => (outcome, effects),
                     // A full log takes no mail: the sender hears a limit.
                     Persisted::Refused => (Outcome::Rejected(CoreRejection::Limit), Vec::new()),
@@ -949,47 +944,9 @@ impl Session {
                 self.start_effects(effects);
             }
             Input::Message { command, reply } => {
-                if self.full.is_some() {
-                    drop(reply.send(Err(self.full())));
-                    return Ok(());
-                }
-                let delivered = self.delivered(command.message_id).is_some();
-                if self.held_bytes >= self.config.limits.session_bytes && !delivered {
-                    drop(reply.send(Err(Rejection::ActorFull {
-                        actor_id: self.id,
-                        reason: format!(
-                            "it holds {} bytes, its limit is {}",
-                            self.held_bytes, self.config.limits.session_bytes
-                        ),
-                    })));
-                    return Ok(());
-                }
-                // The rules file is read before each of your messages: a
-                // change takes effect from the message on.
-                if let Some(Loaded { rules, file }) = self.rules_changed().await
-                    && let Persisted::Refused = self.decide(Event::Rules { rules, file }).await?
-                {
-                    drop(reply.send(Err(self.full())));
-                    return Ok(());
-                }
-                let text = command.text.as_str().to_owned();
-                let event = Event::Deliver {
-                    envelope: Envelope {
-                        id: EnvelopeId::User(command.message_id),
-                        from: Address::User,
-                        to: self.id,
-                        reply_to: None,
-                        body: Body::Text(measure(text.clone())),
-                    },
-                };
-                match self.decide(event).await? {
-                    Persisted::Done(outcome, effects) => {
-                        let answer = self.message_answer(outcome, &command, &text);
-                        drop(reply.send(answer));
-                        self.start_effects(effects);
-                    }
-                    Persisted::Refused => drop(reply.send(Err(self.full()))),
-                }
+                let (answer, effects) = self.message(command).await?;
+                drop(reply.send(answer));
+                self.start_effects(effects);
             }
             Input::Approve { command, reply } => {
                 let verdict = match command.verdict {
@@ -1024,6 +981,84 @@ impl Session {
             Input::Records { reply } => drop(reply.send(self.records.clone())),
         }
         Ok(())
+    }
+
+    /// Records the rules file if its text differs from the text in force
+    /// (A2): a change takes effect from the next decision on. Refused once
+    /// the log is full.
+    async fn reload_rules(&mut self) -> Result<Persisted, ShellError> {
+        let Some(Loaded { rules, file }) = self.rules_changed().await else {
+            return Ok(Persisted::Done(Outcome::Accepted, Vec::new()));
+        };
+        let persisted = self.decide(Event::Rules { rules, file }).await?;
+        if let Persisted::Done(_, effects) = persisted {
+            self.start_effects(effects);
+            return Ok(Persisted::Done(Outcome::Accepted, Vec::new()));
+        }
+        Ok(persisted)
+    }
+
+    /// Delivers `envelope`, from anyone (L3: durable, then answered). The
+    /// rules file is read first: whatever it starts runs under the rules as
+    /// they are now (A2).
+    async fn deliver(&mut self, envelope: Envelope<Parsed>) -> Result<Persisted, ShellError> {
+        if let Persisted::Refused = self.reload_rules().await? {
+            return Ok(Persisted::Refused);
+        }
+        self.decide(Event::Deliver { envelope }).await
+    }
+
+    /// Your message, delivered as any envelope is, and the answer to it.
+    /// It is refused before anything is recorded when the actor holds its
+    /// limit of bytes, or is idle at its limit of turns, so an error never
+    /// answers a message the log holds.
+    async fn message(
+        &mut self,
+        command: SendMessage,
+    ) -> Result<(Result<SendMessageReply, Rejection>, Vec<Effect<Parsed>>), ShellError> {
+        if self.full.is_some() {
+            return Ok((Err(self.full()), Vec::new()));
+        }
+        if self.delivered(command.message_id).is_none() {
+            if self.held_bytes >= self.config.limits.session_bytes {
+                let reason = format!(
+                    "it holds {} bytes, its limit is {}",
+                    self.held_bytes, self.config.limits.session_bytes
+                );
+                return Ok((Err(self.actor_full(reason)), Vec::new()));
+            }
+            let turns =
+                u64::try_from(self.config.limits.core.turns_per_actor()).unwrap_or(u64::MAX);
+            if self.core.running().is_none()
+                && self.core.turns() >= turns
+                && self.core.born().is_some()
+                && !self.core.stopped()
+            {
+                let reason = format!("it started its limit of {turns} turns");
+                return Ok((Err(self.actor_full(reason)), Vec::new()));
+            }
+        }
+        let text = command.text.as_str().to_owned();
+        let envelope = Envelope {
+            id: EnvelopeId::User(command.message_id),
+            from: Address::User,
+            to: self.id,
+            reply_to: None,
+            body: Body::Text(measure(text.clone())),
+        };
+        Ok(match self.deliver(envelope).await? {
+            Persisted::Done(outcome, effects) => {
+                (self.message_answer(outcome, &command, &text), effects)
+            }
+            Persisted::Refused => (Err(self.full()), Vec::new()),
+        })
+    }
+
+    const fn actor_full(&self, reason: String) -> Rejection {
+        Rejection::ActorFull {
+            actor_id: self.id,
+            reason,
+        }
     }
 
     fn message_answer(
@@ -1116,13 +1151,13 @@ impl Session {
                 turn_id: turn,
                 outcome: created,
             }),
-            None => Err(Rejection::ActorFull {
-                actor_id: self.id,
-                reason: format!(
-                    "it started its limit of {} turns",
-                    self.config.limits.core.turns_per_actor()
-                ),
-            }),
+            // A repeat of a message a daemon from before the turn check
+            // took at the limit: it is in the mailbox, and no turn carries
+            // it.
+            None => Err(self.actor_full(format!(
+                "it started its limit of {} turns",
+                self.config.limits.core.turns_per_actor()
+            ))),
         }
     }
 

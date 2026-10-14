@@ -50,7 +50,8 @@
 //!   a message by its text and a task's end as that task's notification.
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (B2): its result is durable within its deadline of its `Dispatched`,
-//!   unless a crash or a full log came between.
+//!   unless a crash or a full log came between. Which effects have one, and
+//!   how long, is this check's own table ([`due`]), not the shell's.
 //! - I16 fail-stop (L3): from an actor's refused append until the daemon
 //!   boots again, nothing more of its log is acknowledged and none of its
 //!   runs or deliveries starts.
@@ -815,6 +816,31 @@ fn told(
     }
 }
 
+/// I15's table: the deadline every run of `args` must resolve by (B2),
+/// written out apart from the shell's `ServerLimits::deadline`, so a shell
+/// that arms none is caught. Every run has one but a timer's (it waits on
+/// purpose), a `tasks` listing's (it reads the actor's own log) and a
+/// `cancel`'s (the core resolves it). A stop is no call and has none: it is
+/// sent until it lands (O2).
+fn due(args: &ToolArgs, limits: &ServerLimits) -> Option<Duration> {
+    let millis = |millis: verified_domain::Millis| Duration::from_millis(millis.get());
+    let slack = millis(limits.deadline_slack);
+    let drains = millis(limits.exec_drain).saturating_mul(2);
+    match args {
+        ToolArgs::Read { .. } | ToolArgs::Edit { .. } => Some(slack),
+        ToolArgs::Bash { background, .. } => {
+            let timeout = if *background {
+                limits.task_timeout
+            } else {
+                limits.exec_timeout
+            };
+            Some(millis(timeout).saturating_add(drains).saturating_add(slack))
+        }
+        ToolArgs::Send { .. } | ToolArgs::Spawn { .. } => Some(millis(limits.deliver_deadline)),
+        ToolArgs::Wake { .. } | ToolArgs::Tasks | ToolArgs::Cancel { .. } => None,
+    }
+}
+
 /// I15: every effect with a deadline resolved within it of its
 /// `Dispatched` becoming durable, unless a boot (a crash) or a refused
 /// append of its actor came between; one still open at `end` counts too.
@@ -845,7 +871,7 @@ fn deadlines(
                     ..
                 } | ToolArgs::Wake { .. }
             );
-            let Some(deadline) = limits.deadline(args) else {
+            let Some(deadline) = due(args, limits) else {
                 continue;
             };
             let resolved = if background {
@@ -853,22 +879,7 @@ fn deadlines(
             } else {
                 call.results.first().map(|(seq, _)| *seq)
             };
-            open.push((
-                call.id.clone(),
-                *dispatched,
-                Duration::from_millis(deadline.get()),
-                resolved,
-            ));
-        }
-        for (task, args) in tasks(&log) {
-            if args.is_none() {
-                open.push((
-                    format!("stop task {task}"),
-                    task,
-                    Duration::from_millis(limits.deliver_deadline.get()),
-                    ends(&log, task).first().copied(),
-                ));
-            }
+            open.push((call.id.clone(), *dispatched, deadline, resolved));
         }
         for (what, dispatched, deadline, resolved) in open {
             let Some(from) = when(dispatched) else {
