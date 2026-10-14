@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::id::{ActorId, CallId, IdEntropy, MessageId, TurnId, UnixMillis};
-use verified_domain::{Exit, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome};
+use verified_domain::{Exit, Grant, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
     BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Kept,
@@ -50,6 +50,8 @@ struct MemEnv {
     writes: std::sync::Mutex<Vec<String>>,
     /// Writes never return: a crash between dispatch and result.
     stall_writes: bool,
+    /// The rules file's text, if there is one.
+    rules: std::sync::Mutex<Option<String>>,
 }
 
 impl MemEnv {
@@ -85,6 +87,11 @@ impl MemEnv {
     /// The paths of the writes that landed, in order.
     fn writes(&self) -> Vec<String> {
         self.writes.lock().expect("unpoisoned").clone()
+    }
+
+    /// Writes the rules file (`None`: removes it).
+    fn set_rules(&self, text: Option<&str>) {
+        *self.rules.lock().expect("unpoisoned") = text.map(str::to_owned);
     }
 }
 
@@ -160,6 +167,15 @@ impl Env for MemEnv {
         }
         kept.push(format!("ran {}\n", command.as_str()).as_bytes());
         Ok((ExitStatus::Code(0), kept))
+    }
+
+    async fn rules_file(&self, _limit: u64) -> Result<Option<Vec<u8>>, EnvError> {
+        Ok(self
+            .rules
+            .lock()
+            .expect("unpoisoned")
+            .clone()
+            .map(String::into_bytes))
     }
 }
 
@@ -1353,4 +1369,91 @@ async fn acting_after_a_refused_append_is_caught() {
         .await
         .expect_err("the check catches a shell that acts after a refused append");
     assert!(broken.contains("acted"), "{broken}");
+}
+
+/// The rules file grants in advance (A2): a rule that fits runs the call
+/// without asking, under a grant naming the rule and the `RulesLoaded` that
+/// holds it, with the file's text in the log. The file is read again before
+/// each message: once it is gone, the same command asks.
+#[tokio::test]
+async fn the_rules_file_grants_and_is_read_before_each_message() {
+    let env = Arc::new(MemEnv::default());
+    env.set_rules(Some("[[allow]]\ntool = \"bash\"\nprefix = \"echo\"\n"));
+    let daemon = boot(&MemDisk::new(), Arc::<MemEnv>::clone(&env)).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let reply = handle
+        .send_message(send(1, "bash echo granted"))
+        .await
+        .expect("accepted");
+    until(&handle, ended(reply.turn_id)).await;
+    assert_eq!(
+        env.commands().first().map(|(command, _)| command.clone()),
+        Some("echo granted".to_owned()),
+        "ran without asking"
+    );
+    let log = records(&handle).await;
+    let loaded = log
+        .iter()
+        .enumerate()
+        .find_map(|(seq, record)| {
+            if let Record::RulesLoaded { file, .. } = record {
+                Some((seq, file.clone()))
+            } else {
+                None
+            }
+        })
+        .expect("the rules are in the log");
+    assert!(
+        loaded
+            .1
+            .is_some_and(|file| file.body.contains("prefix = \"echo\"")),
+        "with the file's text"
+    );
+    assert!(
+        log.iter().any(|record| matches!(
+            record,
+            Record::Approved {
+                by: Grant::Rule { rule: 0, rules },
+                ..
+            } if *rules == u64::try_from(loaded.0).expect("small")
+        )),
+        "granted by rule 0 of that version: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|record| matches!(
+            record,
+            Record::Approved {
+                by: Grant::User,
+                ..
+            }
+        )),
+        "nobody was asked"
+    );
+
+    env.set_rules(None);
+    let second = handle
+        .send_message(send(2, "bash echo asked"))
+        .await
+        .expect("accepted");
+    let chunks = until(&handle, |chunks| approval_requested(chunks).is_some()).await;
+    assert!(
+        approval_requested(&chunks).is_some(),
+        "the same command asks now"
+    );
+    let log = records(&handle).await;
+    assert_eq!(
+        log.iter()
+            .filter(|record| matches!(record, Record::RulesLoaded { .. }))
+            .count(),
+        2,
+        "the change is recorded once, before the message it applies to"
+    );
+    assert_eq!(env.commands().len(), 1, "the second has not run");
+    handle
+        .cancel(Cancel {
+            turn_id: second.turn_id,
+        })
+        .await
+        .expect("cancelled");
+    daemon.tasks.shutdown().cancel();
 }

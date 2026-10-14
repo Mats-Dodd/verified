@@ -70,6 +70,7 @@ use crate::log::{Log, LogError};
 use crate::model::Model;
 use crate::payload::{ModelPart, Parsed, ToolOutput, measure, proposal};
 use crate::projection::Projector;
+use crate::rules_file;
 use crate::seam::{Clock, Entropy, Tasks};
 use crate::shim::{Barrier, barrier};
 use crate::tool;
@@ -497,10 +498,10 @@ impl Session {
     }
 
     async fn resume(&mut self) -> Result<Persisted, ShellError> {
-        // No rules file is read yet: the default rules (`read: allow`) are
-        // recorded once, at the first boot, as is who the actor is: a root
-        // actor named `main`, offered the tools the shell runs.
-        let load = self.core.rules().is_none().then(Loaded::defaults);
+        // Who the actor is is recorded once, at the first boot: a root
+        // actor named `main`, offered the tools the shell runs. The rules
+        // file is read at every boot.
+        let load = self.rules_changed().await;
         let resumed = self.core.resume(Some(born(self.id)), load);
         #[cfg(feature = "sim")]
         crate::shim::observe(crate::shim::Observation::Resumed {
@@ -599,6 +600,49 @@ impl Session {
         }
     }
 
+    /// The rules file as it is now, if its text differs from the text in
+    /// force (or no rules were ever loaded): what to record (A2).
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "`&mut` keeps the future `Send`: a session is not `Sync` (its log is not)"
+    )]
+    async fn rules_changed(&mut self) -> Option<Loaded<Parsed>> {
+        let env = Arc::clone(&self.seams.env);
+        let config = Arc::clone(&self.config);
+        let loaded = rules_file::load(env.as_ref(), &config.limits).await;
+        self.differs(loaded)
+    }
+
+    /// `loaded`, if its text differs from the rules file's text in force.
+    fn differs(&self, loaded: Loaded<Parsed>) -> Option<Loaded<Parsed>> {
+        let Some((seq, _)) = self.core.rules() else {
+            return Some(loaded);
+        };
+        let in_force = usize::try_from(*seq)
+            .ok()
+            .and_then(|at| self.records.get(at))
+            .and_then(|record| match record {
+                Record::RulesLoaded { file, .. } => Some(file.as_ref().map(|file| &file.body)),
+                Record::Born { .. }
+                | Record::Delivered { .. }
+                | Record::TurnStarted { .. }
+                | Record::StepStarted { .. }
+                | Record::ModelOutput { .. }
+                | Record::StepReset { .. }
+                | Record::StepFinished { .. }
+                | Record::Approved { .. }
+                | Record::Dispatched { .. }
+                | Record::ToolResult { .. }
+                | Record::TaskEnded { .. }
+                | Record::StopSent { .. }
+                | Record::CancelRequested { .. }
+                | Record::TurnEnded { .. }
+                | Record::EpochBumped { .. } => None,
+            })
+            .unwrap_or_else(|| defect("the rules in force are a RulesLoaded in the log"));
+        (in_force != loaded.file.as_ref().map(|file| &file.body)).then_some(loaded)
+    }
+
     /// The answer to every command once the log is full.
     fn full(&self) -> Rejection {
         Rejection::SessionFull {
@@ -655,6 +699,14 @@ impl Session {
                         session_id: self.id,
                         turn_id: running,
                     })));
+                    return Ok(());
+                }
+                // The rules file is read before each of your messages: a
+                // change takes effect from the message on.
+                if let Some(Loaded { rules, file }) = self.rules_changed().await
+                    && let Persisted::Refused = self.decide(Event::Rules { rules, file }).await?
+                {
+                    drop(reply.send(Err(self.full())));
                     return Ok(());
                 }
                 let text = command.text.as_str().to_owned();

@@ -868,3 +868,118 @@ async fn file_log_refuses_what_replay_would_cut() {
         "exactly what was acknowledged"
     );
 }
+
+/// A daemon on a real project: its log on disk, `LocalEnv`, and the fake
+/// model on loopback. Its registry, and the tasks to shut it down with.
+async fn real_daemon(project: &std::path::Path) -> (daemon::Registry, Tasks) {
+    let tasks = Tasks::new();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let limits = ServerLimits::v0();
+    let seams = Seams {
+        model: Arc::new(fake_model(&limits, &clock, &tasks).await),
+        env: Arc::new(LocalEnv::new(
+            project.to_path_buf(),
+            Arc::clone(&clock),
+            tasks.groups().clone(),
+        )),
+        clock,
+        entropy: Arc::new(OsEntropy),
+        tasks: tasks.clone(),
+    };
+    let config = ShellConfig {
+        limits: limits.clone(),
+        model: "fake".to_owned(),
+        system: String::new(),
+        planted: verified_server::shell::Planted::None,
+    };
+    let layout = Layout {
+        project: project.to_path_buf(),
+    };
+    let (_held, store) = daemon::prepare(
+        "127.0.0.1:1".parse().expect("an addr"),
+        &layout,
+        &verified_server::seam::NoLock,
+        &limits,
+    )
+    .await
+    .expect("prepared");
+    let (fatal, failed) = tokio::sync::mpsc::channel(1);
+    // The daemon's fatal errors fail the test where it waits on records.
+    drop(failed);
+    let registry = daemon::boot(Arc::new(store), seams, Arc::new(config), fatal)
+        .await
+        .expect("booted");
+    (registry, tasks)
+}
+
+/// The records of `handle`'s log once `ready` holds for them.
+async fn records_until(
+    handle: &verified_server::shell::SessionHandle,
+    ready: impl Fn(&[Record<Parsed>]) -> bool,
+) -> Vec<Record<Parsed>> {
+    within(Duration::from_secs(20), async {
+        loop {
+            let records = handle.records().await.expect("the session runs");
+            if ready(&records) {
+                return records;
+            }
+            SystemClock.sleep(Millis::new(10)).await;
+        }
+    })
+    .await
+    .expect("within 20s")
+}
+
+fn message(seed: u8, text: &str) -> verified_wire::command::SendMessage {
+    verified_wire::command::SendMessage {
+        message_id: MessageId::from_parts(at(), &[seed; 10]),
+        text: verified_wire::command::MessageText::parse(
+            text.to_owned(),
+            &verified_wire::WireLimits::DEFAULT,
+        )
+        .expect("text"),
+    }
+}
+
+/// The real rules file: `.verified/v.toml` on disk, read by `LocalEnv`,
+/// grants a real command without asking, and its text is in the log.
+#[tokio::test]
+async fn a_rules_file_on_disk_grants_a_real_command() {
+    let project = scratch("rules").await;
+    fs::create_dir_all(&project.join(".verified"))
+        .await
+        .expect("the daemon's dir");
+    fs::write_synced(
+        &project.join(".verified/v.toml"),
+        b"[[allow]]\ntool = \"bash\"\nprefix = \"echo \"\n",
+    )
+    .await
+    .expect("the rules file");
+    let (registry, tasks) = real_daemon(&project).await;
+    let (_, handle) = registry.create(session()).await.expect("created");
+    handle
+        .send_message(message(1, "bash echo from-the-real-shell"))
+        .await
+        .expect("accepted");
+    let log = records_until(&handle, |log| {
+        log.iter()
+            .any(|record| matches!(record, Record::TurnEnded { .. }))
+    })
+    .await;
+    assert!(
+        log.iter().any(|record| matches!(
+            record,
+            Record::RulesLoaded { file: Some(file), .. } if file.body.contains("prefix = \"echo \"")
+        )),
+        "the file's text is in the log"
+    );
+    assert!(
+        log.iter().any(|record| matches!(
+            record,
+            Record::ToolResult { exit: Exit::Ok, output: Some(output), .. }
+                if output.body.text.contains("from-the-real-shell")
+        )),
+        "the command ran under the rule: {log:?}"
+    );
+    tasks.shutdown().cancel();
+}

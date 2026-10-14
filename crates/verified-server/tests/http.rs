@@ -55,11 +55,7 @@ async fn start_with(limits: ServerLimits) -> (SocketAddr, Tasks) {
     let (daemon_listener, daemon_addr) = listener().await;
     let seams = Seams {
         model: Arc::new(model),
-        env: Arc::new(verified_server::env::LocalEnv::new(
-            std::env::temp_dir(),
-            Arc::clone(&clock),
-            tasks.groups().clone(),
-        )),
+        env: Arc::new(verified_server::env::NoEnv),
         clock,
         entropy: Arc::new(OsEntropy),
         tasks: tasks.clone(),

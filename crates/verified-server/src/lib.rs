@@ -19,6 +19,7 @@ pub mod model;
 pub mod payload;
 pub mod projection;
 pub mod routes;
+pub mod rules_file;
 pub mod seam;
 pub mod shell;
 pub mod shim;

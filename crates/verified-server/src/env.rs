@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -334,6 +334,60 @@ pub trait Env: Send + Sync + fmt::Debug {
         options: &ExecOptions,
         cancel: &CancellationToken,
     ) -> Result<(ExitStatus, Kept), EnvError>;
+
+    /// The bytes of the rules file, `.verified/v.toml` in the project, at
+    /// most `limit`; `None` when there is none. The user writes it; no tool
+    /// may ([`ProjectPath`] reserves the directory). An environment without
+    /// one, by default, has none: its only rule is the default.
+    ///
+    /// # Errors
+    /// Larger than `limit`, not a file, or IO.
+    async fn rules_file(&self, limit: u64) -> Result<Option<Vec<u8>>, EnvError> {
+        let _: u64 = limit;
+        Ok(None)
+    }
+}
+
+/// An environment with nothing in it: no files, no shell and no rules
+/// file. Every tool fails honestly. For a daemon that runs no tools (the
+/// HTTP tests).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEnv;
+
+#[async_trait]
+impl Env for NoEnv {
+    async fn read(&self, path: &ProjectPath, _limit: u64) -> Result<Vec<u8>, EnvError> {
+        Err(EnvError::NotFound {
+            path: path.as_str().to_owned(),
+        })
+    }
+
+    async fn list(
+        &self,
+        path: Option<&ProjectPath>,
+        _limit: usize,
+    ) -> Result<Vec<DirEntry>, EnvError> {
+        Err(EnvError::NotFound {
+            path: path.map_or_else(String::new, |path| path.as_str().to_owned()),
+        })
+    }
+
+    async fn write(&self, edit: &EditGrant<'_>, _contents: &[u8]) -> Result<Written, EnvError> {
+        Err(EnvError::NotFound {
+            path: edit.path().as_str().to_owned(),
+        })
+    }
+
+    async fn exec(
+        &self,
+        _bash: &BashGrant<'_>,
+        _options: &ExecOptions,
+        _cancel: &CancellationToken,
+    ) -> Result<(ExitStatus, Kept), EnvError> {
+        Err(EnvError::Spawn {
+            reason: "this environment has no shell".to_owned(),
+        })
+    }
 }
 
 /// The real environment, a best-effort development env: the project
@@ -462,44 +516,58 @@ fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
 
 type Waiting<'wait> = Pin<Box<dyn Future<Output = ()> + Send + 'wait>>;
 
-#[async_trait]
-impl Env for LocalEnv {
-    async fn read(&self, path: &ProjectPath, limit: u64) -> Result<Vec<u8>, EnvError> {
-        let shown = || path.as_str().to_owned();
-        let at = path.under(&self.root);
-        let found = fs::stat(&at)
-            .await
-            .map_err(|error| EnvError::from_io(path.as_str(), &error))?;
-        match found {
-            None => return Err(EnvError::NotFound { path: shown() }),
-            Some((fs::Kind::Dir, _)) => return Err(EnvError::IsDirectory { path: shown() }),
-            Some((fs::Kind::Symlink | fs::Kind::Other, _)) => {
-                return Err(EnvError::Io {
-                    path: shown(),
-                    reason: "not a regular file".to_owned(),
-                });
-            }
-            Some((fs::Kind::File, bytes)) if bytes > limit => {
-                return Err(EnvError::TooLarge {
-                    path: shown(),
-                    length: bytes,
-                    limit,
-                });
-            }
-            Some((fs::Kind::File, _)) => {}
+/// The bytes of the regular file at `at` (named `shown` in errors), at most
+/// `limit`.
+async fn read_file(at: &Path, shown: &str, limit: u64) -> Result<Vec<u8>, EnvError> {
+    let named = || shown.to_owned();
+    let found = fs::stat(at)
+        .await
+        .map_err(|error| EnvError::from_io(shown, &error))?;
+    match found {
+        None => return Err(EnvError::NotFound { path: named() }),
+        Some((fs::Kind::Dir, _)) => return Err(EnvError::IsDirectory { path: named() }),
+        Some((fs::Kind::Symlink | fs::Kind::Other, _)) => {
+            return Err(EnvError::Io {
+                path: named(),
+                reason: "not a regular file".to_owned(),
+            });
         }
-        let bytes = fs::read(&at)
-            .await
-            .map_err(|error| EnvError::from_io(path.as_str(), &error))?;
-        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if length > limit {
+        Some((fs::Kind::File, bytes)) if bytes > limit => {
             return Err(EnvError::TooLarge {
-                path: shown(),
-                length,
+                path: named(),
+                length: bytes,
                 limit,
             });
         }
-        Ok(bytes)
+        Some((fs::Kind::File, _)) => {}
+    }
+    let bytes = fs::read(at)
+        .await
+        .map_err(|error| EnvError::from_io(shown, &error))?;
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if length > limit {
+        return Err(EnvError::TooLarge {
+            path: named(),
+            length,
+            limit,
+        });
+    }
+    Ok(bytes)
+}
+
+#[async_trait]
+impl Env for LocalEnv {
+    async fn read(&self, path: &ProjectPath, limit: u64) -> Result<Vec<u8>, EnvError> {
+        read_file(&path.under(&self.root), path.as_str(), limit).await
+    }
+
+    async fn rules_file(&self, limit: u64) -> Result<Option<Vec<u8>>, EnvError> {
+        let shown = format!("{}/{}", crate::daemon::DIR, crate::rules_file::FILE);
+        match read_file(&self.root.join(&shown), &shown, limit).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(EnvError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn list(

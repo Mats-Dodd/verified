@@ -73,6 +73,11 @@ pub struct ServerLimits {
     /// session is full. A turn already running may finish past it, by at
     /// most one turn, which the core's per-turn bounds cap.
     pub session_bytes: usize,
+    /// Largest rules file (`.verified/v.toml`) read; a larger one grants
+    /// nothing.
+    pub rules_file_bytes: u64,
+    /// Most rules one rules file may hold; one with more grants nothing.
+    pub rules_count: usize,
 }
 
 /// Bytes of a log line around a record's payloads: the frame header, the
@@ -197,6 +202,8 @@ impl ServerLimits {
             sse_followers_per_session: 8,
             sse_followers: 64,
             session_bytes: 64 << 20,
+            rules_file_bytes: 64 << 10,
+            rules_count: 256,
         }
     }
 }
