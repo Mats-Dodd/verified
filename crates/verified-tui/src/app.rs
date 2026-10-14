@@ -9,9 +9,11 @@
 //!
 //! The actor tree on top shows every actor, who is running, who waits for
 //! the user and who is stopped; Tab and Shift-Tab follow another one, and
-//! approvals and Esc go to the actor followed. A message typed while a turn
-//! runs is sent at once: it steers the turn, and shows as queued until a
-//! step carries it.
+//! approvals, Esc and Ctrl-K (stop, once `y` confirms it) go to the actor
+//! followed. A message typed while a turn runs is sent at once: it steers
+//! the turn, and shows as queued until a step carries it. One pasted while
+//! an approval waits is sent by Enter too, and the waiting calls are
+//! denied.
 //!
 //! Ported from q's `app.rs`, plus approvals and actors.
 
@@ -768,9 +770,14 @@ impl App {
             KeyCode::PageDown => Some(Msg::Scroll(Scroll::PageDown)),
             KeyCode::Tab => Some(Msg::Switch(Direction::Next)),
             KeyCode::BackTab => Some(Msg::Switch(Direction::Previous)),
-            // The approval prompt takes the keyboard while it is shown.
+            // The approval prompt takes the keyboard while it is shown,
+            // but for Enter on a pasted message: that steers the turn,
+            // and the calls waiting are denied.
             KeyCode::Char('y' | 'Y') if prompt => Some(Msg::Decide(Verdict::Grant)),
             KeyCode::Char('n' | 'N') if prompt => Some(Msg::Decide(Verdict::Deny)),
+            KeyCode::Enter if prompt && key.modifiers.is_empty() && !self.draft.is_empty() => {
+                Some(Msg::Submit(stamp))
+            }
             _ if prompt => None,
             KeyCode::Enter if key.modifiers.is_empty() => Some(Msg::Submit(stamp)),
             KeyCode::Enter => Some(Msg::Newline),

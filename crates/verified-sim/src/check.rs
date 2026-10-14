@@ -32,7 +32,9 @@
 //!   there at most once.
 //! - I9 every `send` or `spawn` that resolved `Ok` is in its recipient's
 //!   log exactly once at quiescence (O2): its envelope, minted from the
-//!   call's key.
+//!   call's key. And every envelope an actor minted names the record of
+//!   its log that licensed it: a `send` or `spawn` to that recipient, or a
+//!   stop of it (a `Keyed` rerun reuses its key).
 //! - I10 every envelope an actor holds (a message, a notification) is
 //!   carried by at most one model call, and at quiescence by exactly one,
 //!   unless the actor stopped or reached its turn limit (L4).
@@ -43,6 +45,9 @@
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (B2): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between.
+//! - I16 fail-stop (L3): from an actor's refused append until the daemon
+//!   boots again, nothing more of its log is acknowledged and none of its
+//!   runs or deliveries starts.
 
 use core::fmt;
 use core::time::Duration;
@@ -55,7 +60,7 @@ use verified_domain::{
 use verified_server::limits::ServerLimits;
 use verified_server::payload::{Parsed, ToolArgs};
 use verified_server::projection::Projector;
-use verified_server::shim::Observation;
+use verified_server::shim::{Barrier, Observation};
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::transcript::Transcript;
@@ -400,6 +405,50 @@ fn delivered_once(logs: &BTreeMap<ActorId, Vec<Record<Parsed>>>, found: &mut Vec
     }
 }
 
+/// I9, the other way: every envelope minted by an actor and held by
+/// another names the sender's record that licensed it.
+fn minted_licensed(logs: &BTreeMap<ActorId, Vec<Record<Parsed>>>, found: &mut Vec<Violation>) {
+    let mut licenses: BTreeMap<(ActorId, u64), ActorId> = BTreeMap::new();
+    for (sender, log) in logs {
+        let mut ignored = Vec::new();
+        for call in calls(log, &mut ignored) {
+            let to = match &call.args {
+                Some(ToolArgs::Send {
+                    to: Address::Actor(to),
+                    ..
+                }) => *to,
+                Some(ToolArgs::Spawn { child, .. }) => *child,
+                Some(_) | None => continue,
+            };
+            for seq in &call.effects {
+                licenses.insert((*sender, *seq), to);
+            }
+        }
+        for (seq, record) in (0u64..).zip(log) {
+            if let Record::StopSent { child } = record {
+                licenses.insert((*sender, seq), *child);
+            }
+        }
+    }
+    for (recipient, log) in logs {
+        for record in log {
+            if let Record::Delivered { envelope } = record
+                && let EnvelopeId::Minted { actor, seq } = envelope.id
+                && licenses.get(&(actor, seq)) != Some(recipient)
+            {
+                found.push(violation(
+                    "I9",
+                    format!(
+                        "{recipient} holds envelope {:?}, which no record of {actor} licensed \
+                         for it",
+                        envelope.id
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// I12 over `logs` at quiescence: every descendant of a stopped actor is
 /// stopped.
 fn stops_cascade(logs: &BTreeMap<ActorId, Vec<Record<Parsed>>>, found: &mut Vec<Violation>) {
@@ -548,11 +597,23 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                     logs.recovered.insert(*actor, records.clone());
                 }
             }
-            Entry::Acked { actor, records, .. } => logs
-                .now
-                .entry(*actor)
-                .or_default()
-                .extend(records.iter().map(|record| (stamped.at, record.clone()))),
+            Entry::Acked { actor, records, .. } => {
+                if halted.contains_key(actor) {
+                    found.push(violation(
+                        "I16",
+                        format!(
+                            "{actor} acknowledged {} records at {:?}, after its log refused an \
+                             append",
+                            records.len(),
+                            stamped.at
+                        ),
+                    ));
+                }
+                logs.now
+                    .entry(*actor)
+                    .or_default()
+                    .extend(records.iter().map(|record| (stamped.at, record.clone())));
+            }
             Entry::Caught { offset, transcript } => {
                 for (actor, log) in logs.all() {
                     if !halted.contains_key(&actor) {
@@ -573,6 +634,15 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 halted.entry(*actor).or_insert(stamped.at);
                 refusals.push((*actor, stamped.at));
             }
+            Entry::Shell(Observation::Passed(
+                Barrier::Dispatched { actor, .. } | Barrier::Delivering { actor, .. },
+            )) if halted.contains_key(actor) => found.push(violation(
+                "I16",
+                format!(
+                    "{actor} started an effect at {:?}, after its log refused an append",
+                    stamped.at
+                ),
+            )),
             Entry::Wrote { actor, effect } => disk.wrote(at, (*actor, *effect), &mut found),
             Entry::Mutation {
                 actor,
@@ -636,6 +706,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 }
             }
             delivered_once(quiet, &mut found);
+            minted_licensed(quiet, &mut found);
             stops_cascade(quiet, &mut found);
         }
     }

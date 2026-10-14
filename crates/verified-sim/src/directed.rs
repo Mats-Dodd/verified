@@ -41,6 +41,8 @@ fn one_turn(turn: TurnPlan, hold: Option<Hold>) -> Scenario {
         block_size: None,
         max_latency: Duration::from_millis(5),
         limits: hosts::limits(),
+        rules: None,
+        stop: false,
     }
 }
 
@@ -59,6 +61,7 @@ pub fn all() -> Vec<Directed> {
                     text: "edit notes.txt alpha d0 ; bash touch d1".to_owned(),
                     verdicts: vec![Verdict::Grant, Verdict::Grant],
                     cancel: None,
+                    steer: None,
                 },
                 Some(Hold::RanTogether),
             ),
@@ -80,6 +83,7 @@ pub fn all() -> Vec<Directed> {
                     text: "read notes.txt".to_owned(),
                     verdicts: Vec::new(),
                     cancel: Some(CancelAt::ToolRunning),
+                    steer: None,
                 },
                 Some(Hold::CancelledFirst),
             ),
@@ -102,6 +106,7 @@ pub fn all() -> Vec<Directed> {
                     ),
                     verdicts: Vec::new(),
                     cancel: None,
+                    steer: None,
                 },
                 None,
             ),

@@ -1627,6 +1627,16 @@ async fn a_background_command_resolves_at_once_and_notifies_when_it_ends() {
         "the task ended once, with what it reported"
     );
     assert_eq!(env.commands().len(), 1, "it ran once");
+    let request = verified_server::history::request(&log, "", 16);
+    let started = format!("Started task {task}");
+    assert!(
+        request.messages.iter().flat_map(|message| &message.content).any(|content| matches!(
+            content,
+            verified_server::model::Content::ToolResult { text, .. } if text.starts_with(&started)
+        )),
+        "the model learns its task, to cancel it: {:?}",
+        request.messages
+    );
     daemon.tasks.shutdown().cancel();
 }
 

@@ -380,6 +380,10 @@ pub struct FileLog {
     length: u64,
     max_line: usize,
     max_file: u64,
+    /// The planted defect (`Planted::SkipFsync`): appends skip their
+    /// fsync. Only under `sim`.
+    #[cfg(feature = "sim")]
+    skip_sync: bool,
 }
 
 impl FileLog {
@@ -400,6 +404,8 @@ impl FileLog {
             length: 0,
             max_line,
             max_file,
+            #[cfg(feature = "sim")]
+            skip_sync: false,
         })
     }
 
@@ -428,6 +434,8 @@ impl FileLog {
             length: scan.valid_len,
             max_line,
             max_file,
+            #[cfg(feature = "sim")]
+            skip_sync: false,
         };
         Ok((log, scan.records))
     }
@@ -462,9 +470,15 @@ impl Log for FileLog {
             self.max_line,
             self.max_file,
         )?;
-        fs::append_synced(&mut self.file, &bytes)
-            .await
-            .map_err(io_error(&self.path))?;
+        #[cfg(feature = "sim")]
+        let appended = if self.skip_sync {
+            fs::append_unsynced(&mut self.file, &bytes).await
+        } else {
+            fs::append_synced(&mut self.file, &bytes).await
+        };
+        #[cfg(not(feature = "sim"))]
+        let appended = fs::append_synced(&mut self.file, &bytes).await;
+        appended.map_err(io_error(&self.path))?;
         self.next = advance(self.next, records);
         self.length = self.length.saturating_add(to_u64(bytes.len()));
         Ok(())
@@ -596,6 +610,9 @@ pub struct FileLogStore {
     max_line: usize,
     max_file: u64,
     max_sessions: usize,
+    /// The planted defect (`Planted::SkipFsync`), for every log it opens.
+    #[cfg(feature = "sim")]
+    skip_sync: bool,
 }
 
 impl FileLogStore {
@@ -606,6 +623,20 @@ impl FileLogStore {
             max_line,
             max_file,
             max_sessions,
+            #[cfg(feature = "sim")]
+            skip_sync: false,
+        }
+    }
+
+    /// This store, its logs acknowledging appends without their fsync: the
+    /// planted defect `Planted::SkipFsync` (breaks L3), for the
+    /// simulation's mutation tests.
+    #[cfg(feature = "sim")]
+    #[must_use]
+    pub fn skipping_sync(self) -> Self {
+        Self {
+            skip_sync: true,
+            ..self
         }
     }
 
@@ -645,7 +676,12 @@ impl LogStore for FileLogStore {
     }
 
     async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
-        let log = FileLog::create(&self.path(session), self.max_line, self.max_file).await?;
+        #[cfg_attr(not(feature = "sim"), expect(unused_mut, reason = "planted under sim"))]
+        let mut log = FileLog::create(&self.path(session), self.max_line, self.max_file).await?;
+        #[cfg(feature = "sim")]
+        {
+            log.skip_sync = self.skip_sync;
+        }
         Ok(Box::new(log))
     }
 
@@ -653,8 +689,13 @@ impl LogStore for FileLogStore {
         &self,
         session: ActorId,
     ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
-        let (log, records) =
+        #[cfg_attr(not(feature = "sim"), expect(unused_mut, reason = "planted under sim"))]
+        let (mut log, records) =
             FileLog::open(&self.path(session), self.max_line, self.max_file).await?;
+        #[cfg(feature = "sim")]
+        {
+            log.skip_sync = self.skip_sync;
+        }
         Ok((Box::new(log), records))
     }
 }

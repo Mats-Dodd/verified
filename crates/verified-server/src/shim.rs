@@ -338,6 +338,19 @@ pub mod fs {
         file.sync_data().await
     }
 
+    /// Appends `bytes` without syncing them: the planted defect
+    /// `Planted::SkipFsync`, under `sim` only.
+    ///
+    /// # Errors
+    /// Any OS error.
+    #[cfg(feature = "sim")]
+    pub async fn append_unsynced(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        crate::shim::barrier(crate::shim::Barrier::GroupWritten { bytes: bytes.len() }).await;
+        Ok(())
+    }
+
     /// Cuts `file` to `len` bytes and makes that durable.
     ///
     /// # Errors

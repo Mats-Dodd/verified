@@ -19,6 +19,7 @@ use verified_server::env::LocalEnv;
 use verified_server::limits::ServerLimits;
 use verified_server::model::anthropic::{AnthropicConfig, AnthropicModel, ApiKey};
 use verified_server::model::fake;
+use verified_server::rules_file;
 use verified_server::seam::{Clock, NoLock, Tasks};
 use verified_server::shell::{Planted, Seams, ShellConfig};
 use verified_server::shim::{fs, net};
@@ -100,13 +101,20 @@ pub fn model(
     )?)
 }
 
-/// Creates the project's files on first boot (durably), then reads them.
-async fn project_files() -> turmoil::Result<BTreeMap<String, String>> {
+/// Creates the project's files on first boot (durably), and the rules
+/// file `rules` if there is one, then reads the files.
+async fn project_files(rules: Option<&str>) -> turmoil::Result<BTreeMap<String, String>> {
     let project = Path::new(PROJECT);
     if fs::stat(project).await?.is_none() {
         fs::create_dir_all(project).await?;
         for (name, text) in FILES {
             fs::write_synced(&project.join(name), text.as_bytes()).await?;
+        }
+        if let Some(rules) = rules {
+            let dir = project.join(daemon::DIR);
+            fs::create_dir_all(&dir).await?;
+            fs::write_synced(&dir.join(rules_file::FILE), rules.as_bytes()).await?;
+            fs::sync_dir(&dir).await?;
         }
         fs::sync_dir(project).await?;
         fs::sync_dir(Path::new("/")).await?;
@@ -123,20 +131,24 @@ async fn project_files() -> turmoil::Result<BTreeMap<String, String>> {
 }
 
 /// The daemon under `limits`, booting (and rebooting after each crash) from
-/// its disk, with the defect `planted` (none, but in the simulation's
-/// mutation tests).
+/// its disk.
+///
+/// It runs with the defect `planted` (none, but in the simulation's
+/// mutation tests). Its project holds the rules file `rules`, if any, from
+/// the first boot on.
 pub fn daemon(
     ledger: Ledger,
     seed: u64,
-    limits: ServerLimits,
+    (limits, rules): (ServerLimits, Option<String>),
     planted: Planted,
 ) -> impl Fn() -> Software {
     move || {
         let ledger = ledger.clone();
         let limits = limits.clone();
+        let rules = rules.clone();
         Box::pin(async move {
             let boot = ledger.boots();
-            let files = project_files().await?;
+            let files = project_files(rules.as_deref()).await?;
             ledger.record(Entry::Boot { boot, files });
             let clock: Arc<dyn Clock> = Arc::new(SimClock::new(epoch()));
             let model = model(&limits, Arc::clone(&clock))?;
@@ -162,6 +174,13 @@ pub fn daemon(
                 project: PathBuf::from(PROJECT),
             };
             let (_held, store) = daemon::prepare(any_addr(PORT), &layout, &NoLock, &limits).await?;
+            // The planted defect lives in the shell's log: its appends
+            // skip their fsync.
+            let store = if planted == Planted::SkipFsync {
+                store.skipping_sync()
+            } else {
+                store
+            };
             let config = ShellConfig {
                 limits,
                 model: MODEL.to_owned(),

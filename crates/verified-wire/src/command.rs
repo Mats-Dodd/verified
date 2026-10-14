@@ -297,10 +297,12 @@ pub struct StopReply {
 )]
 pub enum ActorState {
     Idle,
+    /// A turn is open: also a stopped actor's last turn, until the runs it
+    /// started report.
     Running {
         turn_id: TurnId,
     },
-    /// A stop landed: it starts nothing more.
+    /// A stop landed and no turn is open: it starts nothing more.
     Stopped,
 }
 

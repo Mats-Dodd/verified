@@ -13,6 +13,7 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
+use verified_core::Event;
 use verified_domain::{Exit, ModelFault, Record, Reset, Unstarted};
 use verified_model::coverage::{Class, Key, Phase, Resolved};
 use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
@@ -22,7 +23,9 @@ use verified_server::shim::Observation;
 use verified_sim::directed::{self, Directed, DirectedError};
 use verified_sim::ledger::{Entry, Op};
 use verified_sim::run::Outcome;
-use verified_sim::scenario::{Fault, Scenario};
+use verified_sim::scenario::{
+    Aim, AimedCrash, CancelAt, Fault, Scenario, Steer, SteerAt, TurnPlan,
+};
 use verified_sim::{hosts, model, run};
 
 /// Runs `seed` twice, compares the traces, then judges the run.
@@ -94,9 +97,10 @@ seeds! {
     // user retries it by hand.
     seed_51 = 51;
     // The daemon crashes after an edit is dispatched and before it writes:
-    // the edit resolves Unknown. Later two edits and a command are proposed
-    // in one step.
+    // the edit resolves Unknown. Later it spawns a child, and stops it.
     seed_53 = 53;
+    // Two edits and a command are proposed in one step, and all act.
+    seed_54 = 54;
     // The daemon crashes after a command is dispatched, so it resolves
     // Unknown; then the TUI link stays down past the follower's reconnect
     // schedule, so it stops following and the user reconnects by hand.
@@ -552,4 +556,293 @@ fn without_its_hold_a_directed_scenario_misses_its_target() {
             "{name} reaches its target without its hold, so the hold proves nothing"
         );
     }
+}
+
+/// One run of `scenario`, with the defect `planted` in the daemon.
+fn played(scenario: &Scenario, planted: Planted) -> Outcome {
+    run::once(scenario, planted)
+        .map_err(|error| error.to_string())
+        .expect("the run finishes")
+}
+
+/// Whether `outcome` broke `invariant`.
+fn broke(outcome: &Outcome, invariant: &str) -> bool {
+    outcome
+        .violations
+        .iter()
+        .any(|violation| violation.invariant == invariant)
+}
+
+/// A root that spawns a child, which runs a command of its own (the rules
+/// file grants it).
+fn a_spawn() -> Scenario {
+    Scenario::of(vec![TurnPlan::granted("spawn helper bash touch h0")])
+}
+
+/// Each actor scenario a planted-bug test runs breaks nothing without its
+/// plant, deterministically: the plants, not the scenarios, break them.
+#[test]
+fn the_actor_scenarios_break_nothing() {
+    for scenario in [
+        a_spawn(),
+        a_spawn_crashing_at_its_delivery(),
+        a_steer_lost_to_esc(),
+        a_stopped_parent(),
+        a_silent_run(),
+    ] {
+        run::twice(&scenario)
+            .map_err(|error| error.to_string())
+            .expect("the run finishes, deterministically")
+            .verdict()
+            .map_err(|broken| broken.to_string())
+            .expect("the run breaks nothing");
+    }
+}
+
+/// A1 between logs, as a mutation test: a shell that delivers a spawn
+/// before its `Dispatched` is durable is caught by the replay, at the
+/// child's log, which the model has no license to create yet.
+#[test]
+fn delivering_a_spawn_before_its_dispatch_is_durable_fails_the_replay() {
+    let outcome = played(&a_spawn(), Planted::DeliverBeforePersist);
+    let child = outcome
+        .observed
+        .iter()
+        .map(|(actor, _)| *actor)
+        .find(|actor| {
+            outcome
+                .observed
+                .first()
+                .is_some_and(|(root, _)| root != actor)
+        });
+    assert!(
+        matches!(
+            &outcome.replayed,
+            Err(Mismatch::Diverged(divergence)) if Some(divergence.actor) == child
+        ),
+        "the replay diverges at the child: {:?}",
+        outcome.replayed
+    );
+}
+
+/// O2, as a mutation test: a recipient that acknowledges a delivery
+/// before its `Delivered` is durable lets its sender record `Ok` for an
+/// envelope a crash could still lose. The replay refuses the sender's
+/// result while the append is pending.
+#[test]
+fn acknowledging_before_the_append_fails_the_replay() {
+    let outcome = played(&a_spawn(), Planted::AckBeforeAppend);
+    assert!(
+        matches!(
+            &outcome.replayed,
+            Err(Mismatch::Diverged(divergence))
+                if matches!(divergence.observed, Observed::Decided(Event::ToolDone { exit: Exit::Ok, .. }, _))
+        ),
+        "the replay refuses the early Ok: {:?}",
+        outcome.replayed
+    );
+}
+
+/// A spawn whose child holds its prompt when the daemon crashes, before
+/// the parent heard: the `Keyed` spawn runs again on resume.
+fn a_spawn_crashing_at_its_delivery() -> Scenario {
+    Scenario {
+        aimed: Some(AimedCrash {
+            aim: Aim::Delivered,
+            occurrence: 0,
+            down: Duration::from_millis(100),
+        }),
+        ..Scenario::of(vec![TurnPlan::granted("spawn helper reply done")])
+    }
+}
+
+/// O2, as a mutation test: a shell that mints a fresh envelope id when it
+/// runs a `Keyed` call again after a crash delivers it twice. I9 finds the
+/// second envelope licensed by no record, and the replay finds no delivery
+/// in flight that carries it.
+#[test]
+fn a_fresh_key_after_a_crash_delivers_twice() {
+    let scenario = a_spawn_crashing_at_its_delivery();
+    let fair = played(&scenario, Planted::None);
+    assert!(
+        fair.entries.iter().any(|stamped| matches!(
+            &stamped.entry,
+            Entry::Fault(fault) if fault.starts_with("daemon crashes at Delivered")
+        )),
+        "the crash lands between the append and the parent's result"
+    );
+    let outcome = played(&scenario, Planted::FreshKeyOnResume);
+    assert!(broke(&outcome, "I9"), "{:#?}", outcome.violations);
+    assert!(
+        matches!(&outcome.replayed, Err(Mismatch::Diverged(_))),
+        "{:?}",
+        outcome.replayed
+    );
+}
+
+/// A message that steers a slow turn, which the user then cancels before
+/// any step carries the message: it starts the next turn.
+fn a_steer_lost_to_esc() -> Scenario {
+    Scenario::of(vec![TurnPlan {
+        text: "slow 0".to_owned(),
+        verdicts: Vec::new(),
+        cancel: Some(CancelAt::Streaming),
+        steer: Some(Steer {
+            at: SteerAt::Streaming,
+            text: "steer 0".to_owned(),
+        }),
+    }])
+}
+
+/// L4, as a mutation test: a shell that counts a steered message consumed
+/// when it lands, not when a model call carries it, loses it to Esc. I10
+/// finds it unread at quiescence, and the replay finds the next turn
+/// missing from the log.
+#[test]
+fn consumption_recorded_at_injection_loses_a_steer_to_esc() {
+    let scenario = a_steer_lost_to_esc();
+    let fair = played(&scenario, Planted::None);
+    let turns = fair
+        .entries
+        .iter()
+        .filter(|stamped| {
+            matches!(&stamped.entry, Entry::Acked { records, .. }
+                if records.iter().any(|record| matches!(record, Record::TurnStarted { .. })))
+        })
+        .count();
+    assert_eq!(
+        turns, 2,
+        "the steer starts the turn after the cancelled one"
+    );
+    let outcome = played(&scenario, Planted::ConsumeAtInjection);
+    assert!(broke(&outcome, "I10"), "{:#?}", outcome.violations);
+    assert!(
+        matches!(&outcome.replayed, Err(Mismatch::Diverged(_))),
+        "{:?}",
+        outcome.replayed
+    );
+}
+
+/// A root that spawned a child, stopped by the user.
+fn a_stopped_parent() -> Scenario {
+    Scenario {
+        stop: true,
+        ..a_spawn()
+    }
+}
+
+/// The stop cascade, as a mutation test: a shell that never delivers a
+/// stop to a child leaves it running though its parent stopped (I12).
+#[test]
+fn a_stop_that_skips_a_child_fails() {
+    let outcome = played(&a_stopped_parent(), Planted::StopSkipsChildren);
+    assert!(broke(&outcome, "I12"), "{:#?}", outcome.violations);
+}
+
+/// A command that never reports, whatever it is told.
+fn a_silent_run() -> Scenario {
+    Scenario::of(vec![TurnPlan::granted("bash hang")])
+}
+
+/// B2, as a mutation test: a shell that arms no deadline waits on a
+/// silent run for good. I15 finds the run still open long past its
+/// deadline; with deadlines it resolves `Unknown` by it.
+#[test]
+fn a_cancel_that_waits_for_a_silent_run_fails() {
+    let outcome = played(&a_silent_run(), Planted::NoDeadline);
+    assert!(broke(&outcome, "I15"), "{:#?}", outcome.violations);
+}
+
+/// L3, as a mutation test: a log that acknowledges appends it never
+/// synced loses them to a crash. The replay finds a boot on fewer records
+/// than were acknowledged.
+#[test]
+fn acknowledging_an_append_without_its_fsync_fails_the_replay() {
+    let caught = (0..16u64).any(|seed| {
+        match run::once(&Scenario::from_seed(seed), Planted::SkipFsync) {
+            Ok(outcome) => matches!(
+                outcome.replayed,
+                Err(Mismatch::Diverged(divergence)) if matches!(divergence.observed, Observed::Booted(_))
+            ),
+            Err(_) => false,
+        }
+    });
+    assert!(caught, "no seed's replay caught a lost acknowledged append");
+}
+
+/// Twelve greetings, then a command to approve, under a log of
+/// `file_bytes`: some size refuses the decision that dispatches it.
+fn a_log_that_fills_at_a_dispatch(file_bytes: u64) -> Scenario {
+    let mut turns: Vec<TurnPlan> = (0..12u32)
+        .map(|index| TurnPlan::granted(&format!("hello {index}")))
+        .collect();
+    turns.push(TurnPlan::granted("bash touch f0"));
+    let mut limits = hosts::limits();
+    limits.wire.max_message_text_bytes = 1_000;
+    limits.tool_output_bytes = 1_000;
+    limits.log_line_bytes = 13_200;
+    limits.log_file_bytes = file_bytes;
+    Scenario {
+        rules: None,
+        limits,
+        ..Scenario::of(turns)
+    }
+}
+
+/// L3's fail-stop, as a mutation test: a shell that starts a refused
+/// decision's effects acts without a durable record. Some log size in a
+/// range (the sizes of ids and texts move it a little) refuses the
+/// decision that dispatches the command; I16 finds the run started after
+/// the refusal, though the fair shell breaks nothing there.
+#[test]
+fn acting_after_a_refused_append_fails_the_check() {
+    let caught = (14_200..15_400).step_by(40).find(|file_bytes| {
+        broke(
+            &played(
+                &a_log_that_fills_at_a_dispatch(*file_bytes),
+                Planted::ActAfterRefusal,
+            ),
+            "I16",
+        )
+    });
+    let file_bytes = caught.expect("some log size catches an effect after a refusal");
+    run::twice(&a_log_that_fills_at_a_dispatch(file_bytes))
+        .map_err(|error| error.to_string())
+        .expect("the run finishes, deterministically")
+        .verdict()
+        .map_err(|broken| broken.to_string())
+        .expect("the fair shell fails stop there and breaks nothing");
+}
+
+/// B3 in the simulation: two actors that answer each other's every
+/// message chatter until the limits stop them, and the world goes quiet.
+#[test]
+fn chattering_actors_go_quiet_within_their_limits() {
+    let mut scenario = Scenario::of(vec![TurnPlan::granted("spawn helper ping")]);
+    let mut config = verified_domain::LimitsConfig::v0();
+    config.turns_per_actor = core::num::NonZeroUsize::new(6).expect("non-zero");
+    config.messages_per_actor = core::num::NonZeroUsize::new(6).expect("non-zero");
+    scenario.limits.core = verified_domain::Limits::new(config);
+    let outcome = run::twice(&scenario)
+        .map_err(|error| error.to_string())
+        .expect("the run finishes, deterministically");
+    let pings = outcome
+        .entries
+        .iter()
+        .filter(|stamped| {
+            matches!(&stamped.entry, Entry::Acked { records, .. }
+                if records.iter().any(|record| matches!(
+                    record,
+                    Record::Delivered { envelope } if matches!(envelope.from, verified_domain::Address::Actor(_))
+                )))
+        })
+        .count();
+    assert!(
+        pings >= 6,
+        "they chattered: {pings} deliveries between them"
+    );
+    outcome
+        .verdict()
+        .map_err(|broken| broken.to_string())
+        .expect("the chatter breaks nothing and goes quiet");
 }

@@ -7,6 +7,8 @@
 //! - `touch NAME`: a side effect, nothing else
 //! - `sleep MS`: waits on the Clock seam until done, cancelled or timed out
 //! - `false`: exits 1
+//! - `hang`: never returns, whatever it is told: a run that ignores its
+//!   cancel and its kill, which only v's deadline ends (B2)
 //! - anything else: echoes the command, exits 0
 //!
 //! An `edit`'s write is ledgered with the text it writes when it starts, and
@@ -96,6 +98,10 @@ impl Env for SimEnv {
         Ok(written)
     }
 
+    async fn rules_file(&self, limit: u64) -> Result<Option<Vec<u8>>, EnvError> {
+        self.files.rules_file(limit).await
+    }
+
     async fn exec(
         &self,
         bash: &BashGrant<'_>,
@@ -127,6 +133,9 @@ impl Env for SimEnv {
                 }
                 () = cancel.cancelled() => (ExitStatus::Stopped(Stopped::Cancelled), String::new()),
             }
+        } else if script == "hang" {
+            std::future::pending::<()>().await;
+            (ExitStatus::Code(0), String::new())
         } else if script == "false" {
             (ExitStatus::Code(1), String::new())
         } else {

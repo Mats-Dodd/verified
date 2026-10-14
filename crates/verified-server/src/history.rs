@@ -23,6 +23,10 @@ use crate::payload::{ModelPart, Parsed, ToolInput};
 struct Call {
     id: CallId,
     reason: Option<String>,
+    /// Whether it starts a task (a background run, a timer).
+    background: bool,
+    /// The task it started: the seq of its `Dispatched`.
+    task: Option<u64>,
     result: Option<(Exit, Option<String>)>,
 }
 
@@ -122,7 +126,14 @@ impl Builder {
             let text = output
                 .clone()
                 .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| synthesized_text(*exit, call.reason.as_deref()));
+                .unwrap_or_else(|| match (exit, call.task) {
+                    // A background call resolves at its start: the model
+                    // learns its task, to cancel it or to read its end.
+                    (Exit::Ok, Some(task)) => {
+                        format!("Started task {task}: it runs on, and you are told when it ends.")
+                    }
+                    _ => synthesized_text(*exit, call.reason.as_deref()),
+                });
             let kind = match exit {
                 Exit::Ok => ResultKind::Success,
                 Exit::Failed | Exit::NotStarted(_) | Exit::Unknown => ResultKind::Error,
@@ -137,7 +148,7 @@ impl Builder {
         self.push(Role::User, results);
     }
 
-    fn record(&mut self, record: &Record<Parsed>) {
+    fn record(&mut self, seq: u64, record: &Record<Parsed>) {
         match record {
             Record::Delivered { envelope } => {
                 if let Body::Text(text) = &envelope.body {
@@ -201,13 +212,15 @@ impl Builder {
                 if let Some(step) = &mut self.step {
                     for proposal in calls {
                         step.calls.push(self.calls.len());
-                        let reason = match &proposal.request {
-                            Request::Run { .. } => None,
-                            Request::Invalid { reason } => Some(reason.clone()),
+                        let (reason, background) = match &proposal.request {
+                            Request::Run { args } => (None, args.shape().background()),
+                            Request::Invalid { reason } => (Some(reason.clone()), false),
                         };
                         self.calls.push(Call {
                             id: proposal.id.clone(),
                             reason,
+                            background,
+                            task: None,
                             result: None,
                         });
                     }
@@ -219,12 +232,18 @@ impl Builder {
                     slot.result = Some((*exit, text));
                 }
             }
+            Record::Dispatched { call } => {
+                if let Some(slot) = self.calls.get_mut(call.0)
+                    && slot.background
+                {
+                    slot.task = Some(seq);
+                }
+            }
             Record::TurnEnded { .. } => self.close_step(),
             Record::Approved { .. }
             | Record::Born { .. }
             | Record::RulesLoaded { .. }
             | Record::StopSent { .. }
-            | Record::Dispatched { .. }
             | Record::CancelRequested { .. }
             | Record::EpochBumped { .. } => {}
         }
@@ -273,8 +292,8 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
         step: None,
         mail: BTreeMap::new(),
     };
-    for record in records {
-        builder.record(record);
+    for (seq, record) in (0u64..).zip(records) {
+        builder.record(seq, record);
     }
     // The step about to run has no parts yet; a previous step closes here.
     if let Some(step) = &builder.step

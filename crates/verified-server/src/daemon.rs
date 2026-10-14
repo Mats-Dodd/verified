@@ -165,9 +165,10 @@ impl Registry {
         let (outcome, handle, unborn) = answer
             .await
             .map_err(|_dropped| CreateError::Unavailable)??;
-        // A child just created, or one whose log a crash left unborn, is
-        // born now. The caller waits on the actor, never the registry.
-        if unborn {
+        // A child is born now, as a step of every spawn (one already born
+        // answers that it exists), and so is a root whose log a crash left
+        // unborn. The caller waits on the actor, never the registry.
+        if unborn || born.parent.is_some() {
             handle
                 .born(born)
                 .await

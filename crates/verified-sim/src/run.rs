@@ -22,12 +22,17 @@ use crate::scenario::{Aim, AimedCrash, Fault, Hold, Scenario};
 
 /// The seeds the simulation's tests run, each for a path it reaches
 /// (`tests/dst.rs`), and the seeds `processes` traces by default.
-pub const FIXED: [u64; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 342, 818];
+pub const FIXED: [u64; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 37, 50, 51, 53, 54, 342, 818];
 
 /// The most entries one run's ledger holds.
 const LEDGER_CAPACITY: usize = 100_000;
-/// The longest a run may take, in simulated time, before it counts as stuck.
+/// The longest a run may take, in simulated time, before it counts as
+/// stuck: the world is then judged as it is (a run that never went quiet
+/// breaks I5, and an effect still open past its deadline I15).
 const RUN_LIMIT: Duration = Duration::from_mins(15);
+/// Simulated time past [`RUN_LIMIT`] the daemon gets to recover after the
+/// final crash.
+const RECOVERY_LIMIT: Duration = Duration::from_mins(5);
 /// The most steps the daemon gets to recover after the final crash.
 const RECOVERY_STEPS: usize = 20_000;
 
@@ -178,6 +183,8 @@ const fn aimed_at(aim: Aim, point: &Barrier) -> bool {
         (Aim::Dispatched, Barrier::Dispatched { .. })
             | (Aim::ToolRan, Barrier::ToolRan { .. })
             | (Aim::GroupWritten, Barrier::GroupWritten { .. })
+            | (Aim::Delivering, Barrier::Delivering { .. })
+            | (Aim::Delivered, Barrier::Delivered { .. })
     )
 }
 
@@ -439,7 +446,7 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
     builder
         .rng_seed(seed)
         .enable_random_order()
-        .simulation_duration(RUN_LIMIT)
+        .simulation_duration(RUN_LIMIT.saturating_add(RECOVERY_LIMIT))
         .min_message_latency(Duration::from_millis(1))
         .max_message_latency(scenario.max_latency);
     if let Some(block_size) = scenario.block_size {
@@ -450,11 +457,23 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
     sim.host(ANTHROPIC, hosts::anthropic());
     sim.host(
         DAEMON,
-        hosts::daemon(ledger.clone(), seed, scenario.limits.clone(), planted),
+        hosts::daemon(
+            ledger.clone(),
+            seed,
+            (scenario.limits.clone(), scenario.rules.clone()),
+            planted,
+        ),
     );
     sim.client(
         TUI,
-        driver::tui(scenario.turns.clone(), seed, ledger.clone()),
+        driver::tui(
+            driver::Plan {
+                turns: scenario.turns.clone(),
+                stop: scenario.stop,
+            },
+            seed,
+            ledger.clone(),
+        ),
     );
     let mut faults = Faults::new(scenario);
     loop {
@@ -462,6 +481,13 @@ pub fn once(scenario: &Scenario, planted: Planted) -> Result<Outcome, RunError> 
             .step()
             .map_err(|error| failed(seed, &sim, &ledger, error.to_string()))?;
         if finished {
+            break;
+        }
+        if sim.elapsed() >= RUN_LIMIT {
+            ledger.record_at(
+                sim.elapsed(),
+                Entry::Fault(format!("the run did not finish within {RUN_LIMIT:?}")),
+            );
             break;
         }
         faults.tick(&mut sim, &ledger);

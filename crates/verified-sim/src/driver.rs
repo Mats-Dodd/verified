@@ -29,7 +29,7 @@ use crate::clock::SimClock;
 use crate::entropy::SeededEntropy;
 use crate::hosts::{DAEMON, PORT, epoch};
 use crate::ledger::{Entry, Ledger};
-use crate::scenario::{CancelAt, TurnPlan};
+use crate::scenario::{CancelAt, SteerAt, TurnPlan};
 
 /// How many keys may wait unread.
 const KEYS: usize = 64;
@@ -225,6 +225,10 @@ impl User {
         self.press(Keyboard::enter()).await?;
         *typed = typed.saturating_add(1);
         let mut cancelled = false;
+        let mut steered = turn.steer.is_none();
+        // The prompt a steer answered instead of the user: its call is
+        // denied, so no verdict is sent for it.
+        let mut steered_past: Option<String> = None;
         let mut prompts = 0usize;
         let mut last = u64::MAX;
         let mut still = 0usize;
@@ -258,20 +262,47 @@ impl User {
                 self.press(Keyboard::enter()).await?;
                 continue;
             }
+            if let Some(steer) = turn.steer.as_ref().filter(|_| !steered)
+                && seen.running
+                && seen.settled
+                && !seen.draft
+                && match steer.at {
+                    SteerAt::Streaming => seen.running_text,
+                    SteerAt::ToolRunning => seen.tool_running,
+                    SteerAt::Prompt => seen.approval.is_some(),
+                }
+            {
+                steered = true;
+                if steer.at == SteerAt::Prompt {
+                    steered_past.clone_from(&seen.approval);
+                }
+                self.ledger
+                    .record(Entry::User(format!("steer {index}: {}", steer.text)));
+                self.press(Keyboard::paste(steer.text.clone())).await?;
+                self.press(Keyboard::enter()).await?;
+                *typed = typed.saturating_add(1);
+                continue;
+            }
             let cancel = match turn.cancel {
                 Some(CancelAt::Streaming) => seen.running_text,
                 Some(CancelAt::ToolRunning) => seen.tool_running,
                 Some(CancelAt::Prompt) => seen.approval.is_some(),
                 None => false,
             };
-            if cancel && !cancelled && seen.running {
+            // After a steer, Esc waits for it to be durable: it then
+            // lands before the cancel, injected into the turn.
+            if cancel && !cancelled && seen.running && (turn.steer.is_none() || seen.settled) {
                 cancelled = true;
                 self.ledger.record(Entry::User(format!("cancel {index}")));
                 self.press(Keyboard::key(KeyCode::Esc, KeyModifiers::NONE))
                     .await?;
                 continue;
             }
-            let Some(call) = seen.approval.clone() else {
+            let Some(call) = seen
+                .approval
+                .clone()
+                .filter(|call| steered_past.as_ref() != Some(call))
+            else {
                 continue;
             };
             if !seen.settled || (cancelled && turn.cancel == Some(CancelAt::Prompt)) {
@@ -300,15 +331,41 @@ impl User {
         }
     }
 
-    async fn play(mut self, plan: &[TurnPlan]) -> Result<(), ScriptError> {
+    /// Stops the root (Ctrl-K, then `y`) once it is quiet, and waits for
+    /// the daemon's answer.
+    async fn stop(&mut self) -> Result<(), ScriptError> {
+        loop {
+            let seen = self.glance().await?;
+            if seen.quiet() && !seen.draft {
+                break;
+            }
+            self.unstick(&seen).await?;
+        }
+        self.ledger.record(Entry::User("stop".to_owned()));
+        self.ctrl('k').await?;
+        self.press(Keyboard::key(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await?;
+        loop {
+            let seen = self.glance().await?;
+            if seen.settled {
+                return Ok(());
+            }
+            self.unstick(&seen).await?;
+        }
+    }
+
+    async fn play(mut self, plan: &Plan) -> Result<(), ScriptError> {
         let mut over = false;
         let mut typed = 0usize;
-        for (index, turn) in plan.iter().enumerate() {
+        for (index, turn) in plan.turns.iter().enumerate() {
             if !self.play_turn((index, &mut typed), turn).await? {
                 self.ledger.record(Entry::GaveUp { turn: index });
                 over = true;
                 break;
             }
+        }
+        if plan.stop && !over {
+            self.stop().await?;
         }
         let mut quiet_since: Option<UnixMillis> = None;
         loop {
@@ -348,6 +405,14 @@ impl User {
     }
 }
 
+/// What the scripted user does: its turns, then a stop of the root if
+/// `stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub turns: Vec<TurnPlan>,
+    pub stop: bool,
+}
+
 /// The TUI host: creates a session, plays `plan`, quits once quiescent.
 ///
 /// # Errors
@@ -355,7 +420,7 @@ impl User {
 ///
 /// # Panics
 /// The observer missed a folded read (a harness defect: it sees every update).
-pub async fn tui(plan: Vec<TurnPlan>, seed: u64, ledger: Ledger) -> turmoil::Result {
+pub async fn tui(plan: Plan, seed: u64, ledger: Ledger) -> turmoil::Result {
     let clock = SimClock::new(epoch());
     let entropy = SeededEntropy::new(seed ^ TUI_SALT);
     let session = new_session(&clock, &entropy);

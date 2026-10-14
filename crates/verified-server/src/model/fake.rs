@@ -14,11 +14,19 @@
 //!   `wake MS`, `tasks`, `cancel N`, `spawn NAME PROMPT…`, `send ADDR TEXT…`:
 //!   a tool call; several calls are separated by ` ; ` and come in one
 //!   response
+//! - `reply TEXT…`: `send` TEXT to whoever sent the message; `ping`: reply
+//!   `ping`, so two actors that ping each other chatter until a limit
+//!   stops them
+//! - `A then B …`: a turn of several steps: A's calls, then (once their
+//!   results are in) B's, and so on. In a later step `$task` is the task
+//!   a background call started, `$child` the actor a spawn made (both read
+//!   from the results), and `$from` the sender
 //! - an envelope from an agent or from v is scripted by its text, without
 //!   the header the history gives it
 //! - anything else   streams `Echo: <message>`, a word per delta
 //!
-//! A last user message of only tool results is answered `Result: <first result>`.
+//! A last user message of only tool results is answered with the script's
+//! next step, or `Result: <first result>` once the script is done.
 //!
 //! [`router`] serves the script as an HTTP host, for
 //! [`super::anthropic::AnthropicModel`] over a socket, or over turmoil in
@@ -140,6 +148,101 @@ fn words(text: &str) -> Vec<String> {
     words
 }
 
+/// The text of `message`, and its tool results' (`content`, `is_error`),
+/// in order.
+fn said_in(message: &Value) -> (String, Vec<(String, bool)>) {
+    let mut text = String::new();
+    let mut results = Vec::new();
+    if let Some(said) = message.get("content").and_then(Value::as_str) {
+        text.push_str(said);
+    }
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("tool_result") => results.push((
+                block
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )),
+            Some(_) | None => {}
+        }
+    }
+    (text, results)
+}
+
+/// The script the turn runs: the last user message that says something,
+/// and how many steps of it already ran (the assistant messages since).
+fn script(messages: &[Value]) -> (String, usize) {
+    let mut steps = 0usize;
+    for message in messages.iter().rev() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            steps = steps.saturating_add(1);
+        } else {
+            let (text, _) = said_in(message);
+            if !text.trim().is_empty() {
+                return (text, steps);
+            }
+        }
+    }
+    (String::new(), steps)
+}
+
+/// The sender a header names: `[from ADDR] …` or `[from ADDR; reply to …] …`.
+fn sender(said: &str) -> Option<&str> {
+    let rest = said.strip_prefix("[from ")?;
+    let end = rest.find([';', ']'])?;
+    rest.get(..end)
+}
+
+/// The first number after `task ` in `text`.
+fn task_in(text: &str) -> Option<&str> {
+    text.match_indices("task ").find_map(|(at, word)| {
+        let rest = text.get(at.saturating_add(word.len())..)?;
+        let digits = rest
+            .find(|symbol: char| !symbol.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest.get(..digits).filter(|digits| !digits.is_empty())
+    })
+}
+
+/// The address after `spawned NAME at ` in `text`.
+fn child_in(text: &str) -> Option<&str> {
+    let rest = text.get(text.find("spawned ")?..)?;
+    let rest = rest.get(rest.find(" at ")?.saturating_add(4)..)?;
+    rest.split_whitespace().next()
+}
+
+/// `step` with its placeholders filled from `results` and the sender.
+fn filled(step: &str, results: &[(String, bool)], from: Option<&str>) -> String {
+    let mut step = step.to_owned();
+    let all: String = results
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(task) = task_in(&all) {
+        step = step.replace("$task", task);
+    }
+    if let Some(child) = child_in(&all) {
+        step = step.replace("$child", child);
+    }
+    if let Some(from) = from {
+        step = step.replace("$from", from);
+    }
+    step
+}
+
 /// The text of the last message, and its first tool result if it has one.
 fn last_said(request: &Value) -> (String, Option<(String, bool)>) {
     let Some(last) = request
@@ -232,6 +335,10 @@ fn tool_call(command: &str) -> Option<(&'static str, Value)> {
     }
     if let Some(rest) = command.strip_prefix("send ") {
         let (to, text) = rest.trim().split_once(' ')?;
+        // A placeholder no result filled names no one: no call.
+        if to.starts_with('$') {
+            return None;
+        }
         return Some(("send", json!({"to": to, "text": text})));
     }
     if let Some(raw) = command.strip_prefix("call ") {
@@ -253,16 +360,49 @@ fn tool_call(command: &str) -> Option<(&'static str, Value)> {
     None
 }
 
+/// `said` as a script's first step: `reply` and `ping` made sends to its
+/// sender.
+fn first_step(said: &str, from: Option<&str>) -> String {
+    let said = body(said);
+    let step = said.split(" then ").next().unwrap_or(said);
+    let step = if step.trim() == "ping" {
+        "reply ping"
+    } else {
+        step
+    };
+    match (step.strip_prefix("reply "), from) {
+        (Some(text), Some(from)) => format!("send {from} {text}"),
+        (Some(_) | None, _) => step.to_owned(),
+    }
+}
+
 /// The scripted reply to a Messages request body.
 #[must_use]
 pub fn reply(request: &Value) -> Reply {
     let (said, result) = last_said(request);
-    let said = body(&said).to_owned();
-    let turn = request
+    let messages = request
         .get("messages")
         .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let turn = messages.len();
     let quick = Millis::new(0);
+    let (script, step) = script(messages);
+    let from = sender(&script).map(str::to_owned);
+    // A later step of a script runs its next part, its placeholders filled
+    // from the results it follows.
+    if said.trim().is_empty() && step > 0 {
+        let results = messages.last().map(said_in).unwrap_or_default().1;
+        if let Some(next) = body(&script).split(" then ").nth(step) {
+            let next = filled(next, &results, from.as_deref());
+            let calls: Vec<(&'static str, Value)> =
+                next.split(" ; ").filter_map(tool_call).collect();
+            if !calls.is_empty() {
+                return tool_calls(turn, &calls);
+            }
+        }
+    }
+    let said = first_step(&said, from.as_deref());
     // A tool result answers with its summary, unless the user also said
     // something new (history merges a new message into the results' turn).
     if let Some((content, error)) = result.filter(|_| said.trim().is_empty()) {
@@ -310,18 +450,7 @@ pub fn reply(request: &Value) -> Reply {
     }
     let calls: Vec<(&'static str, Value)> = said.split(" ; ").filter_map(tool_call).collect();
     if !calls.is_empty() {
-        let mut events = vec![message_start()];
-        events.extend(text_block(0, &["On it.".to_owned()]));
-        for (offset, (name, input)) in calls.iter().enumerate() {
-            let index = offset.saturating_add(1);
-            let id = format!("toolu_{turn}_{offset}");
-            events.extend(tool_block(index, &id, name, input));
-        }
-        events.extend(message_end("tool_use"));
-        return Reply::Events {
-            events,
-            pace: quick,
-        };
+        return tool_calls(turn, &calls);
     }
     let mut events = vec![message_start()];
     events.extend(text_block(0, &words(&format!("Echo: {said}"))));
@@ -329,6 +458,22 @@ pub fn reply(request: &Value) -> Reply {
     Reply::Events {
         events,
         pace: quick,
+    }
+}
+
+/// A response proposing `calls`, their ids made from `turn`.
+fn tool_calls(turn: usize, calls: &[(&'static str, Value)]) -> Reply {
+    let mut events = vec![message_start()];
+    events.extend(text_block(0, &["On it.".to_owned()]));
+    for (offset, (name, input)) in calls.iter().enumerate() {
+        let index = offset.saturating_add(1);
+        let id = format!("toolu_{turn}_{offset}");
+        events.extend(tool_block(index, &id, name, input));
+    }
+    events.extend(message_end("tool_use"));
+    Reply::Events {
+        events,
+        pace: Millis::new(0),
     }
 }
 
@@ -414,6 +559,87 @@ mod tests {
     use serde_json::json;
 
     use super::{Reply, reply};
+
+    /// The tool calls `reply` proposes: each one's name and input.
+    fn proposed(reply: &Reply) -> Vec<(String, serde_json::Value)> {
+        let Reply::Events { events, .. } = reply else {
+            return Vec::new();
+        };
+        let mut calls: Vec<(String, String)> = Vec::new();
+        for event in events {
+            if let Some(name) = event
+                .pointer("/content_block/name")
+                .and_then(|name| name.as_str())
+            {
+                calls.push((name.to_owned(), String::new()));
+            }
+            if let (Some(partial), Some(last)) = (
+                event
+                    .pointer("/delta/partial_json")
+                    .and_then(|partial| partial.as_str()),
+                calls.last_mut(),
+            ) {
+                last.1.push_str(partial);
+            }
+        }
+        calls
+            .into_iter()
+            .map(|(name, input)| (name, serde_json::from_str(&input).unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn a_script_runs_its_steps_with_their_placeholders_filled() {
+        let first =
+            json!({"messages": [{"role": "user", "content": "bg sleep 5 then cancel $task"}]});
+        assert_eq!(
+            proposed(&reply(&first)),
+            [(
+                "bash".to_owned(),
+                json!({"command": "sleep 5", "background": true})
+            )]
+        );
+        let second = json!({"messages": [
+            {"role": "user", "content": "bg sleep 5 then cancel $task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1_0",
+                "content": "Started task 12: it runs on, and you are told when it ends."}]},
+        ]});
+        assert_eq!(
+            proposed(&reply(&second)),
+            [("cancel".to_owned(), json!({"task": 12u64}))],
+            "the next step, its task filled from the result"
+        );
+        let done = json!({"messages": [
+            {"role": "user", "content": "bg sleep 5 then cancel $task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1_0", "content": "x"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_3_0", "content": "cancelled"}]},
+        ]});
+        assert!(proposed(&reply(&done)).is_empty(), "the script is done");
+    }
+
+    #[test]
+    fn reply_and_ping_answer_the_sender() {
+        let from = "0199c82c-c000-7157-b49d-191266aae0f8";
+        let request = |text: String| json!({"messages": [{"role": "user", "content": text}]});
+        assert_eq!(
+            proposed(&reply(&request(format!(
+                "[from {from}; reply to {from}] reply done"
+            )))),
+            [("send".to_owned(), json!({"to": from, "text": "done"}))]
+        );
+        assert_eq!(
+            proposed(&reply(&request(format!("[from {from}] ping")))),
+            [("send".to_owned(), json!({"to": from, "text": "ping"}))],
+            "a ping is answered with a ping"
+        );
+        assert!(
+            proposed(&reply(&request("send $child hi".to_owned()))).is_empty(),
+            "an unfilled placeholder names no one"
+        );
+    }
 
     #[test]
     fn script_is_a_function_of_the_request() {

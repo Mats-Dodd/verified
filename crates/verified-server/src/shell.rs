@@ -145,6 +145,21 @@ pub enum Planted {
     /// (breaks A1 between logs).
     #[cfg(feature = "sim")]
     DeliverBeforePersist,
+    /// Count a message consumed when it is injected into a running turn,
+    /// not when a model call carrying it starts (breaks L4): when that turn
+    /// ends before carrying it (Esc), the turn it would start is dropped,
+    /// and the message is never read.
+    #[cfg(feature = "sim")]
+    ConsumeAtInjection,
+    /// Drop a stop's delivery to a child (breaks the stop cascade): the
+    /// child runs on though its parent stopped.
+    #[cfg(feature = "sim")]
+    StopSkipsChildren,
+    /// Acknowledge a group commit without its fsync (breaks L3): a crash
+    /// loses records the shell acted on. The simulation's log store
+    /// plants it ([`crate::log::FileLogStore::skipping_sync`]).
+    #[cfg(feature = "sim")]
+    SkipFsync,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -636,6 +651,12 @@ impl Session {
         } else {
             records
         };
+        #[cfg(feature = "sim")]
+        let (records, effects) = if self.config.planted == Planted::ConsumeAtInjection {
+            self.consumed_at_injection(records, effects)
+        } else {
+            (records, effects)
+        };
         // The planted defect: the decision's tool runs start at once,
         // before its records are durable.
         #[cfg(feature = "sim")]
@@ -690,6 +711,73 @@ impl Session {
             self.committed.set(self.core.seq());
         }
         Ok(Persisted::Done(outcome, effects))
+    }
+
+    /// The planted defect: a message injected into a running turn counts
+    /// as consumed then. A decision that starts a turn carrying one (the
+    /// turn it steered ended first) is cut before that `TurnStarted`, and
+    /// the model call it starts dropped: the message stays unread.
+    #[cfg(feature = "sim")]
+    fn consumed_at_injection(
+        &self,
+        mut records: Vec<Record<Parsed>>,
+        mut effects: Vec<Effect<Parsed>>,
+    ) -> (Vec<Record<Parsed>>, Vec<Effect<Parsed>>) {
+        // Whether a turn is open, and the envelopes delivered while one was.
+        let mut open = false;
+        let mut injected = std::collections::BTreeSet::new();
+        let track =
+            |record: &Record<Parsed>,
+             open: &mut bool,
+             injected: &mut std::collections::BTreeSet<EnvelopeId>| match record {
+                Record::TurnStarted { .. } => *open = true,
+                Record::TurnEnded { .. } => *open = false,
+                Record::Delivered { envelope } if *open => {
+                    injected.insert(envelope.id);
+                }
+                Record::Born { .. }
+                | Record::RulesLoaded { .. }
+                | Record::Delivered { .. }
+                | Record::StepStarted { .. }
+                | Record::ModelOutput { .. }
+                | Record::StepReset { .. }
+                | Record::StepFinished { .. }
+                | Record::Approved { .. }
+                | Record::Dispatched { .. }
+                | Record::ToolResult { .. }
+                | Record::TaskEnded { .. }
+                | Record::StopSent { .. }
+                | Record::CancelRequested { .. }
+                | Record::EpochBumped { .. } => {}
+            };
+        for record in &self.records {
+            track(record, &mut open, &mut injected);
+        }
+        let mut cut = None;
+        for (at, record) in records.iter().enumerate() {
+            if matches!(record, Record::TurnStarted { .. })
+                && let Some(Record::StepStarted { carries, .. }) =
+                    records.get(at..).and_then(|rest| {
+                        rest.iter()
+                            .find(|later| matches!(later, Record::StepStarted { .. }))
+                    })
+                && carries.iter().any(|id| injected.contains(id))
+            {
+                cut = Some(at);
+                break;
+            }
+            track(record, &mut open, &mut injected);
+        }
+        if let Some(cut) = cut {
+            records.truncate(cut);
+            let from = self
+                .core
+                .seq()
+                .saturating_add(u64::try_from(cut).unwrap_or(u64::MAX));
+            effects
+                .retain(|effect| !matches!(effect, Effect::CallModel { id, .. } if id.seq >= from));
+        }
+        (records, effects)
     }
 
     /// Decides `event` and persists the decision; once the log is full,
@@ -1213,6 +1301,12 @@ impl Session {
                 });
             }
             Effect::Stop { id, child } => {
+                // The planted defect: the stop never reaches the child.
+                #[cfg(feature = "sim")]
+                if self.config.planted == Planted::StopSkipsChildren {
+                    self.arm(id, self.config.limits.deliver_deadline);
+                    return;
+                }
                 let envelope = Envelope {
                     id: EnvelopeId::Minted {
                         actor: self.id,
@@ -1278,8 +1372,16 @@ impl Session {
             }
             ToolArgs::Tasks => {
                 let listing = tasks(&self.records);
-                let inbox = self.inbox.clone();
+                let (inbox, actor) = (self.inbox.clone(), self.id);
                 self.seams.tasks.spawn(async move {
+                    // It reads the log as a `read` reads a file: a run.
+                    barrier(Barrier::Dispatched { actor, id }).await;
+                    barrier(Barrier::ToolRan {
+                        actor,
+                        id,
+                        stopped: false,
+                    })
+                    .await;
                     let output = measure(ToolOutput::complete(listing));
                     report(
                         &inbox,

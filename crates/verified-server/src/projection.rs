@@ -398,9 +398,11 @@ pub fn summary(
         return Ok(None);
     };
     let projector = projected(records);
+    // A stopped actor's last turn runs until its runs report: it is
+    // running until then.
     let state = match (core.stopped(), core.running()) {
-        (true, _) => ActorState::Stopped,
-        (false, Some(turn_id)) => ActorState::Running { turn_id },
+        (_, Some(turn_id)) => ActorState::Running { turn_id },
+        (true, None) => ActorState::Stopped,
         (false, None) => ActorState::Idle,
     };
     let running = projector.tasks().filter(|task| task.end.is_none()).count();
