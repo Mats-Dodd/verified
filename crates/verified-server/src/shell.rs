@@ -77,6 +77,9 @@ use crate::seam::{Clock, Entropy, Tasks};
 use crate::shim::{Barrier, barrier};
 use crate::tool;
 
+#[cfg(feature = "sim")]
+mod planted;
+
 /// Everything nondeterministic a session uses.
 #[derive(Debug, Clone)]
 pub struct Seams {
@@ -671,39 +674,9 @@ impl Session {
             effects,
             outcome,
         } = decision;
+        // The planted defects that tamper with a decision.
         #[cfg(feature = "sim")]
-        let records = if self.config.planted == Planted::UnknownAsNotStarted {
-            unknown_as_not_started(records)
-        } else {
-            records
-        };
-        #[cfg(feature = "sim")]
-        let (records, effects) = if self.config.planted == Planted::ConsumeAtInjection {
-            self.consumed_at_injection(records, effects)
-        } else {
-            (records, effects)
-        };
-        // The planted defect: the decision's tool runs start at once,
-        // before its records are durable.
-        #[cfg(feature = "sim")]
-        let effects = {
-            let mut effects = effects;
-            if self.config.planted == Planted::RunBeforePersist {
-                for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
-                {
-                    self.start_effect(run);
-                }
-            }
-            if self.config.planted == Planted::DeliverBeforePersist {
-                for run in effects.extract_if(.., |effect| {
-                    matches!(effect, Effect::RunTool { call }
-                        if matches!(call.args(), ToolArgs::Send { .. } | ToolArgs::Spawn { .. }))
-                }) {
-                    self.start_effect(run);
-                }
-            }
-            effects
-        };
+        let (records, effects) = self.planted_decision(records, effects);
         if !records.is_empty() {
             assert!(
                 self.full.is_none() && self.log.next_seq() == self.core.seq(),
@@ -737,73 +710,6 @@ impl Session {
             self.committed.set(self.core.seq());
         }
         Ok(Persisted::Done(outcome, effects))
-    }
-
-    /// The planted defect: a message injected into a running turn counts
-    /// as consumed then. A decision that starts a turn carrying one (the
-    /// turn it steered ended first) is cut before that `TurnStarted`, and
-    /// the model call it starts dropped: the message stays unread.
-    #[cfg(feature = "sim")]
-    fn consumed_at_injection(
-        &self,
-        mut records: Vec<Record<Parsed>>,
-        mut effects: Vec<Effect<Parsed>>,
-    ) -> (Vec<Record<Parsed>>, Vec<Effect<Parsed>>) {
-        // Whether a turn is open, and the envelopes delivered while one was.
-        let mut open = false;
-        let mut injected = std::collections::BTreeSet::new();
-        let track =
-            |record: &Record<Parsed>,
-             open: &mut bool,
-             injected: &mut std::collections::BTreeSet<EnvelopeId>| match record {
-                Record::TurnStarted { .. } => *open = true,
-                Record::TurnEnded { .. } => *open = false,
-                Record::Delivered { envelope } if *open => {
-                    injected.insert(envelope.id);
-                }
-                Record::Born { .. }
-                | Record::RulesLoaded { .. }
-                | Record::Delivered { .. }
-                | Record::StepStarted { .. }
-                | Record::ModelOutput { .. }
-                | Record::StepReset { .. }
-                | Record::StepFinished { .. }
-                | Record::Approved { .. }
-                | Record::Dispatched { .. }
-                | Record::ToolResult { .. }
-                | Record::TaskEnded { .. }
-                | Record::StopSent { .. }
-                | Record::CancelRequested { .. }
-                | Record::EpochBumped { .. } => {}
-            };
-        for record in &self.records {
-            track(record, &mut open, &mut injected);
-        }
-        let mut cut = None;
-        for (at, record) in records.iter().enumerate() {
-            if matches!(record, Record::TurnStarted { .. })
-                && let Some(Record::StepStarted { carries, .. }) =
-                    records.get(at..).and_then(|rest| {
-                        rest.iter()
-                            .find(|later| matches!(later, Record::StepStarted { .. }))
-                    })
-                && carries.iter().any(|id| injected.contains(id))
-            {
-                cut = Some(at);
-                break;
-            }
-            track(record, &mut open, &mut injected);
-        }
-        if let Some(cut) = cut {
-            records.truncate(cut);
-            let from = self
-                .core
-                .seq()
-                .saturating_add(u64::try_from(cut).unwrap_or(u64::MAX));
-            effects
-                .retain(|effect| !matches!(effect, Effect::CallModel { id, .. } if id.seq >= from));
-        }
-        (records, effects)
     }
 
     /// Decides `event` and persists the decision; once the log is full,
@@ -1668,24 +1574,6 @@ fn refused(actor: ActorId) -> Persisted {
     #[cfg(not(feature = "sim"))]
     let _: ActorId = actor;
     Persisted::Refused
-}
-
-/// The planted defect: `records` with every `Unknown` result made a
-/// `NotStarted` report, as if the shell knew the call never ran. It invents
-/// the report (an empty output): the core refuses a synthesized `NotStarted`
-/// for a dispatched call (H2), so a shell can only lie past it this way.
-#[cfg(feature = "sim")]
-fn unknown_as_not_started(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
-    for record in &mut records {
-        if let Record::ToolResult { exit, output, .. } = record
-            && *exit == Exit::Unknown
-            && output.is_none()
-        {
-            *exit = Exit::NotStarted(Unstarted::Cancelled);
-            *output = Some(measure(ToolOutput::complete(String::new())));
-        }
-    }
-    records
 }
 
 /// Answers a delivery or a birth. An asker that went away (a stopping
