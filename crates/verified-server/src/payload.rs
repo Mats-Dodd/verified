@@ -358,18 +358,7 @@ pub const fn tool_name(tool: Tool) -> &'static str {
 /// The tool spelled `name`, if any.
 #[must_use]
 pub fn tool_named(name: &str) -> Option<Tool> {
-    [
-        Tool::Read,
-        Tool::Edit,
-        Tool::Bash,
-        Tool::Spawn,
-        Tool::Send,
-        Tool::Wake,
-        Tool::Tasks,
-        Tool::Cancel,
-    ]
-    .into_iter()
-    .find(|tool| tool_name(*tool) == name)
+    Tool::ALL.into_iter().find(|tool| tool_name(*tool) == name)
 }
 
 /// A tool call's arguments, parsed from the model's JSON.

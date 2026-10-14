@@ -143,7 +143,7 @@ fn tool_definition(tool: Tool) -> Value {
             "Start a new agent named `name`, offered `tools`, and send it `prompt`. Returns its address. It runs on its own; it messages you with `send` if it wants to.",
             json!({
                 "name": {"type": "string", "description": "1 to 64 of [A-Za-z0-9_-]."},
-                "tools": {"type": "array", "items": {"type": "string", "enum": ["read", "edit", "bash", "spawn", "send", "wake", "tasks", "cancel"]}},
+                "tools": {"type": "array", "items": {"type": "string", "enum": Tool::ALL.map(tool_name)}},
                 "prompt": {"type": "string"}
             }),
             json!(["name", "tools", "prompt"]),

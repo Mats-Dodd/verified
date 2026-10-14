@@ -49,6 +49,7 @@ use tokio::sync::mpsc;
 use verified_domain::Millis;
 use verified_wire::sse::SseEvent;
 
+use crate::payload::{tool_name, tool_named};
 use crate::seam::{Clock, Tasks};
 
 /// The fake's reply to one request.
@@ -351,17 +352,7 @@ fn tool_call(command: &str) -> Option<(&'static str, Value)> {
     }
     if let Some(raw) = command.strip_prefix("call ") {
         let (name, input) = raw.split_once(' ').unwrap_or((raw, "{}"));
-        let name: &'static str = match name {
-            "read" => "read",
-            "edit" => "edit",
-            "bash" => "bash",
-            "spawn" => "spawn",
-            "send" => "send",
-            "wake" => "wake",
-            "tasks" => "tasks",
-            "cancel" => "cancel",
-            _ => "unknown_tool",
-        };
+        let name = tool_named(name).map_or("unknown_tool", tool_name);
         let input = serde_json::from_str(input).unwrap_or(Value::String(input.to_owned()));
         return Some((name, input));
     }

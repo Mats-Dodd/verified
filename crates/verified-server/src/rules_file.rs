@@ -27,7 +27,7 @@ use verified_domain::{ActorName, Measured, Pattern, Rule, Rules, Tool};
 
 use crate::env::Env;
 use crate::limits::{RECORD_OVERHEAD, ServerLimits};
-use crate::payload::{Parsed, measure};
+use crate::payload::{Parsed, measure, tool_named};
 
 /// The rules file's name, under the daemon's directory.
 pub const FILE: &str = "v.toml";
@@ -52,17 +52,7 @@ struct Allow {
 
 /// The tool a rule names.
 fn tool(name: &str) -> Result<Tool, String> {
-    match name {
-        "read" => Ok(Tool::Read),
-        "edit" => Ok(Tool::Edit),
-        "bash" => Ok(Tool::Bash),
-        "spawn" => Ok(Tool::Spawn),
-        "send" => Ok(Tool::Send),
-        "wake" => Ok(Tool::Wake),
-        "tasks" => Ok(Tool::Tasks),
-        "cancel" => Ok(Tool::Cancel),
-        other => Err(format!("unknown tool `{other}`")),
-    }
+    tool_named(name).ok_or_else(|| format!("unknown tool `{name}`"))
 }
 
 /// The rules `text` says, in file order, at most `count` of them.

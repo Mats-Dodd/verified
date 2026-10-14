@@ -313,3 +313,21 @@ where
         (record, call)
     })
 }
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "plain Rust beside the impl inside `verus!`: no proof mentions it"
+)]
+impl Tool {
+    /// Every tool, in declaration order.
+    pub const ALL: [Self; 8] = [
+        Self::Read,
+        Self::Edit,
+        Self::Bash,
+        Self::Spawn,
+        Self::Send,
+        Self::Wake,
+        Self::Tasks,
+        Self::Cancel,
+    ];
+}
