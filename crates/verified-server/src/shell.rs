@@ -20,14 +20,14 @@
 //! (`ModelFault::TooLarge`): no record the shell makes is one the log refuses.
 //! Effects are cancelled with tokens at safe points, never by dropping them.
 //!
-//! Should the log refuse an append anyway (its file is full), nothing was
-//! written and nothing is applied: the session stops taking records. It
-//! interrupts the running turn, whose closing records alone may take the
-//! log's reserve ([`ServerLimits::reserve`]), so the turn still ends. It
-//! keeps serving its stream and refuses every record from then on; a
-//! restart replays the same log and carries on until an append is refused
-//! again, ending a turn the crash left running the same way. Nothing
-//! acknowledged is ever lost, and the daemon never crash-loops on it.
+//! Storage is the world. Should the log refuse an append (its file is
+//! full), nothing was written and nothing is applied, and the session fails
+//! stop (L3): it decides nothing more, starts no effect and acknowledges no
+//! command, answering each one full. It keeps serving its stream, and runs
+//! already started report into nothing. A restart replays the same log and
+//! carries on until an append is refused again; a turn left running stays
+//! as the log says. Nothing acknowledged is ever lost, nothing acts without
+//! a durable record, and the daemon never crash-loops on it.
 //!
 //! Law 7, as clarified: no side effect is ever cancelled by dropping its
 //! future. Tool runs and log appends run to completion (a tool checks its
@@ -68,7 +68,7 @@ use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
 use crate::model::Model;
-use crate::payload::{ModelPart, Parsed, ToolOutput, Truncation, measure, proposal};
+use crate::payload::{ModelPart, Parsed, ToolOutput, measure, proposal};
 use crate::projection::Projector;
 use crate::seam::{Clock, Entropy, Tasks};
 use crate::shim::{Barrier, barrier};
@@ -121,6 +121,10 @@ pub enum Planted {
     /// replay must catch the report of a run that acted.
     #[cfg(feature = "sim")]
     StoppedAsNotStarted,
+    /// Start a decision's effects although the log refused its records
+    /// (breaks L3's fail-stop: nothing acts without a durable record).
+    #[cfg(feature = "sim")]
+    ActAfterRefusal,
 }
 
 /// Why a session stopped. Every variant is fatal: the daemon exits and
@@ -395,8 +399,8 @@ pub struct Session {
     cancels: BTreeMap<EffectId, CancellationToken>,
     /// JSON bytes of `records` and `chunks`, against `session_bytes`.
     held_bytes: usize,
-    /// Why the log stopped taking records, once it has: from then on only
-    /// the running turn's closing records are persisted, into the reserve.
+    /// Why the log stopped taking records, once it has: from then on the
+    /// session fails stop (L3).
     full: Option<String>,
 }
 
@@ -475,14 +479,7 @@ impl Session {
     }
 
     async fn run(mut self, mut receiver: mpsc::Receiver<Input>) -> Result<(), ShellError> {
-        let mut resumed = self.resume().await?;
-        if matches!(resumed, Persisted::Refused) && self.core.running().is_some() {
-            // The log has no room to carry the turn on: interrupt it, and
-            // resume again, which now ends it.
-            self.close().await?;
-            resumed = self.resume().await?;
-        }
-        if let Persisted::Done(_, effects) = resumed {
+        if let Persisted::Done(_, effects) = self.resume().await? {
             self.start_effects(effects);
         }
         let shutdown = self.seams.tasks.shutdown().clone();
@@ -512,10 +509,8 @@ impl Session {
         self.persist(resumed).await
     }
 
-    /// Steps 2 and 3: durable, then applied and projected. An ordinary
-    /// append leaves the log's reserve free. Once the log has refused one,
-    /// only the running turn's closing records are persisted, into the
-    /// reserve.
+    /// Steps 2 and 3: durable, then applied and projected. Once the log has
+    /// refused an append, nothing more is (fail-stop).
     async fn persist(&mut self, decision: Decision<Parsed>) -> Result<Persisted, ShellError> {
         let Decision {
             records,
@@ -542,21 +537,19 @@ impl Session {
             effects
         };
         if !records.is_empty() {
-            let spare = if self.full.is_none() {
-                self.config.limits.reserve()
-            } else if self.core.running().is_some() && records.iter().all(closes) {
-                0
-            } else {
-                return Ok(refused());
-            };
             assert!(
-                self.log.next_seq() == self.core.seq(),
-                "the log and the core agree on the next seq"
+                self.full.is_none() && self.log.next_seq() == self.core.seq(),
+                "a log that refused nothing, agreeing with the core on the next seq"
             );
-            match self.log.append(&records, spare).await {
+            match self.log.append(&records).await {
                 Ok(()) => {}
                 Err(error) if error.refused() => {
-                    self.full.get_or_insert_with(|| error.to_string());
+                    self.halt(error.to_string());
+                    // The planted defect: act on what is not durable.
+                    #[cfg(feature = "sim")]
+                    if self.config.planted == Planted::ActAfterRefusal {
+                        self.start_effects(effects);
+                    }
                     return Ok(refused());
                 }
                 Err(error) => return Err(error.into()),
@@ -578,7 +571,12 @@ impl Session {
         Ok(Persisted::Done(outcome, effects))
     }
 
+    /// Decides `event` and persists the decision; once the log is full,
+    /// decides nothing (fail-stop).
     async fn decide(&mut self, event: Event<Parsed>) -> Result<Persisted, ShellError> {
+        if self.full.is_some() {
+            return Ok(Persisted::Refused);
+        }
         #[cfg(feature = "sim")]
         let observed = event.clone();
         let decision = self.core.decide(event);
@@ -587,29 +585,18 @@ impl Session {
             event: observed,
             records: decision.records.clone(),
         });
-        let persisted = self.persist(decision).await?;
-        if matches!(persisted, Persisted::Refused) {
-            self.close().await?;
-        }
-        Ok(persisted)
+        self.persist(decision).await
     }
 
-    /// Once the log is full, interrupts the running turn (if it is not
-    /// stopping already), so that its closing records end it.
-    async fn close(&mut self) -> Result<(), ShellError> {
-        let Some(turn) = self.core.running() else {
-            return Ok(());
-        };
-        let decision = self.core.decide(Event::Interrupt { turn });
-        #[cfg(feature = "sim")]
-        crate::shim::observe(crate::shim::Observation::Decided {
-            event: Event::Interrupt { turn },
-            records: decision.records.clone(),
-        });
-        if let Persisted::Done(_, effects) = self.persist(decision).await? {
-            self.start_effects(effects);
+    /// The log refused an append: the session fails stop (L3). It records
+    /// why, and stops its model calls (they are not effects, and nothing
+    /// they say could be recorded). Tool runs already started run on; what
+    /// they report is dropped, and a restart resolves them from the log.
+    fn halt(&mut self, why: String) {
+        self.full.get_or_insert(why);
+        for cancel in self.cancels.values() {
+            cancel.cancel();
         }
-        Ok(())
     }
 
     /// The answer to every command once the log is full.
@@ -640,22 +627,15 @@ impl Session {
                     | Event::ModelParts { .. }
                     | Event::Woke { .. } => {}
                 }
-                let closed = closing(&event);
-                let persisted = if self.full.is_none() {
-                    self.decide(event).await?
-                } else {
-                    Persisted::Refused
-                };
-                let persisted = match (persisted, closed) {
-                    // The log is full: the completion as it takes one.
-                    (Persisted::Refused, Some(closed)) => self.decide(closed).await?,
-                    (persisted, _) => persisted,
-                };
-                if let Persisted::Done(_, effects) = persisted {
+                if let Persisted::Done(_, effects) = self.decide(event).await? {
                     self.start_effects(effects);
                 }
             }
             Input::Message { command, reply } => {
+                if self.full.is_some() {
+                    drop(reply.send(Err(self.full())));
+                    return Ok(());
+                }
                 let delivered = self.delivered(command.message_id).is_some();
                 if self.held_bytes >= self.config.limits.session_bytes && !delivered {
                     drop(reply.send(Err(Rejection::SessionFull {
@@ -721,11 +701,6 @@ impl Session {
                         let answer = self.cancel_answer(outcome, turn);
                         drop(reply.send(answer));
                         self.start_effects(effects);
-                    }
-                    // The refusal closed the running turn: if that was this
-                    // one, this cancel is what cancelled it.
-                    Persisted::Refused if was_cancelled(&self.records, turn) => {
-                        drop(reply.send(self.cancel_answer(Outcome::Accepted, turn)));
                     }
                     Persisted::Refused => drop(reply.send(Err(self.full()))),
                 }
@@ -1036,75 +1011,6 @@ fn refused() -> Persisted {
     #[cfg(feature = "sim")]
     crate::shim::observe(crate::shim::Observation::Refused);
     Persisted::Refused
-}
-
-/// Whether `record` is one that ends a turn, and so may take the log's
-/// reserve: a short line, a result's output (if any) without its text, as
-/// [`closing`] leaves it.
-fn closes(record: &Record<Parsed>) -> bool {
-    match record {
-        Record::ToolResult { output, .. } => output
-            .as_ref()
-            .is_none_or(|output| output.body.text.is_empty()),
-        Record::CancelRequested { .. } | Record::TurnEnded { .. } | Record::EpochBumped { .. } => {
-            true
-        }
-        Record::TaskEnded { output, .. } => output
-            .as_ref()
-            .is_none_or(|output| output.body.text.is_empty()),
-        Record::Born { .. }
-        | Record::RulesLoaded { .. }
-        | Record::Delivered { .. }
-        | Record::TurnStarted { .. }
-        | Record::StepStarted { .. }
-        | Record::ModelOutput { .. }
-        | Record::StepReset { .. }
-        | Record::StepFinished { .. }
-        | Record::Approved { .. }
-        | Record::Dispatched { .. }
-        | Record::StopSent { .. } => false,
-    }
-}
-
-/// A completion as a full log takes it, so the core answers with closing
-/// records that fit the reserve: a tool's output is dropped, and a model's
-/// finished response (its calls would be a `StepFinished`) counts as
-/// interrupted, as the turn being stopped is. `None` for an event a full
-/// log drops: streamed parts, and a timer, which the turn's interrupt made
-/// stale.
-fn closing(event: &Event<Parsed>) -> Option<Event<Parsed>> {
-    match event {
-        Event::ToolDone { id, exit, output } => {
-            let shown = u64::try_from(output.body.text.len()).unwrap_or(u64::MAX);
-            let omitted_bytes = match output.body.truncation {
-                Truncation::Complete => shown,
-                Truncation::Truncated { omitted_bytes } => omitted_bytes.saturating_add(shown),
-            };
-            Some(Event::ToolDone {
-                id: *id,
-                exit: *exit,
-                output: measure(ToolOutput {
-                    text: String::new(),
-                    truncation: Truncation::Truncated { omitted_bytes },
-                }),
-            })
-        }
-        Event::ModelDone { id, result } => Some(Event::ModelDone {
-            id: *id,
-            result: match result {
-                ModelExit::Finished(_) => ModelExit::Failed(ModelFault::Cancelled),
-                ModelExit::Failed(cause) => ModelExit::Failed(*cause),
-            },
-        }),
-        Event::Expired { id } => Some(Event::Expired { id: *id }),
-        Event::Born { .. }
-        | Event::Rules { .. }
-        | Event::Deliver { .. }
-        | Event::Approve { .. }
-        | Event::Interrupt { .. }
-        | Event::ModelParts { .. }
-        | Event::Woke { .. } => None,
-    }
 }
 
 /// The planted defect: `records` with every `Unknown` result made a

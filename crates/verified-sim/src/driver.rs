@@ -33,6 +33,11 @@ use crate::scenario::{CancelAt, TurnPlan};
 const KEYS: usize = 64;
 /// How often the user looks again when nothing changed.
 const GLANCE: Millis = Millis::new(100);
+/// Glances a running turn may go without a new record, and no prompt, before
+/// the user presses Esc: three simulated minutes, past any tool's timeout.
+/// A turn stalls only when its log is full and the session failed stop
+/// (L3); Esc then learns the session takes no more.
+const STALL: usize = 1_800;
 /// Mixed into the seed for the TUI's entropy.
 const TUI_SALT: u64 = 0x7475_6900;
 /// What the TUI's notice says when the session takes no more commands
@@ -76,7 +81,11 @@ impl Seen {
         let tool_running = parts.iter().any(
             |part| matches!(part, Part::Tool(tool) if tool.state == ToolState::ApprovalResponded),
         );
-        let quiet = app.caught_up() && app.settled() && running.is_none() && !app.creating();
+        let over = app.notice().is_some_and(|notice| notice.contains(OVER));
+        // A session that takes no more may leave its turn running for good
+        // (a full log fails stop): what it folded is then final too.
+        let quiet =
+            app.caught_up() && app.settled() && (running.is_none() || over) && !app.creating();
         Self {
             turns: app.transcript().turns().len(),
             running: running.is_some(),
@@ -94,7 +103,7 @@ impl Seen {
                 app.connection(),
                 Connection::Down(_) | Connection::Broken(_)
             ),
-            over: app.notice().is_some_and(|notice| notice.contains(OVER)),
+            over,
             draft: !app.draft().is_empty(),
             offset: app.offset().seq(),
             transcript: quiet
@@ -179,10 +188,26 @@ impl User {
         self.press(Keyboard::enter()).await?;
         let mut cancelled = false;
         let mut prompts = 0usize;
+        let mut last = u64::MAX;
+        let mut still = 0usize;
         loop {
             let seen = self.glance().await?;
             if seen.over {
                 return Ok(false);
+            }
+            still = if seen.offset == last && seen.approval.is_none() {
+                still.saturating_add(1)
+            } else {
+                0
+            };
+            last = seen.offset;
+            if seen.running && !cancelled && still >= STALL {
+                cancelled = true;
+                self.ledger
+                    .record(Entry::User(format!("cancel {index}: stalled")));
+                self.press(Keyboard::key(KeyCode::Esc, KeyModifiers::NONE))
+                    .await?;
+                continue;
             }
             if seen.turns > index && !seen.running && seen.settled {
                 return Ok(true);

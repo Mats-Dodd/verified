@@ -317,14 +317,14 @@ pub trait Log: Send + fmt::Debug {
     /// The seq the next appended record gets.
     fn next_seq(&self) -> u64;
 
-    /// Appends `records` as one group commit: one write, one fsync, leaving
-    /// at least `spare` bytes of the file's bound free. Returns once they
-    /// are durable. After an error the log is unusable, except after a
-    /// [`LogError::refused`] one.
+    /// Appends `records` as one group commit: one write, one fsync, within
+    /// the file's bound. Returns once they are durable. After an error the
+    /// log is unusable, except after a [`LogError::refused`] one, which
+    /// wrote nothing.
     ///
     /// # Errors
     /// Any IO error; the caller crashes.
-    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError>;
+    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError>;
 }
 
 /// The framed lines of a group commit from `first`, refused when a line
@@ -453,14 +453,14 @@ impl Log for FileLog {
         self.next
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError> {
+    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
         let bytes = frames(
             &self.path.display().to_string(),
             self.next,
             records,
             self.length,
             self.max_line,
-            self.max_file.saturating_sub(spare),
+            self.max_file,
         )?;
         fs::append_synced(&mut self.file, &bytes)
             .await
@@ -546,7 +546,7 @@ impl Log for MemLog {
         self.next
     }
 
-    async fn append(&mut self, records: &[Record<Parsed>], spare: u64) -> Result<(), LogError> {
+    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
         let length = self
             .disk
             .bytes(self.session)
@@ -557,7 +557,7 @@ impl Log for MemLog {
             records,
             length,
             self.max_line,
-            self.max_file.saturating_sub(spare),
+            self.max_file,
         )?;
         self.disk.append(self.session, &bytes);
         self.next = advance(self.next, records);
@@ -799,7 +799,7 @@ mod tests {
         let mut refused = Vec::new();
         for group in groups {
             let before = disk.bytes(session());
-            match log.append(group, 0).await {
+            match log.append(group).await {
                 Ok(()) => acked.extend(group.iter().cloned()),
                 Err(error) => {
                     assert!(

@@ -43,9 +43,8 @@ pub struct ServerLimits {
     /// record the daemon makes fits ([`ServerLimits::record_budget`]).
     pub log_line_bytes: usize,
     /// Largest log file: an append past it is refused, and recovery refuses
-    /// a larger file. Its last [`ServerLimits::reserve`] bytes take only the
-    /// records that end the running turn; once an ordinary append is
-    /// refused, the session ends its turn there and takes no more records.
+    /// a larger file. Storage is the world: once an append is refused the
+    /// session fails stop (L3) and takes no more records.
     pub log_file_bytes: u64,
     /// Largest file the `read` tool or an `edit` reads.
     pub file_bytes: u64,
@@ -90,10 +89,6 @@ pub const OUTPUT_TRAILER: usize = 1024;
 /// may be larger still, within [`RECORD_OVERHEAD`].
 const PROJECTION_GROWTH: usize = 2;
 
-/// Records that end a turn besides one result per call of its step: its
-/// `CancelRequested`, a restart's `EpochBumped` and its `TurnEnded`.
-const CLOSING_RECORDS: usize = 3;
-
 /// JSON escapes a byte into at most six (`\u00XX`).
 const ESCAPED: usize = 6;
 
@@ -131,23 +126,6 @@ impl ServerLimits {
         self.log_line_bytes.saturating_sub(RECORD_OVERHEAD)
     }
 
-    /// Bytes at the end of the log file only the records ending the running
-    /// turn may take: a short line (no payload, so within
-    /// [`RECORD_OVERHEAD`]) for each of its step's results and its
-    /// `CancelRequested`, a restart's `EpochBumped` and its `TurnEnded`.
-    /// [`ServerLimits::check`] makes sure it fits.
-    #[must_use]
-    pub fn reserve(&self) -> u64 {
-        u64::try_from(self.reserve_bytes().unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
-    }
-
-    fn reserve_bytes(&self) -> Option<usize> {
-        self.core
-            .calls_per_step()
-            .checked_add(CLOSING_RECORDS)?
-            .checked_mul(RECORD_OVERHEAD)
-    }
-
     /// Checks that every record the daemon makes fits a log line, so an
     /// append never refuses one: a user's message and a tool's output at
     /// their bounds, escaped. Model output has no bound of its own small
@@ -158,8 +136,7 @@ impl ServerLimits {
     /// record.
     ///
     /// # Errors
-    /// A bound that does not fit, or a log file smaller than one line and
-    /// the [`ServerLimits::reserve`].
+    /// A bound that does not fit, or a log file smaller than one line.
     pub fn check(&self) -> Result<(), LimitsError> {
         let budget = self.record_budget();
         fits(
@@ -187,12 +164,7 @@ impl ServerLimits {
             self.wire.max_data_bytes(),
         )?;
         let file = usize::try_from(self.log_file_bytes).unwrap_or(usize::MAX);
-        fits(
-            "one log line and the reserve that ends a turn",
-            self.reserve_bytes()
-                .and_then(|reserve| reserve.checked_add(self.log_line_bytes)),
-            file,
-        )
+        fits("one log line", Some(self.log_line_bytes), file)
     }
 
     /// The bounds v0 ships with.

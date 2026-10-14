@@ -10,7 +10,9 @@
 //! acknowledged record, then a prefix of the pending group), is the model's
 //! replay to judge ([`crate::model`]), from the same ledger.
 //!
-//! - I5 at quiescence every turn ended and every call resolved.
+//! - I5 at quiescence every turn ended and every call resolved, unless the
+//!   log refused an append since the last boot: storage is the world, and a
+//!   full log fails stop (L3) with its turn as it was.
 //! - I6 exactly: each stream read the TUI folded, `from..next`, arrived as
 //!   the projection of exactly the log's records `from..next`, and the reads
 //!   tile the stream from offset 0; once caught up, the TUI's folded
@@ -33,6 +35,7 @@ use std::collections::BTreeMap;
 use verified_domain::{EffectId, Exit, Record, Request, named};
 use verified_server::payload::{Parsed, ToolArgs};
 use verified_server::projection::Projector;
+use verified_server::shim::Observation;
 use verified_wire::WireLimits;
 use verified_wire::chunk::UiChunk;
 use verified_wire::transcript::Transcript;
@@ -215,6 +218,7 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
     let mut disk = Disk::default();
     let mut caught = 0usize;
     let mut gave_up = None;
+    let mut halted = false;
     for (at, stamped) in entries.iter().enumerate() {
         match &stamped.entry {
             Entry::Created => log.clear(),
@@ -225,10 +229,16 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
             Entry::Acked { records, .. } => log.extend(records.iter().cloned()),
             Entry::Caught { offset, transcript } => {
                 caught = caught.saturating_add(1);
-                quiescent(&log, "at quiescence", &mut found);
+                if !halted {
+                    quiescent(&log, "at quiescence", &mut found);
+                }
                 caught_up(&log, *offset, transcript, &mut found);
             }
-            Entry::Boot { files, .. } => disk.boot(at, files),
+            Entry::Boot { files, .. } => {
+                halted = false;
+                disk.boot(at, files);
+            }
+            Entry::Shell(Observation::Refused) => halted = true,
             Entry::Wrote { effect } => disk.wrote(at, *effect, &mut found),
             Entry::Mutation { call, effect, op } => {
                 if let Op::Write { path, text } = op {

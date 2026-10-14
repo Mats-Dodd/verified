@@ -27,11 +27,11 @@ use verified_server::env::{
     Stopped, Written,
 };
 use verified_server::limits::ServerLimits;
-use verified_server::log::{MemDisk, MemLogStore};
+use verified_server::log::{Log, LogError, LogStore, MemDisk, MemLogStore};
 use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
-use verified_server::shell::{CommandError, Seams, SessionHandle, ShellConfig};
+use verified_server::shell::{CommandError, Planted, Seams, SessionHandle, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
@@ -183,6 +183,20 @@ async fn boot(disk: &MemDisk, env: Arc<dyn Env>) -> Daemon {
 }
 
 async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> Daemon {
+    let store = Arc::new(MemLogStore::new(
+        disk.clone(),
+        limits.log_line_bytes,
+        limits.log_file_bytes,
+    ));
+    boot_on(store, env, limits, Planted::None).await
+}
+
+async fn boot_on(
+    store: Arc<dyn LogStore>,
+    env: Arc<dyn Env>,
+    limits: ServerLimits,
+    planted: Planted,
+) -> Daemon {
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
@@ -196,14 +210,9 @@ async fn boot_with(disk: &MemDisk, env: Arc<dyn Env>, limits: ServerLimits) -> D
         limits: limits.clone(),
         model: "fake".to_owned(),
         system: "You are a test.".to_owned(),
-        planted: verified_server::shell::Planted::None,
+        planted,
     });
     let (fatal, failed) = mpsc::channel(1);
-    let store = Arc::new(MemLogStore::new(
-        disk.clone(),
-        limits.log_line_bytes,
-        limits.log_file_bytes,
-    ));
     let registry = daemon::boot(store, seams, config, fatal)
         .await
         .expect("the daemon boots");
@@ -799,7 +808,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
         limits: limits(),
         model: "fake".to_owned(),
         system: String::new(),
-        planted: verified_server::shell::Planted::None,
+        planted: Planted::None,
     });
     let refused = daemon::boot(
         Arc::new(MemLogStore::new(disk.clone(), 1 << 20, 1 << 30)),
@@ -809,12 +818,7 @@ async fn torn_tail_is_cut_and_corruption_refused() {
     )
     .await;
     assert!(
-        matches!(
-            refused,
-            Err(DaemonError::Log(
-                verified_server::log::LogError::Corrupt { .. }
-            ))
-        ),
+        matches!(refused, Err(DaemonError::Log(LogError::Corrupt { .. }))),
         "mid-log damage stops recovery: {:?}",
         refused.err()
     );
@@ -1004,45 +1008,11 @@ fn small_limits() -> ServerLimits {
     small
 }
 
-/// The turns `log` started and has not ended.
-fn still_running(log: &[Record<Parsed>]) -> Vec<TurnId> {
-    let mut running = Vec::new();
-    for record in log {
-        match record {
-            Record::TurnStarted { turn, .. } => running.push(*turn),
-            Record::TurnEnded { turn, .. } => running.retain(|open| open != turn),
-            Record::StepStarted { .. }
-            | Record::Born { .. }
-            | Record::RulesLoaded { .. }
-            | Record::Delivered { .. }
-            | Record::TaskEnded { .. }
-            | Record::StopSent { .. }
-            | Record::ModelOutput { .. }
-            | Record::StepReset { .. }
-            | Record::StepFinished { .. }
-            | Record::Approved { .. }
-            | Record::Dispatched { .. }
-            | Record::ToolResult { .. }
-            | Record::CancelRequested { .. }
-            | Record::EpochBumped { .. } => {}
-        }
-    }
-    running
-}
-
-fn assert_every_turn_ended(log: &[Record<Parsed>]) {
-    let running = still_running(log);
-    assert!(
-        running.is_empty(),
-        "a turn always ends; still running: {running:?}"
-    );
-}
-
 /// A log that reaches its file bound refuses the append that would pass it:
-/// nothing of it is written, the running turn ends within the log's
-/// reserve, the session refuses commands from then on, and the log still
-/// replays to exactly what was acknowledged, including after a restart,
-/// which serves it read-only instead of crashing.
+/// nothing of it is written, the session fails stop (it refuses commands and
+/// appends nothing more), and the log still replays to exactly what was
+/// acknowledged, including after a restart, which serves it instead of
+/// crashing.
 #[tokio::test]
 async fn a_full_log_stops_taking_records_and_loses_nothing() {
     let small = small_limits();
@@ -1079,8 +1049,21 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
         "the session fills: {full:?}"
     );
     let acked = records(&handle).await;
-    assert_every_turn_ended(&acked);
     let bytes = disk.bytes(session_id()).expect("the log");
+    let again = handle.send_message(send(99, "anyone?")).await;
+    assert!(
+        matches!(
+            again,
+            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+        ),
+        "fail-stop: every later command is refused: {again:?}"
+    );
+    assert_eq!(
+        disk.bytes(session_id()),
+        Some(bytes.clone()),
+        "fail-stop: nothing more is appended"
+    );
+    assert_eq!(records(&handle).await, acked, "nor applied");
     assert!(
         u64::try_from(bytes.len()).expect("small") <= small.log_file_bytes,
         "the file never passes its bound"
@@ -1110,7 +1093,6 @@ async fn a_full_log_stops_taking_records_and_loses_nothing() {
         ),
         "{refused:?}"
     );
-    assert_every_turn_ended(&records(&handle).await);
     assert!(
         u64::try_from(disk.bytes(session_id()).expect("the log").len()).expect("small")
             <= small.log_file_bytes,
@@ -1154,10 +1136,11 @@ async fn shutdown_wins_over_a_queued_command() {
     assert_eq!(disk.bytes(other), None, "a stopping daemon makes no log");
 }
 
-/// A crash mid-turn on a log too full to carry the turn on: the restart
-/// ends the turn, cancelled, within the log's bound.
+/// A crash mid-turn on a log too full to carry the turn on: the restart's
+/// resume is refused, and the session fails stop instead of crash-looping.
+/// It serves its log as it is, refuses commands and appends nothing.
 #[tokio::test]
-async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
+async fn a_restart_on_a_full_log_fails_stop() {
     let roomy = ServerLimits {
         log_file_bytes: 1 << 20,
         ..small_limits()
@@ -1194,121 +1177,180 @@ async fn a_crash_mid_turn_on_a_nearly_full_log_ends_the_turn() {
     first.tasks.shutdown().cancel();
     drop(handle);
 
-    // Room for a few short records, not for the rest of the turn.
+    // No room for even the restart's first record.
+    let full = disk.bytes(session_id()).expect("the log");
     let tight = ServerLimits {
-        log_file_bytes: u64::try_from(length()).expect("small") + 1024,
+        log_file_bytes: u64::try_from(full.len()).expect("small"),
         ..small_limits()
     };
-    let second = boot_with(&disk, Arc::new(MemEnv::default()), tight.clone()).await;
+    let second = boot_with(&disk, Arc::new(MemEnv::default()), tight).await;
     let handle = second
         .registry
         .lookup(session_id())
         .await
-        .expect("it boots");
-    let ending = within(Duration::from_secs(5), until(&handle, ended(slow.turn_id))).await;
+        .expect("it boots, and does not crash");
     let log = records(&handle).await;
     assert!(
-        ending.is_ok(),
-        "the restart ends the turn: {:?}",
-        still_running(&log)
+        log.iter()
+            .any(|record| matches!(record, Record::TurnStarted { turn } if *turn == slow.turn_id)),
+        "the turn the crash left running is served as the log says"
     );
-    assert_every_turn_ended(&log);
-    assert_eq!(
-        log.last(),
-        Some(&Record::TurnEnded {
-            turn: slow.turn_id,
-            outcome: TurnOutcome::Cancelled
-        }),
-        "the turn is cancelled"
-    );
+    let refused = handle.send_message(send(99, "more")).await;
     assert!(
-        u64::try_from(length()).expect("small") <= tight.log_file_bytes,
-        "within its bound"
+        matches!(
+            refused,
+            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+        ),
+        "{refused:?}"
     );
-    second.tasks.shutdown().cancel();
-}
-
-/// A cancel whose `CancelRequested` is the first record a full log refuses
-/// still cancels the turn (into the reserve), and says so.
-#[tokio::test]
-async fn a_cancel_that_fills_the_log_is_answered_as_a_cancel() {
-    let disk = MemDisk::new();
-    let length = || disk.bytes(session_id()).map_or(0, |bytes| bytes.len());
-    let env = MemEnv::with_file("lib.rs", "fn mian() {}");
-    let roomy = ServerLimits {
-        log_file_bytes: 1 << 20,
-        ..small_limits()
-    };
-    let first = boot_with(&disk, Arc::<MemEnv>::clone(&env), roomy.clone()).await;
-    let (_, handle) = first.registry.create(session_id()).await.expect("created");
-    // A log long enough to need one line and the reserve past it.
-    let mut seed = 1u8;
-    while length() < 40usize << 10u32 {
-        let reply = handle
-            .send_message(send(seed, &"x".repeat(990)))
-            .await
-            .expect("accepted");
-        until(&handle, ended(reply.turn_id)).await;
-        seed = seed.saturating_add(1);
-    }
-    // A turn waiting for approval appends nothing more.
-    let reply = handle
-        .send_message(send(seed, "edit lib.rs mian main"))
-        .await
-        .expect("accepted");
-    until(&handle, |chunks| approval_requested(chunks).is_some()).await;
-    first.tasks.shutdown().cancel();
-    drop(handle);
-    // A restart appends one EpochBumped; the next is as long.
-    let before = length();
-    let second = boot_with(&disk, Arc::<MemEnv>::clone(&env), roomy).await;
-    let handle = second
-        .registry
-        .lookup(session_id())
-        .await
-        .expect("it boots");
-    drop(records(&handle).await);
-    let bumped = length().saturating_sub(before);
-    second.tasks.shutdown().cancel();
-    drop(handle);
-    // Room past the reserve for the next restart's EpochBumped, no more.
-    let mut tight = small_limits();
-    tight.log_file_bytes = u64::try_from(length().saturating_add(bumped))
-        .expect("small")
-        .saturating_add(tight.reserve());
-    let third = boot_with(&disk, Arc::<MemEnv>::clone(&env), tight.clone()).await;
-    let handle = third.registry.lookup(session_id()).await.expect("it boots");
-    drop(records(&handle).await);
     let cancelled = handle
         .cancel(Cancel {
-            turn_id: reply.turn_id,
+            turn_id: slow.turn_id,
         })
-        .await
-        .expect("the cancel is answered");
-    assert_eq!(cancelled.outcome, Outcome::Created, "this cancel did it");
-    until(&handle, ended(reply.turn_id)).await;
-    assert_eq!(
-        records(&handle).await.last(),
-        Some(&Record::TurnEnded {
-            turn: reply.turn_id,
-            outcome: TurnOutcome::Cancelled
-        }),
-        "the turn is cancelled"
-    );
+        .await;
     assert!(
-        u64::try_from(length()).expect("small") <= tight.log_file_bytes,
-        "within its bound"
+        matches!(
+            cancelled,
+            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+        ),
+        "{cancelled:?}"
     );
-    third.tasks.shutdown().cancel();
+    assert_eq!(disk.bytes(session_id()), Some(full), "nothing appended");
+    fold(&handle).await;
+    second.tasks.shutdown().cancel();
 }
 
-/// The first refusal of a new message within two seconds.
+/// The first refusal of a new message within two seconds, other than busy
+/// (the turn a restart carried on may still be running).
 async fn eventually_refused(handle: &SessionHandle) -> Option<CommandError> {
     for seed in 100..=120u8 {
-        if let Err(error) = handle.send_message(send(seed, "more")).await {
-            return Some(error);
+        match handle.send_message(send(seed, "more")).await {
+            Err(CommandError::Rejected(Rejection::SessionBusy { .. })) | Ok(_) => {}
+            Err(error) => return Some(error),
         }
         SystemClock.sleep(Millis::new(100)).await;
     }
     None
+}
+
+/// Logs that refuse every group dispatching a call, as a disk filling at
+/// that moment would: the first refusal comes exactly where the next act
+/// would.
+#[derive(Debug)]
+struct RefusingStore(MemLogStore);
+
+#[derive(Debug)]
+struct RefusingLog(Box<dyn Log>);
+
+#[async_trait]
+impl Log for RefusingLog {
+    fn next_seq(&self) -> u64 {
+        self.0.next_seq()
+    }
+
+    async fn append(&mut self, records: &[Record<Parsed>]) -> Result<(), LogError> {
+        if records
+            .iter()
+            .any(|record| matches!(record, Record::Dispatched { .. }))
+        {
+            return Err(LogError::Full {
+                path: "refusing".to_owned(),
+                length: 0,
+                limit: 0,
+            });
+        }
+        self.0.append(records).await
+    }
+}
+
+#[async_trait]
+impl LogStore for RefusingStore {
+    async fn list(&self) -> Result<Vec<ActorId>, LogError> {
+        self.0.list().await
+    }
+
+    async fn create(&self, session: ActorId) -> Result<Box<dyn Log>, LogError> {
+        Ok(Box::new(RefusingLog(self.0.create(session).await?)))
+    }
+
+    async fn open(
+        &self,
+        session: ActorId,
+    ) -> Result<(Box<dyn Log>, Vec<Record<Parsed>>), LogError> {
+        let (log, records) = self.0.open(session).await?;
+        Ok((Box::new(RefusingLog(log)), records))
+    }
+}
+
+/// L3's fail-stop, checked: an approved `bash` whose `Dispatched` the log
+/// refuses. What broke it, if anything: the approval acknowledged, the
+/// command run, or anything appended after the refusal.
+async fn fail_stop(planted: Planted) -> Result<(), String> {
+    let disk = MemDisk::new();
+    let env = Arc::new(MemEnv::default());
+    let limits = limits();
+    let store = Arc::new(RefusingStore(MemLogStore::new(
+        disk.clone(),
+        limits.log_line_bytes,
+        limits.log_file_bytes,
+    )));
+    let daemon = boot_on(store, Arc::<MemEnv>::clone(&env), limits, planted).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    handle
+        .send_message(send(1, "bash echo hi"))
+        .await
+        .expect("accepted");
+    let chunks = until(&handle, |chunks| approval_requested(chunks).is_some()).await;
+    let call_id = approval_requested(&chunks).expect("asked");
+    let before = disk.bytes(session_id());
+    let approved = handle
+        .approve(Approve {
+            call_id,
+            verdict: Verdict::Grant,
+        })
+        .await;
+    let more = handle.send_message(send(2, "still there?")).await;
+    SystemClock.sleep(Millis::new(300)).await;
+    let mut broken = Vec::new();
+    for answer in [approved.map(drop), more.map(drop)] {
+        if !matches!(
+            answer,
+            Err(CommandError::Rejected(Rejection::SessionFull { .. }))
+        ) {
+            broken.push(format!("answered {answer:?}"));
+        }
+    }
+    if !env.commands().is_empty() {
+        broken.push(format!("acted: {:?}", env.commands()));
+    }
+    if disk.bytes(session_id()) != before {
+        broken.push("appended after the refusal".to_owned());
+    }
+    daemon.tasks.shutdown().cancel();
+    if broken.is_empty() {
+        Ok(())
+    } else {
+        Err(broken.join("; "))
+    }
+}
+
+/// Storage is the world: a refused append halts the session. Nothing acts
+/// without its durable record, nothing is acknowledged, and nothing more
+/// is appended (L3).
+#[tokio::test]
+async fn a_refused_append_fails_stop() {
+    fail_stop(Planted::None)
+        .await
+        .expect("nothing acts or is acknowledged after a refused append");
+}
+
+/// The planted bug for L3's fail-stop: a shell that starts a decision's
+/// effects although the log refused its records. The check must catch it.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn acting_after_a_refused_append_is_caught() {
+    let broken = fail_stop(Planted::ActAfterRefusal)
+        .await
+        .expect_err("the check catches a shell that acts after a refused append");
+    assert!(broken.contains("acted"), "{broken}");
 }

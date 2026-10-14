@@ -13,7 +13,7 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use verified_domain::{Exit, ModelFault, Record, Reset, TurnOutcome, Unstarted};
+use verified_domain::{Exit, ModelFault, Record, Reset, Unstarted};
 use verified_model::coverage::{Class, Key, Phase, Resolved};
 use verified_model::{Bug, Harness, Kind, Mismatch, Observed};
 use verified_server::limits::ServerLimits;
@@ -425,30 +425,27 @@ fn the_fixed_seeds_replay_every_kind_of_step() {
     }
 }
 
-/// v0's limits, shrunk so a seed's few turns fill the log: one line and
-/// the reserve that ends a turn, no more.
+/// v0's limits, shrunk so a seed's few turns fill the log: one line, no
+/// more.
 fn a_small_log() -> ServerLimits {
     let mut limits = hosts::limits();
     limits.wire.max_message_text_bytes = 1_000;
     limits.tool_output_bytes = 1_000;
     limits.log_line_bytes = 16usize << 10u32;
-    limits.log_file_bytes = u64::try_from(limits.log_line_bytes)
-        .expect("small")
-        .saturating_add(limits.reserve());
+    limits.log_file_bytes = u64::try_from(limits.log_line_bytes).expect("small");
     limits
 }
 
 /// Seeds whose turns fill [`a_small_log`] while a turn runs, and the
-/// simulated millisecond of a crash added as it fills (seed 28's leaves
-/// a resume the full log refuses).
+/// simulated millisecond of a crash added as it fills.
 const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_585))];
 
-/// A full log ends the running turn within its reserve, refuses what
-/// follows, and the run is still a path of the model: the refused
-/// decisions never reached the core, a refused resume is decided again
-/// once the turn is interrupted, and the turn ends cancelled.
+/// Storage is the world: a full log fails stop (L3). From the first refused
+/// append until the daemon boots again, nothing is acknowledged and no tool
+/// run starts, and the run is still a path of the model: the refused
+/// decisions never reached the core.
 #[test]
-fn a_full_log_ends_the_running_turn_and_replays() {
+fn a_full_log_fails_stop_and_replays() {
     for (seed, crash) in FILLING {
         let mut scenario = Scenario {
             limits: a_small_log(),
@@ -464,33 +461,49 @@ fn a_full_log_ends_the_running_turn_and_replays() {
             scenario.faults.sort_by_key(|(at, _)| *at);
         }
         let outcome = run::twice(&scenario)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                let tail = error
+                    .trace()
+                    .iter()
+                    .rev()
+                    .take(30)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                format!("{error}\n{}", tail.join("\n"))
+            })
             .expect("the run finishes, deterministically");
-        let filled = outcome
-            .entries
-            .iter()
-            .position(|stamped| stamped.entry == Entry::Shell(Observation::Refused))
-            .expect("the log fills");
-        let cancelled = outcome.entries.iter().skip(filled).any(|stamped| {
-            matches!(&stamped.entry, Entry::Acked { records, .. } if records.iter().any(|record| {
-                matches!(
-                    record,
-                    Record::TurnEnded {
-                        outcome: TurnOutcome::Cancelled,
-                        ..
-                    }
-                )
-            }))
-        });
-        assert!(
-            cancelled,
-            "seed {seed}: the turn running as the log fills ends cancelled"
-        );
-        assert_eq!(
-            outcome.observed.contains(&Observed::Refused),
-            crash.is_some(),
-            "seed {seed}: only the crash leaves a resume refused"
-        );
+        let mut halted = false;
+        let mut filled = false;
+        for stamped in &outcome.entries {
+            match &stamped.entry {
+                Entry::Shell(Observation::Refused) => {
+                    halted = true;
+                    filled = true;
+                }
+                Entry::Boot { .. } => halted = false,
+                Entry::Acked { records, .. } => {
+                    assert!(
+                        !halted,
+                        "seed {seed}: acknowledged {records:?} after a refusal"
+                    );
+                }
+                Entry::Shell(Observation::Passed(barrier)) => {
+                    assert!(!halted, "seed {seed}: {barrier:?} after a refusal");
+                }
+                Entry::Created
+                | Entry::Recovered { .. }
+                | Entry::Mutation { .. }
+                | Entry::Wrote { .. }
+                | Entry::Fault(_)
+                | Entry::User(_)
+                | Entry::GaveUp { .. }
+                | Entry::Read { .. }
+                | Entry::Shell(_)
+                | Entry::Caught { .. } => {}
+            }
+        }
+        assert!(filled, "seed {seed}: the log fills");
         outcome
             .verdict()
             .map_err(|broken| broken.to_string())
