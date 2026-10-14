@@ -69,6 +69,8 @@ pub struct World {
     pub flights: BTreeMap<EffectId, Flight>,
     pub orphans: BTreeMap<EffectId, Flight>,
     pub asks: BTreeSet<CallId>,
+    /// Calls the user approved by command, whether or not one awaited it.
+    pub approved: BTreeSet<CallId>,
     /// Times each call's side effect happened, with its tool.
     pub runs: BTreeMap<CallId, (Tool, u8)>,
     /// Times a run of each call was started (a `RunTool` reached the world),
@@ -117,6 +119,7 @@ impl Default for World {
             flights: BTreeMap::new(),
             orphans: BTreeMap::new(),
             asks: BTreeSet::new(),
+            approved: BTreeSet::new(),
             runs: BTreeMap::new(),
             starts: BTreeMap::new(),
             sent: 0,

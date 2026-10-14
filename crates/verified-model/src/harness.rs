@@ -160,6 +160,9 @@ pub enum Bug {
     /// The shell approves what it should ask about, as if by the first rule
     /// in force, whether or not it fits the call.
     RuleApprovesAll,
+    /// The shell approves what it should ask about in the user's name,
+    /// without the user's command.
+    UserApprovesAll,
     /// After a crash, drop the `Unknown` result of a dispatched `Unsafe`
     /// call, and all the resume decided after it, so the call stays
     /// dispatched.
@@ -394,6 +397,17 @@ impl Harness {
                     world.pending.push(Record::Approved {
                         call: *call,
                         by: Grant::Rule { rule: 0, rules },
+                    });
+                }
+            }
+        }
+        if self.bug == Some(Bug::UserApprovesAll) {
+            // The shell grants what it should ask about, as if you had.
+            for work in &decided.effects {
+                if let Work::AskApproval { call, .. } = work {
+                    world.pending.push(Record::Approved {
+                        call: *call,
+                        by: Grant::User,
                     });
                 }
             }
@@ -779,7 +793,10 @@ impl Model for Harness {
             Action::Deliver(event) => {
                 match &event {
                     Event::Deliver { .. } => world.sent = world.sent.saturating_add(1),
-                    Event::Approve { call, .. } => {
+                    Event::Approve { call, verdict } => {
+                        if *verdict == Verdict::Approve {
+                            world.approved.insert(call.clone());
+                        }
                         if !world.asks.remove(call) {
                             world.stale_answers = world.stale_answers.saturating_add(1);
                         }
@@ -895,6 +912,13 @@ impl Model for Harness {
                 "every grant is the user's or a rule in force that fits",
                 |model: &Self, world: &World| {
                     !model.audit(world).breaches.contains(&Breach::GrantUnfit)
+                },
+            ),
+            // A2: a user's grant answers the user's command.
+            Property::always(
+                "every user's grant answers the user's approval command",
+                |model: &Self, world: &World| {
+                    model.audit(world).user_grants.is_subset(&world.approved)
                 },
             ),
             Property::always(

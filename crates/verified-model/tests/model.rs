@@ -192,6 +192,26 @@ fn approval_by_a_rule_that_does_not_match_is_caught() {
     }
 }
 
+/// A2: a shell that grants in the user's name what the user never
+/// approved. `spec_apply` accepts a `Grant::User` (it cannot see the
+/// command), so only the audit against the user's commands catches it.
+#[test]
+fn approval_by_the_user_without_a_command_is_caught() {
+    let checker = Harness {
+        bug: Some(Bug::UserApprovesAll),
+        ..suite::with_crashes(vec![vec![Tool::Edit]], 1)
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+    assert!(
+        checker
+            .discovery("every user's grant answers the user's approval command")
+            .is_some(),
+        "the edit granted without your command is caught"
+    );
+}
+
 #[test]
 fn calls_past_the_bounds() {
     let states = check(

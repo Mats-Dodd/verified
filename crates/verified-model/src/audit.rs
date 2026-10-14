@@ -12,6 +12,8 @@ use verified_domain::{
 #[derive(Debug, Default)]
 pub(crate) struct Audit {
     pub(crate) proposed: BTreeSet<CallId>,
+    /// Calls granted in the user's name (`Grant::User`).
+    pub(crate) user_grants: BTreeSet<CallId>,
     pub(crate) breaches: BTreeSet<Breach>,
     /// Calls that failed by a limit.
     pub(crate) limited: u8,
@@ -75,6 +77,13 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                     audit.breaches.insert(Breach::GrantUnfit);
                 }
             }
+            Record::Approved {
+                by: Grant::User, ..
+            } => {
+                if let Some((_, proposal)) = target {
+                    audit.user_grants.insert(proposal.id.clone());
+                }
+            }
             Record::TurnStarted { .. } => {
                 proposed = 0;
                 over.clear();
@@ -129,7 +138,6 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
             | Record::StopSent { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
-            | Record::Approved { .. }
             | Record::TurnEnded { .. } => {}
         }
     }
