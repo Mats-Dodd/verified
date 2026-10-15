@@ -1508,6 +1508,44 @@ fn a_crash_after_esc_during_a_forced_compaction_stays_parked() {
     );
 }
 
+/// A crash after a park at a turn's first step keeps the actor parked:
+/// its message still waits, and recovery starts no turn and no summarize
+/// call, after a failed summary or after Esc alike. New mail retries.
+#[test]
+fn a_crash_keeps_an_actor_parked_with_its_message_waiting() {
+    for esc in [false, true] {
+        let mut driver = Driver::new(small_limits());
+        let id = forced_at_the_first_step(&mut driver);
+        if esc {
+            let turn = last_turn(&driver);
+            driver.send(Event::Interrupt { turn });
+        }
+        driver.send(Event::Summarized {
+            id,
+            summary: Summary::Failed(ModelFault::Other),
+        });
+        let from = driver.log.len();
+        let effects = driver.crash();
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Summarize { .. } | Effect::CallModel { .. }
+            )),
+            "esc {esc}: no model call: {effects:?}"
+        );
+        assert!(
+            !driver
+                .since(from)
+                .iter()
+                .any(|record| matches!(record, Record::TurnStarted { .. })),
+            "esc {esc}: no turn starts"
+        );
+        assert_eq!(driver.core.unread(), 1, "esc {esc}: its message waits");
+        let (_, effects) = driver.send(deliver(3, 10));
+        summarize_of(&effects);
+    }
+}
+
 /// A stop during a forced compaction stops it like any foreground call.
 #[test]
 fn a_stop_cancels_a_forced_compaction() {

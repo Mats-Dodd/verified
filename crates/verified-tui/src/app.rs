@@ -15,7 +15,8 @@
 //! approval waits, `y` and `n` answer it on an empty draft; any other text
 //! is typed, and Enter sends it too, denying the waiting calls. Enter on
 //! `/compact` asks the actor followed to summarize its model history
-//! instead; the transcript keeps everything and marks where it fell.
+//! instead; the transcript keeps everything and marks the latest
+//! compaction after the turn it fell in.
 //!
 //! Ported from q's `app.rs`, plus approvals and actors.
 

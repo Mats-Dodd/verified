@@ -793,15 +793,22 @@ fn a_task_end_never_told_is_caught() {
 
 /// T4, as a mutation test: a cut that takes the mail no step carried yet
 /// into its summary. The long message waits behind a cut at the first
-/// step of its turn; the step that carries it then never tells it, and
-/// I14 finds a model call whose request lacks what its step carried.
+/// step of its turn. I14 fails twice: the summarize call is told the
+/// unread message, and the step that carries it never tells it.
 #[test]
 fn a_cut_that_swallows_unread_mail_fails_i14() {
     let outcome = played(
         &directed::compacted_at_the_first_step(),
         Planted::CutSwallowsMail,
     );
-    assert!(broke(&outcome, "I14"), "{:#?}", outcome.violations);
+    let i14 = |prefix: &str| {
+        outcome
+            .violations
+            .iter()
+            .any(|violation| violation.invariant == "I14" && violation.detail.starts_with(prefix))
+    };
+    assert!(i14("summarize call "), "{:#?}", outcome.violations);
+    assert!(i14("model call "), "{:#?}", outcome.violations);
 }
 
 /// T1, as a mutation test: a shell that asks for a summary before its

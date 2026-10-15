@@ -1385,6 +1385,12 @@ impl Session {
                     self.config.limits.model_max_tokens,
                     self.config.planted,
                 );
+                #[cfg(feature = "sim")]
+                crate::shim::observe(crate::shim::Observation::SummaryRequested {
+                    actor: self.id,
+                    id,
+                    said: history::said_anywhere(&request),
+                });
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 let task = SummaryTask {

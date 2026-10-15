@@ -516,6 +516,21 @@ pub fn said(request: &ModelRequest) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The text blocks of every message of the user's in `request`.
+#[must_use]
+pub fn said_anywhere(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.clone()),
+            Content::ToolUse { .. } | Content::ToolResult { .. } => None,
+        })
+        .collect()
+}
+
 /// The request, and the mail no step carried yet.
 fn build(
     records: &[Record<Parsed>],

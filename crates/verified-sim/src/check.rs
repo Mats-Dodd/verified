@@ -51,6 +51,9 @@
 //! - I14 every model call is told what its step carried (T4): each
 //!   envelope its `StepStarted` carries is in the request's last message,
 //!   a message by its text and a task's end as that task's notification.
+//!   And no summarize call is told mail its cut left unread: an envelope
+//!   no step carried before the cut is told in its request no more often
+//!   than envelopes a step did carry say the same.
 //! - I15 every effect with a deadline resolved by it, in simulated time
 //!   (P1): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between. Which effects have one, and
@@ -684,6 +687,9 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
             Entry::Shell(Observation::Requested { actor, id, said }) => {
                 told(*actor, &logs.records(*actor), id.seq, said, &mut found);
             }
+            Entry::Shell(Observation::SummaryRequested { actor, id, said }) => {
+                kept_out(*actor, &logs.records(*actor), id.seq, said, &mut found);
+            }
             Entry::Shell(Observation::Refused { actor }) => {
                 halted.entry(*actor).or_insert(stamped.at);
                 refusals.push((*actor, stamped.at));
@@ -860,6 +866,89 @@ fn told(
                      never told ({text:?} not in {said:?})"
                 ),
             ));
+        }
+    }
+}
+
+/// I14 for the summarize call whose `CompactionStarted` is at `cut` of
+/// `actor`'s log, sent a request whose user's messages hold `said`: mail
+/// delivered or notified before the cut and carried by no step before it
+/// is not in the request (T4: a cut never holds unread mail). A text two
+/// envelopes share may be told once for each one a step carried.
+fn kept_out(
+    actor: ActorId,
+    log: &[Record<Parsed>],
+    cut: u64,
+    said: &[String],
+    found: &mut Vec<Violation>,
+) {
+    let before = log
+        .get(..usize::try_from(cut).unwrap_or(usize::MAX))
+        .unwrap_or(log);
+    let mut carried = BTreeSet::new();
+    let mut mail = Vec::new();
+    for record in before {
+        match record {
+            Record::Delivered { envelope } => {
+                if let Body::Text(text) = &envelope.body {
+                    mail.push((envelope.id, Told::Text(text.body.clone())));
+                }
+            }
+            Record::TaskEnded { task, .. } => {
+                mail.push((EnvelopeId::Task(*task), Told::Task(task.0)));
+            }
+            Record::StepStarted { carries, .. } => carried.extend(carries.iter().copied()),
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::TurnStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
+        }
+    }
+    for (id, told) in mail.iter().filter(|(id, _)| !carried.contains(id)) {
+        let times = said.iter().filter(|block| told.is(block)).count();
+        let shared = mail
+            .iter()
+            .filter(|(other, same)| carried.contains(other) && same == told)
+            .count();
+        if times > shared {
+            found.push(violation(
+                "I14",
+                format!(
+                    "summarize call {cut} of {actor} was told envelope {id:?}, unread at its cut                      ({told:?} in {said:?})"
+                ),
+            ));
+        }
+    }
+}
+
+/// How a summarize call's request would tell an envelope: a message by
+/// its text, alone (the user's) or after its sender (`[from …] text`), and
+/// a task's end as its notification (`[v] task N ended: …`).
+#[derive(Debug, PartialEq, Eq)]
+enum Told {
+    Text(String),
+    Task(u64),
+}
+
+impl Told {
+    fn is(&self, block: &str) -> bool {
+        match self {
+            Self::Text(text) => {
+                block == text
+                    || (block.starts_with("[from ") && block.ends_with(&format!("] {text}")))
+            }
+            Self::Task(task) => block.starts_with(&format!("[v] task {task} ended:")),
         }
     }
 }

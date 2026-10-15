@@ -1092,6 +1092,50 @@ fn spawns_are_bounded_by_children_per_actor() {
     );
 }
 
+/// A refused spawn made no child: a compaction's open work lists only the
+/// children a spawn made.
+#[test]
+fn open_work_lists_no_child_of_a_refused_spawn() {
+    let mut driver = Driver::new();
+    let born = ActorId::from_parts(at(12), &[7; 10]);
+    let spawn = |name: &str, child: ActorId| {
+        call(
+            name,
+            Shape::Spawn {
+                subject: b"helper".to_vec(),
+                child,
+            },
+        )
+    };
+    let effects = proposing(&mut driver, vec![spawn("a", child()), spawn("b", born)]);
+    driver.done(run_of(&effects, "a"), Exit::NotStarted(Unstarted::Refused));
+    let (_, effects) = driver.done(run_of(&effects, "b"), Exit::Ok);
+    driver.finish(model_call(&effects), Vec::new());
+    let (_, effects) = driver.send(Event::Compact);
+    let id = effects
+        .iter()
+        .find_map(|effect| {
+            if let Effect::Summarize { id } = effect {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .expect("a summarize call");
+    driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(10)),
+    });
+    let children = driver.log.last().and_then(|record| {
+        if let Record::Compacted { open, .. } = record {
+            Some(open.children.clone())
+        } else {
+            None
+        }
+    });
+    assert_eq!(children, Some(vec![born]), "only the child a spawn made");
+}
+
 fn call_spawn() -> Proposal<Abstract> {
     call(
         "spawn",

@@ -583,6 +583,14 @@ pub enum Observation {
         id: verified_domain::EffectId,
         said: Vec<String>,
     },
+    /// The summarize call `id` of `actor` is about to be sent a request
+    /// whose user's messages hold `said`, their text blocks: none may tell
+    /// mail its cut (at `id.seq`) left unread.
+    SummaryRequested {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+        said: Vec<String>,
+    },
     /// A barrier was reached.
     Passed(Barrier),
 }
