@@ -20,6 +20,7 @@ pub fn config(steps: u32) -> LimitsConfig {
         turns_per_actor: count(4),
         messages_per_actor: count(4),
         tasks_per_actor: count(4),
+        children_per_actor: count(4),
         depth: 1,
         steps_per_turn: NonZeroU32::new(steps).expect("at least one step"),
         calls_per_step: count(4),
@@ -70,6 +71,9 @@ pub fn bounded(scripts: Vec<Vec<Tool>>, batches: u8) -> Bounded {
         max_hangs: 0,
         expiries: false,
         rules: None,
+        message_bytes: 1,
+        summaries: vec![1],
+        compacts: 0,
     }
 }
 
@@ -419,6 +423,87 @@ pub fn stops_across_deadlines_and_crashes() -> Harness {
     )
 }
 
+/// The limits of the compaction checks: a 10-byte context, two steps a
+/// turn.
+///
+/// # Panics
+/// Never: every count is non-zero.
+#[must_use]
+pub fn compaction_limits() -> Limits {
+    Limits::new(LimitsConfig {
+        context_bytes: NonZeroU64::new(10).expect("non-zero"),
+        ..config(2)
+    })
+}
+
+/// The user's messages are 9 bytes of a 10-byte context, and a summary
+/// is 1 byte (room for a message) or 5 (none).
+fn compacting(bounded: Bounded) -> Bounded {
+    Bounded {
+        faults: false,
+        message_bytes: 9,
+        summaries: vec![1, 5],
+        ..bounded
+    }
+}
+
+/// T1 and T4 across compactions, between turns and at a first step.
+///
+/// A turn ends past 80% of the context and compacts between turns; the
+/// second message does not fit after the first, so its turn's first step
+/// compacts. Summaries make room or do not, fail, or are stopped by Esc.
+#[must_use]
+pub fn compactions_between_turns_and_at_the_first_step() -> Harness {
+    Harness::bounded(
+        compaction_limits(),
+        compacting(Bounded {
+            messages: 2,
+            max_interrupts: 1,
+            ..bounded(vec![Vec::new()], 0)
+        }),
+    )
+}
+
+/// A read's result after a batch of parts does not fit the next step, so
+/// that beat compacts, and Esc may stop it.
+#[must_use]
+pub fn a_compaction_after_tools() -> Harness {
+    Harness::bounded(
+        compaction_limits(),
+        compacting(Bounded {
+            max_interrupts: 1,
+            ..bounded(vec![vec![Tool::Read]], 1)
+        }),
+    )
+}
+
+/// The user's `/compact` between turns, a parked actor's included.
+#[must_use]
+pub fn compact_between_turns() -> Harness {
+    Harness::bounded(
+        compaction_limits(),
+        compacting(Bounded {
+            messages: 2,
+            compacts: 1,
+            ..bounded(vec![Vec::new()], 0)
+        }),
+    )
+}
+
+/// A crash anywhere around a compaction, between turns or forced at a
+/// turn's first step: a dangling start compacts again.
+#[must_use]
+pub fn compactions_across_crashes() -> Harness {
+    Harness::bounded(
+        compaction_limits(),
+        compacting(Bounded {
+            messages: 2,
+            max_crashes: 1,
+            ..bounded(vec![Vec::new()], 0)
+        }),
+    )
+}
+
 /// Every bound BFS checks the model under, by its check's name.
 #[must_use]
 pub fn all() -> Vec<(&'static str, Harness)> {
@@ -457,5 +542,12 @@ pub fn all() -> Vec<(&'static str, Harness)> {
             "stops_across_deadlines_and_crashes",
             stops_across_deadlines_and_crashes(),
         ),
+        (
+            "compactions_between_turns_and_at_the_first_step",
+            compactions_between_turns_and_at_the_first_step(),
+        ),
+        ("a_compaction_after_tools", a_compaction_after_tools()),
+        ("compact_between_turns", compact_between_turns()),
+        ("compactions_across_crashes", compactions_across_crashes()),
     ]
 }

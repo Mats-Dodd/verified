@@ -14,10 +14,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use stateright::Model as _;
-use verified_core::Event;
+use verified_core::{Event, Outcome, Summary};
 use verified_domain::{
-    Body, EnvelopeId, Exit, Failure, Limit, Record, Request, Reset, Tool, TurnOutcome, Unstarted,
-    named,
+    Body, EnvelopeId, Exit, Failure, Limit, ModelFault, Record, Request, Reset, Tool, TurnOutcome,
+    Unstarted, named,
 };
 
 use crate::harness::{Action, Harness, Kind};
@@ -135,6 +135,21 @@ pub enum Situation {
     Expired,
 }
 
+/// How a compaction's summarize call ended, as its actor took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Compaction {
+    /// It wrote a summary.
+    Written,
+    /// It failed.
+    Failed,
+    /// It was stopped (Esc, a stop).
+    Cancelled,
+    /// Its answer came for a compaction a turn or a crash superseded.
+    Stale,
+    /// The daemon crashed while it ran.
+    Crashed,
+}
+
 /// What started a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Started {
@@ -167,6 +182,12 @@ pub enum Key {
         started: Started,
         resolved: Resolved,
     },
+    /// A summarize call ended so, for a compaction inside a turn
+    /// (`forced`, at a beat that had no room) or between turns.
+    Compaction {
+        forced: bool,
+        ended: Compaction,
+    },
     /// An action of this kind was taken.
     Action(Kind),
     /// A turn ended so.
@@ -195,6 +216,11 @@ impl fmt::Display for Key {
             Self::Task { started, resolved } => {
                 write!(formatter, "task {started:?} -> {resolved:?}")
             }
+            Self::Compaction { forced, ended } => write!(
+                formatter,
+                "compaction {} -> {ended:?}",
+                if *forced { "forced" } else { "between turns" }
+            ),
             Self::Action(kind) => write!(formatter, "action {kind:?}"),
             Self::Turn(ended) => write!(formatter, "turn {ended:?}"),
             Self::Situation(situation) => write!(formatter, "{situation:?}"),
@@ -303,7 +329,9 @@ fn decided(after: &Actor, keys: &mut BTreeSet<Key>) {
             | Record::Delivered { .. }
             | Record::StepFinished { .. }
             | Record::ModelOutput { .. }
-            | Record::CancelRequested { .. } => {}
+            | Record::CancelRequested { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
     }
 }
@@ -311,7 +339,7 @@ fn decided(after: &Actor, keys: &mut BTreeSet<Key>) {
 const fn class(job: &Job) -> Option<Class> {
     match job {
         Job::Tool { tool, .. } => Some(Class::of(*tool)),
-        Job::Model { .. } | Job::Sleep | Job::Deliver { .. } => None,
+        Job::Model { .. } | Job::Sleep | Job::Summarize | Job::Deliver { .. } => None,
     }
 }
 
@@ -326,6 +354,12 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
         if let Some(actor) = after.actor(slot) {
             decided(actor, keys);
         }
+    };
+    // Whether the actor at `slot` was in a turn: a compaction there is forced.
+    let forced = |slot: usize| {
+        harness
+            .core(before, slot)
+            .is_some_and(|core| core.running().is_some())
     };
     match action {
         Action::Crash(keep) => {
@@ -350,6 +384,18 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                             Situation::CrashKeptGroup
                         },
                     );
+                }
+            }
+            for (slot, actor) in before.actors.iter().enumerate() {
+                if actor
+                    .flights
+                    .values()
+                    .any(|flight| matches!(flight.job, Job::Summarize))
+                {
+                    keys.insert(Key::Compaction {
+                        forced: forced(slot),
+                        ended: Compaction::Crashed,
+                    });
                 }
             }
             for slot in 0..after.actors.len() {
@@ -424,11 +470,26 @@ pub fn keys(harness: &Harness, before: &World, action: &Action, after: &World) -
                         situation(&mut keys, Situation::Expired);
                     }
                 }
+                Event::Summarized { summary, .. } => {
+                    let stale = harness.core(before, *slot).is_some_and(|core| {
+                        core.decide(event.clone()).outcome == Outcome::Stale
+                    });
+                    keys.insert(Key::Compaction {
+                        forced: forced(*slot),
+                        ended: match summary {
+                            _ if stale => Compaction::Stale,
+                            Summary::Written(_) => Compaction::Written,
+                            Summary::Failed(ModelFault::Cancelled) => Compaction::Cancelled,
+                            Summary::Failed(_) => Compaction::Failed,
+                        },
+                    });
+                }
                 Event::Born { .. }
                 | Event::Rules { .. }
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
-                | Event::Woke { .. } => {}
+                | Event::Woke { .. }
+                | Event::Compact => {}
             }
             decided_at(*slot, &mut keys);
         }
@@ -570,6 +631,8 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
             | Kind::ToolDone
             | Kind::Woke
             | Kind::Expire
+            | Kind::Compact
+            | Kind::Summarize
             | Kind::Sync
             | Kind::Crash
             | Kind::Read
@@ -577,6 +640,7 @@ pub const fn classify(key: &Key) -> (Gap, &'static str) {
         )
         | Key::Call { .. }
         | Key::Task { .. }
+        | Key::Compaction { .. }
         | Key::Crashed { .. }
         | Key::Turn(_)
         | Key::Situation(_) => TEST,

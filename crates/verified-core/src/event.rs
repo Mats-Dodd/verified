@@ -28,6 +28,15 @@ pub enum ModelExit<P: Payload> {
     Failed(ModelFault),
 }
 
+/// How a summarize call ended.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[verifier::external_derive]
+pub enum Summary<P: Payload> {
+    /// The model wrote this summary.
+    Written(Measured<P::Text>),
+    Failed(ModelFault),
+}
+
 /// The rules the shell read for `Core::resume`, with the text of the file
 /// they came from (`None`: there is no rules file, so the default rules).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -62,6 +71,10 @@ pub enum Event<P: Payload> {
     ToolDone { id: EffectId, exit: Exit, output: Measured<P::Output> },
     /// A `Sleep` effect ended.
     Woke { id: EffectId },
+    /// The user asked to compact the model's history (`/compact`).
+    Compact,
+    /// A `Summarize` effect ended.
+    Summarized { id: EffectId, summary: Summary<P> },
     /// The deadline of run `id` (a call's or a task's) passed: v stops
     /// waiting. A timeout is v cancelling at a deadline, so a run still
     /// unresolved is `Unknown` and asked to stop; one that already reported

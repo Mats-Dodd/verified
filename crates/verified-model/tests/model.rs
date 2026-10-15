@@ -3,11 +3,11 @@
 //! in the shell is caught. Then paths through the model replayed as traces.
 
 use stateright::{Checker as _, Expectation, Model as _};
-use verified_core::{Event, ModelExit, Verdict};
+use verified_core::{Event, ModelExit, Summary, Verdict};
 use verified_domain::{
     Abstract, ActorId, Body, CallId, EffectId, Epoch, Exit, Failure, Limit, Limits, Measured,
-    MessageId, Proposal, Record, Request, Shape, StepId, Tool, TurnId, TurnOutcome, Unit,
-    UnixMillis, Unstarted,
+    MessageId, ModelFault, Proposal, Record, Request, Shape, StepId, Tool, TurnId, TurnOutcome,
+    Unit, UnixMillis, Unstarted,
 };
 use verified_model::coverage::{self, Class, Key, Phase, Resolved, Situation, explore};
 use verified_model::replay::Divergence;
@@ -625,6 +625,54 @@ fn a_stop_before_its_childs_birth_is_caught() {
     );
 }
 
+#[test]
+fn compactions_between_turns_and_at_the_first_step() {
+    check(
+        suite::compactions_between_turns_and_at_the_first_step(),
+        &[
+            "an idle compaction lands",
+            "a compaction is superseded",
+            "a forced compaction lets its turn go on",
+            "a turn is cancelled",
+        ],
+    );
+}
+
+#[test]
+fn a_compaction_after_tools() {
+    check(
+        suite::a_compaction_after_tools(),
+        &[
+            "a tool runs",
+            "a forced compaction lets its turn go on",
+            "a turn is cancelled",
+        ],
+    );
+}
+
+#[test]
+fn compact_between_turns() {
+    check(
+        suite::compact_between_turns(),
+        &[
+            "an idle compaction lands",
+            "a forced compaction lets its turn go on",
+        ],
+    );
+}
+
+#[test]
+fn compactions_across_crashes() {
+    check(
+        suite::compactions_across_crashes(),
+        &[
+            "an idle compaction lands",
+            "a compaction is superseded",
+            "a forced compaction lets its turn go on",
+        ],
+    );
+}
+
 /// Follows `path` from the initial state: each action must be one the
 /// model enables where it is taken, and every safety property must hold
 /// after it. Returns the state reached.
@@ -795,7 +843,13 @@ fn a_trace_carries_real_ids_and_sizes() {
             },
         },
     };
-    let run = |first: u64, second: u64| {
+    // Past the bound, the beat compacts first (its cut is record 12, after
+    // the read's result); a summarize call that fails parks the actor.
+    let summarize = EffectId {
+        epoch: Epoch(1),
+        seq: 12,
+    };
+    let run = |first: u64, second: u64, tail: &[Action]| {
         let parts = |bytes: u64| {
             Action::Deliver(
                 0,
@@ -832,6 +886,7 @@ fn a_trace_carries_real_ids_and_sizes() {
             ),
             Action::Sync(0),
         ];
+        let path: Vec<Action> = path.iter().chain(tail).cloned().collect();
         follow(&Harness::trace(Limits::v0(), events(&path)), &path)
             .root()
             .log
@@ -846,12 +901,27 @@ fn a_trace_carries_real_ids_and_sizes() {
             }
         })
     };
-    assert_eq!(
-        ended(&run(300_000, 299_000)),
-        Some(TurnOutcome::Failed(Failure::Limit(Limit::Context))),
-        "2 kB of text, 599 kB of parts and 4 kB of output pass 600 kB"
+    let failed = [
+        Action::Deliver(
+            0,
+            Event::Summarized {
+                id: summarize,
+                summary: Summary::Failed(ModelFault::Other),
+            },
+        ),
+        Action::Sync(0),
+    ];
+    let full = run(300_000, 299_000, &failed);
+    assert!(
+        full.contains(&Record::CompactionStarted { through: 12 }),
+        "2 kB of text, 599 kB of parts and 4 kB of output pass 600 kB: {full:?}"
     );
-    let small = run(1, 1);
+    assert_eq!(
+        ended(&full),
+        Some(TurnOutcome::Failed(Failure::Limit(Limit::Context))),
+        "no summary made room"
+    );
+    let small = run(1, 1, &[]);
     assert_eq!(ended(&small), None, "the turn goes on");
     assert!(
         small.contains(&Record::StepStarted {

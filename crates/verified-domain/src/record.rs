@@ -8,8 +8,10 @@
 //! proposed), each call's `Approved`, `Dispatched` and `ToolResult`, and
 //! finally exactly one `TurnEnded`. A background call's `Dispatched` starts
 //! a task, as a `StopSent` does; `TaskEnded` ends it and is its
-//! notification. Records are never changed once written. JSON shape: one
-//! object per line, internally tagged by `"type"`.
+//! notification. A compaction is `CompactionStarted` (the cut) and, once
+//! the summary is written, `Compacted`; neither removes anything from the
+//! log: only what the model is sent shrinks. Records are never changed once
+//! written. JSON shape: one object per line, internally tagged by `"type"`.
 
 use vstd::prelude::*;
 
@@ -209,6 +211,16 @@ pub enum TurnOutcome {
     Failed(Failure),
 }
 
+/// What the actor still has open when its history is compacted, written
+/// from the core's state, never by the model: its running tasks and the
+/// children it spawned. Rendered beside the summary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[verifier::external_derive]
+pub struct OpenWork {
+    pub tasks: Vec<TaskId>,
+    pub children: Vec<ActorId>,
+}
+
 /// A fact in the log.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
@@ -264,6 +276,14 @@ pub enum Record<P: Payload> {
     TurnEnded { turn: TurnId, outcome: TurnOutcome },
     /// The daemon recovered; effects from earlier epochs are stale.
     EpochBumped { epoch: Epoch },
+    /// Model history compaction begins. The cut is `through`, this
+    /// record's own seq: everything the model has consumed, at a beat. It is
+    /// durable before the summarize call (T1); unread mail is after it.
+    CompactionStarted { through: u64 },
+    /// The summarize call of the `CompactionStarted` at `started` wrote
+    /// `summary`. From here the model is sent the summary and `open`, then
+    /// what follows the cut. Written only when the call succeeds.
+    Compacted { started: u64, summary: Measured<P::Text>, open: OpenWork },
 }
 
 } // verus!
@@ -308,7 +328,9 @@ where
             | Record::StepReset { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         };
         (record, call)
     })

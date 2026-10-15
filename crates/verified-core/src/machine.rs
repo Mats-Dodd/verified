@@ -63,6 +63,12 @@
 //!   once; a step carries exactly the batch at the head of the mailbox, and
 //!   only at a step boundary, once every call of the step before resolved
 //!   (`lemma_carried_at_boundaries`, T4).
+//! - model history compaction: a cut is always now, at a beat, with every
+//!   call resolved (`lemma_cut_is_now`); neither of its records touches the
+//!   mailbox or what was carried, so unread mail is never inside a cut
+//!   (`lemma_cut_keeps_mail`, T4); and a summarize call starts only once
+//!   its own `CompactionStarted`, the live compaction, is durable
+//!   (`summarize_ok`, T1).
 //!
 //! Model-checked or tested, not proved (Stateright, `verified-model`, and
 //! the scenario tests in `tests/turns.rs` and `tests/actors.rs`):
@@ -111,14 +117,15 @@ use verified_domain::rules::RuleView;
 use verified_domain::shape::ShapeView;
 use verified_domain::{
     ActorId, ActorName, Address, Body, Born, CallId, CallIx, Class, EffectId, Envelope, EnvelopeId,
-    Epoch, Exit, Failure, Grant, Limit, Limits, Measured, Millis, ModelFault, Payload, Proposal,
-    Record, Request, Reset, Rules, Shape, StepId, TaskId, Tool, TurnId, TurnOutcome, Unstarted,
+    Epoch, Exit, Failure, Grant, Limit, Limits, Measured, Millis, ModelFault, OPEN_ENTRY_BYTES,
+    OpenWork, Payload, Proposal, Record, Request, Reset, Rules, Shape, StepId, TaskId, Tool,
+    TurnId, TurnOutcome, Unstarted,
 };
 
 use crate::effect::{self, Decision, Effect, Outcome, Rejection};
 #[cfg(verus_only)]
 use crate::effect::{Approved, ToolCall};
-use crate::event::{Event, Loaded, ModelExit, Verdict};
+use crate::event::{Event, Loaded, ModelExit, Summary, Verdict};
 use crate::mailbox::{self, Waiting};
 #[cfg(verus_only)]
 use crate::mailbox::{held, ids_of, is_batch};
@@ -155,6 +162,39 @@ pub enum Stage {
     Backoff { since: u64, reset: Reset },
     /// The model finished the step; its calls are being resolved.
     Tools,
+    /// The model's history is being compacted at a beat, its cut the
+    /// `CompactionStarted` at `since`; `Compacted` returns to `then`.
+    Compacting { since: u64, then: Then },
+}
+
+/// The beat a compaction inside a turn returns to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[verifier::external_derive]
+pub enum Then {
+    /// The turn's first step is next.
+    Starting,
+    /// The next step after the calls of the last one.
+    Tools,
+}
+
+/// The stage `then` names.
+pub open spec fn spec_stage(then: Then) -> Stage {
+    match then {
+        Then::Starting => Stage::Starting,
+        Then::Tools => Stage::Tools,
+    }
+}
+
+impl Then {
+    const fn stage(self) -> (stage: Stage)
+        ensures
+            stage == spec_stage(self),
+    {
+        match self {
+            Then::Starting => Stage::Starting,
+            Then::Tools => Stage::Tools,
+        }
+    }
 }
 
 /// Whether the user asked the running turn to stop.
@@ -261,6 +301,9 @@ pub struct CoreView {
     pub tasks: Seq<Task>,
     /// Every actor a dispatched `spawn` names: the stop cascade's targets.
     pub children: Seq<ActorId>,
+    /// The seq of the `CompactionStarted` of a compaction between turns,
+    /// until its `Compacted` or a turn supersedes it.
+    pub compacting: Option<u64>,
 }
 
 /// Approve before dispatch, at most once each, and only a valid request.
@@ -316,11 +359,9 @@ pub open spec fn turn_ok(view: CoreView) -> bool {
             &&& open.first_call <= view.calls.len()
             &&& match open.stage {
                 Stage::Tools => resolved(view.calls, 0, open.first_call as int),
-                Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } => resolved(
-                    view.calls,
-                    0,
-                    view.calls.len() as int,
-                ),
+                Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Compacting {
+                    ..
+                } => resolved(view.calls, 0, view.calls.len() as int),
             }
         },
     }
@@ -334,7 +375,7 @@ pub open spec fn turn_ok(view: CoreView) -> bool {
 pub open spec fn actor_ok(view: CoreView) -> bool {
     let ids = held(view.consumed, view.mailbox);
     &&& match view.turn {
-        Turn::Open(open) => open.stage is Starting ==> view.mailbox.len() > 0,
+        Turn::Open(open) => awaits_mail(open.stage) ==> view.mailbox.len() > 0,
         Turn::Idle => true,
     }
     &&& forall|at: int| 0 <= at < view.tasks.len() ==> (#[trigger] view.tasks[at]).seq < view.seq
@@ -343,6 +384,15 @@ pub open spec fn actor_ok(view: CoreView) -> bool {
         #[trigger] view.tasks[second]).seq
     &&& ids.no_duplicates()
     &&& forall|at: int| 0 <= at < ids.len() ==> held_ok(view, #[trigger] ids[at])
+}
+
+/// A stage whose next step is the turn's first: it carries mail.
+pub open spec fn awaits_mail(stage: Stage) -> bool {
+    match stage {
+        Stage::Starting => true,
+        Stage::Compacting { then, .. } => then is Starting,
+        Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools => false,
+    }
 }
 
 /// Where an envelope the actor holds came from: a delivery, or the end of
@@ -389,6 +439,7 @@ pub open spec fn initial() -> CoreView {
         calls: Seq::empty(),
         tasks: Seq::empty(),
         children: Seq::empty(),
+        compacting: None,
     }
 }
 
@@ -523,7 +574,7 @@ pub open spec fn carries_fit(stage: Stage, mailbox: Seq<Waiting>, carries: Seq<E
             mailbox,
             carries.len() as int,
         ),
-        Stage::Model { .. } => false,
+        Stage::Model { .. } | Stage::Compacting { .. } => false,
     }
 }
 
@@ -624,6 +675,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                             },
                         ),
                         calls: Seq::empty(),
+                        compacting: None,
                         ..view
                     },
                 )
@@ -663,7 +715,7 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
                         } else {
                             None
                         },
-                        Stage::Model { .. } => None,
+                        Stage::Model { .. } | Stage::Compacting { .. } => None,
                     };
                     match retries {
                         Some(retries) => Some(
@@ -883,6 +935,70 @@ pub open spec fn spec_apply<P: Payload>(view: CoreView, record: Record<P>) -> Op
         } else {
             None
         },
+        Record::CompactionStarted { through } => if through == view.seq && !view.stopped {
+            match view.turn {
+                Turn::Idle => if view.actor is Some {
+                    Some(CoreView { seq, compacting: Some(view.seq), ..view })
+                } else {
+                    None
+                },
+                Turn::Open(open) => {
+                    let then = match open.stage {
+                        Stage::Starting => Some(Then::Starting),
+                        Stage::Tools => Some(Then::Tools),
+                        Stage::Compacting { then, .. } => Some(then),
+                        Stage::Model { .. } | Stage::Backoff { .. } => None,
+                    };
+                    match then {
+                        Some(then) => if open.intent is Proceed && resolved(
+                            view.calls,
+                            0,
+                            view.calls.len() as int,
+                        ) {
+                            Some(
+                                CoreView {
+                                    seq,
+                                    turn: Turn::Open(
+                                        Open { stage: Stage::Compacting { since: view.seq, then }, ..open },
+                                    ),
+                                    ..view
+                                },
+                            )
+                        } else {
+                            None
+                        },
+                        None => None,
+                    }
+                },
+            }
+        } else {
+            None
+        },
+        Record::Compacted { started, .. } => if view.stopped {
+            None
+        } else {
+            match view.turn {
+                Turn::Idle => if view.compacting == Some(started) {
+                    Some(CoreView { seq, compacting: None, ..view })
+                } else {
+                    None
+                },
+                Turn::Open(open) => match open.stage {
+                    Stage::Compacting { since, then } => if since == started && open.intent is Proceed {
+                        Some(
+                            CoreView {
+                                seq,
+                                turn: Turn::Open(Open { stage: spec_stage(then), ..open }),
+                                ..view
+                            },
+                        )
+                    } else {
+                        None
+                    },
+                    Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools => None,
+                },
+            }
+        },
     }
 }
 
@@ -993,11 +1109,38 @@ pub open spec fn runs_ok<P: Payload>(
     forall|index: int| 0 <= index < effects.len() ==> effect_ok(start, end, #[trigger] effects[index], reruns)
 }
 
-/// `effect` is licensed, if it is a tool run or a stop.
+/// The seq of the `CompactionStarted` whose summary `view` waits for: the
+/// idle actor's, or the running turn's while it proceeds.
+pub open spec fn live_compaction(view: CoreView) -> Option<u64> {
+    match view.turn {
+        Turn::Idle => view.compacting,
+        Turn::Open(open) => match open.stage {
+            Stage::Compacting { since, .. } => if open.intent is Proceed {
+                Some(since)
+            } else {
+                None
+            },
+            Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools => None,
+        },
+    }
+}
+
+/// T1 for a summarize call: its cut, the `CompactionStarted` its id names,
+/// is one of the decision's own records, durable before it starts, and the
+/// live one, in the current epoch, of an actor not stopped.
+pub open spec fn summarize_ok(start: CoreView, end: CoreView, id: EffectId) -> bool {
+    &&& id.seq >= start.seq
+    &&& id.epoch.0 == end.epoch
+    &&& !end.stopped
+    &&& live_compaction(end) == Some(id.seq)
+}
+
+/// `effect` is licensed, if it is a tool run, a stop or a summarize call.
 pub open spec fn effect_ok<P: Payload>(start: CoreView, end: CoreView, effect: Effect<P>, reruns: bool) -> bool {
     match effect {
         Effect::RunTool { call } => run_ok(start, end, call, reruns),
         Effect::Stop { id, child } => stop_ok(start, end, id, child, reruns),
+        Effect::Summarize { id } => summarize_ok(start, end, id),
         _ => true,
     }
 }
@@ -1076,12 +1219,13 @@ pub open spec fn cancelled(view: CoreView, turn: TurnId) -> bool {
 }
 
 /// A record that starts something within a turn: a model call, a retry,
-/// an approval, a dispatch.
+/// an approval, a dispatch, a compaction.
 pub open spec fn starts<P: Payload>(record: Record<P>) -> bool {
     ||| record is StepStarted
     ||| record is StepReset
     ||| record is Approved
     ||| record is Dispatched
+    ||| record is CompactionStarted
 }
 
 /// C3, one record: once a cancel of the running turn is durable, nothing
@@ -1225,6 +1369,40 @@ pub proof fn lemma_carried_at_boundaries<P: Payload>(view: CoreView, record: Rec
 {
 }
 
+/// T4 across a compaction: neither of its records touches the mailbox,
+/// what was carried or the calls, so unread mail is never inside a cut and
+/// stays to be carried after it.
+pub proof fn lemma_cut_keeps_mail<P: Payload>(view: CoreView, record: Record<P>)
+    requires
+        record is CompactionStarted || record is Compacted,
+        spec_apply(view, record) is Some,
+    ensures
+        spec_apply(view, record)->0.mailbox == view.mailbox,
+        spec_apply(view, record)->0.consumed == view.consumed,
+        spec_apply(view, record)->0.calls == view.calls,
+{
+}
+
+/// The cut is now, at a beat: a `CompactionStarted` applies only at its
+/// own seq, with every call resolved (no tool use without its result
+/// inside the cut), between turns or at a step boundary of a turn that
+/// proceeds.
+pub proof fn lemma_cut_is_now<P: Payload>(view: CoreView, record: Record<P>)
+    requires
+        state_ok(view),
+        record is CompactionStarted,
+        spec_apply(view, record) is Some,
+    ensures
+        record->CompactionStarted_through == view.seq,
+        resolved(view.calls, 0, view.calls.len() as int),
+        match view.turn {
+            Turn::Open(open) => open.intent is Proceed && (open.stage is Starting || open.stage is Tools
+                || open.stage is Compacting),
+            Turn::Idle => true,
+        },
+{
+}
+
 /// The batch at the head of a mailbox has one size.
 pub proof fn lemma_batch_unique(mailbox: Seq<Waiting>, first: int, second: int)
     requires
@@ -1272,7 +1450,7 @@ proof fn lemma_actor_frame(view: CoreView, next: CoreView)
         next.seq >= view.seq,
         forall|id: EnvelopeId| seen(view.envelopes, id) ==> seen(next.envelopes, id),
         match next.turn {
-            Turn::Open(open) => open.stage is Starting ==> next.mailbox.len() > 0,
+            Turn::Open(open) => awaits_mail(open.stage) ==> next.mailbox.len() > 0,
             Turn::Idle => true,
         },
     ensures
@@ -1413,6 +1591,25 @@ impl Context {
             Context::Exceeded => Context::Exceeded,
         }
     }
+
+    /// Past 80% of `bound`: the end of a turn compacts the history.
+    #[expect(clippy::integer_division, reason = "a fifth of the bound, rounded down: the threshold errs late by under 5 bytes")]
+    const fn over(self, bound: u64) -> bool {
+        match self {
+            Context::Within(size) => size > bound - bound / 5,
+            Context::Exceeded => true,
+        }
+    }
+
+    /// A conversation that starts over from a summary of `summary` bytes
+    /// and `open` entries of open work.
+    #[expect(clippy::as_conversions, reason = "a usize fits in a u64 on every target")]
+    const fn restart(summary: u64, open: usize, bound: u64) -> Context {
+        match (open as u64).checked_mul(OPEN_ENTRY_BYTES) {
+            Some(entries) => Context::Within(0).grow(summary, bound).grow(entries, bound),
+            None => Context::Exceeded,
+        }
+    }
 }
 
 struct Call<P: Payload> {
@@ -1525,6 +1722,10 @@ pub enum Violation {
     /// for a dispatched call, anything but `NotStarted` for an undispatched
     /// one, or a run's report for a call never dispatched.
     WrongResult,
+    /// A compaction's cut is not its own record: the cut is always now.
+    WrongCut,
+    /// A summary for a compaction that is not the live one.
+    NotCompacting,
 }
 
 /// A record `apply` refused, and its position in the log.
@@ -1578,6 +1779,8 @@ pub struct Core<P: Payload> {
     runs: Vec<Option<TaskRun<P>>>,
     /// Every actor a dispatched `spawn` names.
     children: Vec<ActorId>,
+    /// The seq of a compaction between turns awaiting its summary.
+    compacting: Option<u64>,
 }
 
 impl<P: Payload> View for Core<P> {
@@ -1612,6 +1815,7 @@ impl<P: Payload> View for Core<P> {
             calls: self.ledger@,
             tasks: self.tasks@,
             children: self.children@,
+            compacting: self.compacting,
         }
     }
 }
@@ -1690,7 +1894,7 @@ impl<P: Payload> Plan<P> {
         &&& self.from == self.start@.seq
         &&& forall|index: int|
             0 <= index < self.effects@.len() ==> !((#[trigger] self.effects@[index]) is RunTool) && !(
-            self.effects@[index] is Stop)
+            self.effects@[index] is Stop) && !(self.effects@[index] is Summarize)
         &&& forall|index: int|
             0 <= index < self.records@.len() && given(#[trigger] self.records@[index]) ==> index == 0
                 && self.given@ == Some(self.records@[index])
@@ -1726,13 +1930,14 @@ impl<P: Payload> Plan<P> {
         seq
     }
 
-    /// Adds an effect that is neither a tool run nor a stop (those come
-    /// from `finish`).
+    /// Adds an effect that is neither a tool run, a stop nor a summarize
+    /// call (those come from `finish`).
     fn effect(&mut self, effect: Effect<P>)
         requires
             old(self).inv(),
             !(effect is RunTool),
             !(effect is Stop),
+            !(effect is Summarize),
         ensures
             final(self).inv(),
             final(self).start == old(self).start,
@@ -1745,6 +1950,21 @@ impl<P: Payload> Plan<P> {
 
     const fn id(&self, seq: u64) -> EffectId {
         EffectId { epoch: self.scratch.epoch, seq }
+    }
+
+    /// How the turn the decision ended ended, if it ended one.
+    fn ended(&self) -> Option<TurnOutcome> {
+        let mut ended = None;
+        let mut index: usize = 0;
+        while index < self.records.len()
+            decreases self.records@.len() - index,
+        {
+            if let Record::TurnEnded { outcome, .. } = &self.records[index] {
+                ended = Some(*outcome);
+            }
+            index += 1;
+        }
+        ended
     }
 
     /// The running turn on the scratch copy.
@@ -1877,8 +2097,8 @@ impl<P: Payload> Plan<P> {
         }
     }
 
-    /// Starts every effect the decision licenses (tool runs, task runs and
-    /// stops) and hands the decision over.
+    /// Starts every effect the decision licenses (tool runs, task runs,
+    /// stops and a summarize call) and hands the decision over.
     fn finish(self, outcome: Outcome, runs: Runs) -> (decision: Decision<P>)
         requires
             self.inv(),
@@ -1903,6 +2123,7 @@ impl<P: Payload> Plan<P> {
         };
         plan.start_calls(runs);
         plan.start_tasks(runs);
+        plan.start_summary(runs);
         Decision { records: plan.records, effects: plan.effects, outcome }
     }
 
@@ -2019,6 +2240,43 @@ impl<P: Payload> Plan<P> {
                 }
             }
             index += 1;
+        }
+    }
+
+    /// Starts the summarize call of the live compaction, if the decision
+    /// started it: its `CompactionStarted` is one of the decision's own
+    /// records (T1). One a crash cut short is started again by `resume`
+    /// under a new `CompactionStarted`, never rerun.
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    #[cfg_attr(not(verus_keep_ghost), expect(unused_variables, reason = "ghost argument: read only by the proofs, erased in plain builds"))]
+    fn start_summary(&mut self, runs: Runs)
+        requires
+            old(self).started(runs is All),
+        ensures
+            final(self).started(runs is All),
+            final(self).start == old(self).start,
+            final(self).given == old(self).given,
+            final(self).records@ == old(self).records@,
+            final(self).scratch@ == old(self).scratch@,
+            final(self).from == old(self).from,
+    {
+        if self.scratch.stopped {
+            return;
+        }
+        let live = match self.scratch.turn {
+            Turn::Idle => self.scratch.compacting,
+            Turn::Open(open) => match (open.stage, open.intent) {
+                (Stage::Compacting { since, .. }, Intent::Proceed) => Some(since),
+                (Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools, _)
+                | (Stage::Compacting { .. }, Intent::Cancel) => None,
+            },
+        };
+        let ghost reruns = runs is All;
+        if let Some(seq) = live {
+            if seq >= self.from {
+                let id = EffectId { epoch: self.scratch.epoch, seq };
+                self.start(Effect::Summarize { id }, Ghost(reruns));
+            }
         }
     }
 
@@ -2188,6 +2446,7 @@ impl<P: Payload> Core<P> {
             tasks: Vec::new(),
             runs: Vec::new(),
             children: Vec::new(),
+            compacting: None,
         };
         assert(core@.calls =~= initial().calls);
         assert(core@.envelopes =~= initial().envelopes);
@@ -2329,6 +2588,7 @@ impl<P: Payload> Core<P> {
             tasks: copy_of(self.tasks.as_slice()),
             runs,
             children: copy_of(self.children.as_slice()),
+            compacting: self.compacting,
         };
         proof {
             assert forall|at: int| 0 <= at < copy.calls@.len() implies mirrors(
@@ -2621,6 +2881,23 @@ impl<P: Payload> Core<P> {
         }
     }
 
+    /// What the actor has open, for a `Compacted`: its running tasks and
+    /// the children it spawned, from its own state, never the model's.
+    fn open_work(&self) -> OpenWork {
+        let mut tasks: Vec<TaskId> = Vec::new();
+        let mut at: usize = 0;
+        while at < self.tasks.len()
+            decreases self.tasks@.len() - at,
+        {
+            let task = self.tasks[at];
+            if !task.ended && matches!(task.origin, Origin::Call { .. }) {
+                tasks.push(TaskId(task.seq));
+            }
+            at += 1;
+        }
+        OpenWork { tasks, children: copy_of(self.children.as_slice()) }
+    }
+
     /// `apply` of `StepFinished { step, calls }`.
     #[expect(clippy::manual_map, reason = "Verus has no closures, so no `Option::map`")]
     #[expect(clippy::ptr_arg, reason = "the specification names the record's own `Vec`")]
@@ -2825,6 +3102,7 @@ impl<P: Payload> Core<P> {
         });
         self.calls.clear();
         self.ledger = Ghost(Seq::empty());
+        self.compacting = None;
         self.seq = next;
         assert(self@.calls =~= spec_apply(old(self)@, Record::<P>::TurnStarted { turn })->0.calls);
         Ok(())
@@ -2858,7 +3136,7 @@ impl<P: Payload> Core<P> {
             Stage::Backoff { .. } => count == 0,
             Stage::Starting => count > 0 && batch == count && mailbox::heads(carries.as_slice(), self.mailbox.as_slice()),
             Stage::Tools => batch == count && mailbox::heads(carries.as_slice(), self.mailbox.as_slice()),
-            Stage::Model { .. } => false,
+            Stage::Model { .. } | Stage::Compacting { .. } => false,
         };
         proof {
             if is_batch(self@.mailbox, count as int) {
@@ -2890,7 +3168,7 @@ impl<P: Payload> Core<P> {
                 }
                 0
             },
-            Stage::Model { .. } => return self.refuse(Violation::WrongStage),
+            Stage::Model { .. } | Stage::Compacting { .. } => return self.refuse(Violation::WrongStage),
         };
         proof {
             lemma_actor_keeps(self@, Record::<P>::StepStarted { step, carries: *carries });
@@ -3147,36 +3425,7 @@ impl<P: Payload> Core<P> {
                 self.seq = next;
                 Ok(())
             },
-            Record::StepReset { step, reason } => {
-                let open = self.open()?;
-                if !(matches!(open.stage, Stage::Model { .. })) {
-                    return self.refuse(Violation::WrongStage);
-                }
-                if matches!(open.intent, Intent::Cancel) {
-                    return self.refuse(Violation::Cancelling);
-                }
-                if self.stopped {
-                    return self.refuse(Violation::Stopped);
-                }
-                if !step.same(open.step) {
-                    return self.refuse(Violation::WrongStep);
-                }
-                let retries = match reason {
-                    Reset::Retry { .. } => {
-                        if open.retries == usize::MAX {
-                            return self.refuse(Violation::Overflow);
-                        }
-                        open.retries + 1
-                    },
-                    Reset::Restart => open.retries,
-                };
-                self.turn = Turn::Open(
-                    Open { retries, stage: Stage::Backoff { since: self.seq, reset: *reason }, ..open },
-                );
-                self.context = self.step_base;
-                self.seq = next;
-                Ok(())
-            },
+            Record::StepReset { step, reason } => self.apply_step_reset(*step, *reason),
             Record::StepFinished { step, calls } => self.apply_step_finished(*step, calls),
             Record::Approved { call, by } => self.apply_approved(*call, *by),
             Record::Dispatched { call } => self.apply_dispatched(*call),
@@ -3229,7 +3478,162 @@ impl<P: Payload> Core<P> {
                 self.seq = next;
                 Ok(())
             },
+            Record::CompactionStarted { through } => self.apply_compaction_started(*through),
+            Record::Compacted { started, summary, open } => self.apply_compacted(*started, summary, open),
         }
+    }
+
+    /// `apply` of `Compacted { started, summary, open }`. The conversation
+    /// starts over from the summary and the open work.
+    const fn apply_compacted(&mut self, started: u64, summary: &Measured<P::Text>, open: &OpenWork) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::Compacted { started, summary: *summary, open: *open }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        match self.turn {
+            Turn::Idle => {
+                let live = match self.compacting {
+                    Some(seq) => seq == started,
+                    None => false,
+                };
+                if !live {
+                    return self.refuse(Violation::NotCompacting);
+                }
+                proof {
+                    lemma_actor_keeps(self@, Record::<P>::Compacted { started, summary: *summary, open: *open });
+                };
+                self.compacting = None;
+            },
+            Turn::Open(running) => {
+                let (since, then) = match running.stage {
+                    Stage::Compacting { since, then } => (since, then),
+                    Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools => {
+                        return self.refuse(Violation::NotCompacting);
+                    },
+                };
+                if since != started {
+                    return self.refuse(Violation::NotCompacting);
+                }
+                if matches!(running.intent, Intent::Cancel) {
+                    return self.refuse(Violation::Cancelling);
+                }
+                proof {
+                    lemma_actor_keeps(self@, Record::<P>::Compacted { started, summary: *summary, open: *open });
+                };
+                self.turn = Turn::Open(Open { stage: then.stage(), ..running });
+            },
+        }
+        let entries = open.tasks.len().saturating_add(open.children.len());
+        self.context = Context::restart(summary.bytes, entries, self.limits.context_bytes());
+        self.step_base = self.context;
+        self.seq = next;
+        Ok(())
+    }
+
+    /// `apply` of `StepReset { step, reason }`: the attempt's output no
+    /// longer counts.
+    fn apply_step_reset(&mut self, step: StepId, reason: Reset) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::StepReset { step, reason }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        let open = self.open()?;
+        if !(matches!(open.stage, Stage::Model { .. })) {
+            return self.refuse(Violation::WrongStage);
+        }
+        if matches!(open.intent, Intent::Cancel) {
+            return self.refuse(Violation::Cancelling);
+        }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        if !step.same(open.step) {
+            return self.refuse(Violation::WrongStep);
+        }
+        let retries = match reason {
+            Reset::Retry { .. } => {
+                if open.retries == usize::MAX {
+                    return self.refuse(Violation::Overflow);
+                }
+                open.retries + 1
+            },
+            Reset::Restart => open.retries,
+        };
+        proof {
+            lemma_actor_keeps(self@, Record::<P>::StepReset { step, reason });
+        };
+        self.turn = Turn::Open(
+            Open { retries, stage: Stage::Backoff { since: self.seq, reset: reason }, ..open },
+        );
+        self.context = self.step_base;
+        self.seq = next;
+        Ok(())
+    }
+
+    /// `apply` of `CompactionStarted { through }`.
+    fn apply_compaction_started(&mut self, through: u64) -> (applied: Result<(), Corrupt>)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            match spec_apply(old(self)@, Record::<P>::CompactionStarted { through }) {
+                Some(next) => applied is Ok && final(self)@ == next,
+                None => applied is Err && final(self)@ == old(self)@,
+            },
+    {
+        let next = bump(self.seq);
+        if through != self.seq {
+            return self.refuse(Violation::WrongCut);
+        }
+        if self.stopped {
+            return self.refuse(Violation::Stopped);
+        }
+        match self.turn {
+            Turn::Idle => {
+                if self.born.is_none() {
+                    return self.refuse(Violation::Unborn);
+                }
+                proof {
+                    lemma_actor_keeps(self@, Record::<P>::CompactionStarted { through });
+                };
+                self.compacting = Some(self.seq);
+            },
+            Turn::Open(open) => {
+                let then = match open.stage {
+                    Stage::Starting => Then::Starting,
+                    Stage::Tools => Then::Tools,
+                    Stage::Compacting { then, .. } => then,
+                    Stage::Model { .. } | Stage::Backoff { .. } => return self.refuse(Violation::WrongStage),
+                };
+                if matches!(open.intent, Intent::Cancel) {
+                    return self.refuse(Violation::Cancelling);
+                }
+                if !self.all_resolved(0) {
+                    return self.refuse(Violation::Unresolved);
+                }
+                proof {
+                    lemma_actor_keeps(self@, Record::<P>::CompactionStarted { through });
+                };
+                self.turn = Turn::Open(Open { stage: Stage::Compacting { since: self.seq, then }, ..open });
+            },
+        }
+        self.seq = next;
+        Ok(())
     }
 
     /// Rebuilds the state a log describes by applying it record by record.
@@ -3298,8 +3702,10 @@ impl<P: Payload> Core<P> {
     /// Starts model call `index` of `turn`, carrying the batch at the head
     /// of the mailbox (nothing, for a retry), unless a bound says the turn
     /// is over. The index is widened, so the step after the last `u32` is
-    /// past the bound too.
-    fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64)
+    /// past the bound too. When the step would not fit the context, a beat
+    /// (`may_compact`: not a retry, and not right after a compaction)
+    /// compacts the history instead; the step starts once it is written.
+    fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64, may_compact: bool)
         requires
             old(plan).inv(),
             may_start(old(plan).scratch@, turn, index as int),
@@ -3316,7 +3722,9 @@ impl<P: Payload> Core<P> {
         };
         let count = match open.stage {
             Stage::Backoff { .. } => 0,
-            Stage::Starting | Stage::Model { .. } | Stage::Tools => mailbox::batch(plan.scratch.mailbox.as_slice()),
+            Stage::Starting | Stage::Model { .. } | Stage::Tools | Stage::Compacting { .. } => mailbox::batch(
+                plan.scratch.mailbox.as_slice(),
+            ),
         };
         proof {
             if !(open.stage is Backoff) {
@@ -3327,7 +3735,11 @@ impl<P: Payload> Core<P> {
         if index >= u64::from(self.limits.steps_per_turn()) {
             plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
         } else if matches!(plan.scratch.context.grow(bytes, self.limits.context_bytes()), Context::Exceeded) {
-            plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
+            if may_compact && matches!(open.stage, Stage::Starting | Stage::Tools) {
+                plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
+            } else {
+                plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
+            }
         } else {
             #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "Verus proves the index is below steps_per_turn, a u32")]
             let step = StepId { turn, index: index as u32 };
@@ -3361,7 +3773,36 @@ impl<P: Payload> Core<P> {
         let turn = TurnId(plan.scratch.seq);
         plan.emit(Record::TurnStarted { turn });
         assert(resolved(plan.scratch@.calls, 0, plan.scratch@.calls.len() as int));
-        self.start_step(plan, turn, 0);
+        self.start_step(plan, turn, 0, true);
+    }
+
+    /// Compaction at the end of a turn: when this decision ended a turn
+    /// (other than at a full context, which a compaction just failed to
+    /// cure) and left the conversation past 80% of `context_bytes`, the
+    /// idle actor with no mail compacts its history now. Mail that waits
+    /// starts a turn instead, whose beat compacts if it must.
+    fn after_turn(&self, plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+    {
+        if plan.open().is_some() || plan.scratch.live().is_none() || plan.scratch.mailbox.len() > 0 {
+            return;
+        }
+        let Some(ended) = plan.ended() else {
+            return;
+        };
+        if matches!(ended, TurnOutcome::Failed(Failure::Limit(Limit::Context))) {
+            return;
+        }
+        if plan.scratch.context.over(self.limits.context_bytes()) {
+            plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
+        }
     }
 
     /// Moves the current step's calls forward: cancels and stops, calls
@@ -3495,7 +3936,7 @@ impl<P: Payload> Core<P> {
                     } else if count == open.first_call {
                         plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Completed });
                     } else {
-                        self.start_step(plan, open.turn, u64::from(open.step.index) + 1);
+                        self.start_step(plan, open.turn, u64::from(open.step.index) + 1, true);
                     }
                 },
             }
@@ -3503,7 +3944,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// Dispatches approved call `index`. A background call past
-    /// `Limits::tasks_per_actor` does not start. Once dispatched, a
+    /// `Limits::tasks_per_actor` does not start, nor a `spawn` past
+    /// `Limits::children_per_actor`. Once dispatched, a
     /// background call resolves `Ok` (its task runs on: no turn waits for
     /// it, P1), and a `cancel` is done at once by the core.
     fn dispatch(&self, plan: &mut Plan<P>, index: usize)
@@ -3532,6 +3974,10 @@ impl<P: Payload> Core<P> {
             None => (false, None),
         };
         if background && plan.scratch.tasks.len() >= self.limits.tasks_per_actor() {
+            plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
+            return;
+        }
+        if plan.scratch.calls[index].spawns() && plan.scratch.children.len() >= self.limits.children_per_actor() {
             plan.resolve(index, Exit::NotStarted(Unstarted::Limit));
             return;
         }
@@ -3609,7 +4055,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// Revokes the running turn `turn`, whose cancel was just recorded:
-    /// nothing more starts, the model call in flight is stopped, each
+    /// nothing more starts, the model call or summarize call in flight is
+    /// stopped, each
     /// dispatched call is signalled once, and the turn ends once every call
     /// has resolved.
     #[verifier::loop_isolation(false)]
@@ -3632,7 +4079,7 @@ impl<P: Payload> Core<P> {
             Stage::Starting | Stage::Backoff { .. } => {
                 plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Cancelled });
             },
-            Stage::Model { since } => {
+            Stage::Model { since } | Stage::Compacting { since, .. } => {
                 let id = plan.id(since);
                 plan.effect(Effect::CancelModel { id });
             },
@@ -3745,9 +4192,8 @@ impl<P: Payload> Core<P> {
         }
     }
 
-    /// A stop was just delivered: revoke the running turn, the tasks, and
-    /// stop every child (C3).
-    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    /// A stop was just delivered: revoke the running turn (or stop a
+    /// compaction between turns), the tasks, and stop every child (C3).
     fn cascade(&self, plan: &mut Plan<P>)
         requires
             old(plan).inv(),
@@ -3759,11 +4205,19 @@ impl<P: Payload> Core<P> {
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
-        if let Some(open) = plan.open() {
-            if matches!(open.intent, Intent::Proceed) {
-                plan.emit(Record::CancelRequested { turn: open.turn });
-                self.revoke(plan, open.turn);
-            }
+        match plan.open() {
+            Some(open) => {
+                if matches!(open.intent, Intent::Proceed) {
+                    plan.emit(Record::CancelRequested { turn: open.turn });
+                    self.revoke(plan, open.turn);
+                }
+            },
+            None => {
+                if let Some(since) = plan.scratch.compacting {
+                    let id = plan.id(since);
+                    plan.effect(Effect::CancelModel { id });
+                }
+            },
         }
         Self::stop_tasks(plan);
         Self::stop_children(plan);
@@ -3790,7 +4244,108 @@ impl<P: Payload> Core<P> {
             Event::ToolDone { id, exit, output } => self.on_tool_done(id, exit, output),
             Event::Woke { id } => self.on_woke(id),
             Event::Expired { id } => self.on_expired(id),
+            Event::Compact => self.on_compact(),
+            Event::Summarized { id, summary } => self.on_summarized(id, summary),
         }
+    }
+
+    /// The user's `/compact`: compact the history between turns. Refused
+    /// while a turn runs: its beats compact it when they must.
+    fn on_compact(&self) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+            honest(Event::Compact, decision.records@),
+    {
+        if self.born.is_none() {
+            return quiet(Outcome::Rejected(Rejection::Unborn));
+        }
+        if self.stopped {
+            return quiet(Outcome::Rejected(Rejection::Stopped));
+        }
+        if matches!(self.turn, Turn::Open(_)) {
+            return quiet(Outcome::Rejected(Rejection::Running));
+        }
+        let mut plan = self.plan();
+        plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
+        plan.finish(Outcome::Accepted, Runs::New)
+    }
+
+    /// A summarize call ended. In a turn, its summary is recorded and the
+    /// step it made room for starts (or the turn fails at the full context,
+    /// and the actor parks: nothing starts another turn in this decision);
+    /// a failed one fails the turn so, and one under a cancel ends it
+    /// `Cancelled`. Between turns, a summary is recorded and unparks the
+    /// actor, and a failure changes nothing. A compaction a turn
+    /// superseded, or one before a crash, is stale.
+    fn on_summarized(&self, id: EffectId, result: Summary<P>) -> (decision: Decision<P>)
+        requires
+            self.wf(),
+        ensures
+            decided(self@, decision),
+            honest(Event::Summarized { id, summary: result }, decision.records@),
+    {
+        let mut plan = self.plan();
+        if let Some(open) = plan.open() {
+            let (since, then) = match open.stage {
+                Stage::Compacting { since, then } => (since, then),
+                Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Tools => {
+                    return quiet(Outcome::Stale);
+                },
+            };
+            if !id.same(EffectId { epoch: self.epoch, seq: since }) {
+                return quiet(Outcome::Stale);
+            }
+            match open.intent {
+                Intent::Cancel => {
+                    plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
+                },
+                Intent::Proceed => {
+                    if plan.scratch.stopped {
+                        // A torn stop: `resume` cancels the turn first, so
+                        // no decision reaches here.
+                        return quiet(Outcome::Stale);
+                    }
+                    match result {
+                        Summary::Written(summary) => {
+                            let open_work = plan.scratch.open_work();
+                            plan.emit(Record::Compacted { started: since, summary, open: open_work });
+                            let index = match then {
+                                Then::Starting => 0,
+                                Then::Tools => u64::from(open.step.index) + 1,
+                            };
+                            self.start_step(&mut plan, open.turn, index, false);
+                        },
+                        Summary::Failed(_) => {
+                            plan.emit(
+                                Record::TurnEnded {
+                                    turn: open.turn,
+                                    outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)),
+                                },
+                            );
+                        },
+                    }
+                },
+            }
+        } else {
+            let live = match plan.scratch.compacting {
+                Some(seq) => id.same(EffectId { epoch: self.epoch, seq }),
+                None => false,
+            };
+            if !live || plan.scratch.live().is_none() {
+                return quiet(Outcome::Stale);
+            }
+            match result {
+                Summary::Written(summary) => {
+                    let open_work = plan.scratch.open_work();
+                    plan.emit(Record::Compacted { started: id.seq, summary, open: open_work });
+                    self.begin(&mut plan);
+                },
+                Summary::Failed(_) => return quiet(Outcome::Accepted),
+            }
+        }
+        plan.finish(Outcome::Accepted, Runs::New)
     }
 
     fn on_born(&self, born: Born) -> (decision: Decision<P>)
@@ -3868,6 +4423,7 @@ impl<P: Payload> Core<P> {
             self.steer(&mut plan);
         }
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -3924,6 +4480,7 @@ impl<P: Payload> Core<P> {
         }
         self.settle(&mut plan);
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -3948,6 +4505,7 @@ impl<P: Payload> Core<P> {
         plan.emit(Record::CancelRequested { turn });
         self.revoke(&mut plan, turn);
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -3968,7 +4526,7 @@ impl<P: Payload> Core<P> {
                         None
                     }
                 },
-                Stage::Starting | Stage::Backoff { .. } | Stage::Tools => None,
+                Stage::Starting | Stage::Backoff { .. } | Stage::Tools | Stage::Compacting { .. } => None,
             },
             Turn::Idle => None,
         }
@@ -4071,6 +4629,7 @@ impl<P: Payload> Core<P> {
             },
         }
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.ask();
         plan.finish(Outcome::Accepted, Runs::New)
     }
@@ -4166,6 +4725,7 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4201,6 +4761,7 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4217,17 +4778,20 @@ impl<P: Payload> Core<P> {
         };
         let since = match open.stage {
             Stage::Backoff { since, .. } => since,
-            Stage::Starting | Stage::Model { .. } | Stage::Tools => return quiet(Outcome::Stale),
+            Stage::Starting | Stage::Model { .. } | Stage::Tools | Stage::Compacting { .. } => {
+                return quiet(Outcome::Stale);
+            },
         };
         if !id.same(EffectId { epoch: self.epoch, seq: since }) {
             return quiet(Outcome::Stale);
         }
         if matches!(open.intent, Intent::Proceed) && !plan.scratch.stopped {
-            self.start_step(&mut plan, open.turn, u64::from(open.step.index));
+            self.start_step(&mut plan, open.turn, u64::from(open.step.index), true);
         } else if matches!(open.intent, Intent::Cancel) {
             plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
         }
         self.begin(&mut plan);
+        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4242,7 +4806,8 @@ impl<P: Payload> Core<P> {
     /// where the log stops. A stop the crash tore is finished first. A dispatched call
     /// with no result is rerun if it is `Safe` or `Keyed` and becomes
     /// `Unknown` if it is `Unsafe`; so is a running task. A model call in
-    /// flight restarts its step; a backoff sleeps again. Like `decide`, the
+    /// flight restarts its step; a backoff sleeps again; a compaction whose
+    /// summary never came starts again. Like `decide`, the
     /// records apply and every effect is licensed by them.
     #[verifier::spinoff_prover]
     #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
@@ -4264,6 +4829,36 @@ impl<P: Payload> Core<P> {
         if let Some(Loaded { rules, file }) = load {
             plan.emit(Record::RulesLoaded { rules, file });
         }
+        self.resume_turn(&mut plan);
+        Self::resume_tasks(&mut plan);
+        // A compaction between turns the crash cut short starts again,
+        // unless mail waits: then a turn starts and supersedes it.
+        if plan.open().is_none() && plan.scratch.compacting.is_some() && plan.scratch.live().is_some()
+            && plan.scratch.mailbox.len() == 0 {
+            plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
+        }
+        if plan.scratch.stopped {
+            Self::stop_children(&mut plan);
+        }
+        self.begin(&mut plan);
+        self.after_turn(&mut plan);
+        plan.ask();
+        plan.finish(Outcome::Accepted, Runs::All)
+    }
+
+    /// `resume`'s part for the running turn: a stop the crash tore cancels
+    /// it first; then it picks up at its stage.
+    #[expect(clippy::collapsible_if, reason = "Verus does not parse `if let` chains")]
+    fn resume_turn(&self, plan: &mut Plan<P>)
+        requires
+            old(plan).inv(),
+        ensures
+            final(plan).inv(),
+            final(plan).start == old(plan).start,
+            final(plan).given == old(plan).given,
+            final(plan).from == old(plan).from,
+            final(plan).scratch@.epoch == old(plan).scratch@.epoch,
+    {
         if let Some(open) = plan.open() {
             if plan.scratch.stopped && matches!(open.intent, Intent::Proceed) {
                 plan.emit(Record::CancelRequested { turn: open.turn });
@@ -4271,33 +4866,33 @@ impl<P: Payload> Core<P> {
         }
         if let Some(open) = plan.open() {
             match (open.stage, open.intent) {
-                (Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. }, Intent::Cancel) => {
+                (
+                    Stage::Starting | Stage::Model { .. } | Stage::Backoff { .. } | Stage::Compacting { .. },
+                    Intent::Cancel,
+                ) => {
                     plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
                 },
+                (Stage::Compacting { .. }, Intent::Proceed) => {
+                    // A dangling start: compact again, under a new cut.
+                    plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
+                },
                 (Stage::Starting, Intent::Proceed) => {
-                    self.start_step(&mut plan, open.turn, 0);
+                    self.start_step(plan, open.turn, 0, true);
                 },
                 (Stage::Model { .. }, Intent::Proceed) => {
                     plan.emit(Record::StepReset { step: open.step, reason: Reset::Restart });
-                    self.start_step(&mut plan, open.turn, u64::from(open.step.index));
+                    self.start_step(plan, open.turn, u64::from(open.step.index), true);
                 },
                 (Stage::Backoff { since, reset }, Intent::Proceed) => {
                     let id = plan.id(since);
                     plan.effect(Effect::Sleep { id, delay: backoff(reset) });
                 },
                 (Stage::Tools, Intent::Proceed | Intent::Cancel) => {
-                    Self::resume_tools(&mut plan);
-                    self.settle(&mut plan);
+                    Self::resume_tools(plan);
+                    self.settle(plan);
                 },
             }
         }
-        Self::resume_tasks(&mut plan);
-        if plan.scratch.stopped {
-            Self::stop_children(&mut plan);
-        }
-        self.begin(&mut plan);
-        plan.ask();
-        plan.finish(Outcome::Accepted, Runs::All)
     }
 
     /// Resolves each dispatched call with no result that is not rerun: a
@@ -4451,7 +5046,7 @@ pub open spec fn may_start(view: CoreView, turn: TurnId, index: int) -> bool {
                 Stage::Starting => index == 0,
                 Stage::Backoff { .. } => index == open.step.index,
                 Stage::Tools => index == open.step.index + 1,
-                Stage::Model { .. } => false,
+                Stage::Model { .. } | Stage::Compacting { .. } => false,
             }
         },
         Turn::Idle => false,
@@ -4516,6 +5111,7 @@ impl<P: Payload> fmt::Debug for Core<P> {
             .field("tasks", &self.tasks)
             .field("runs", &self.runs)
             .field("children", &self.children)
+            .field("compacting", &self.compacting)
             .finish_non_exhaustive()
     }
 }
@@ -4539,6 +5135,7 @@ impl<P: Payload> PartialEq for Core<P> {
             && self.tasks == other.tasks
             && self.runs == other.runs
             && self.children == other.children
+            && self.compacting == other.compacting
     }
 }
 
@@ -4570,6 +5167,8 @@ impl fmt::Display for Violation {
             Self::UnknownTask => "no running task has that id",
             Self::WrongStop => "the stop is not one this actor may send",
             Self::WrongResult => "the result claims more than v knows of the call",
+            Self::WrongCut => "the compaction's cut is not its own record",
+            Self::NotCompacting => "no compaction with that cut awaits its summary",
         })
     }
 }

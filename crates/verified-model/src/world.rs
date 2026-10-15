@@ -54,6 +54,8 @@ pub enum Job {
         tool: Tool,
     },
     Sleep,
+    /// A summarize call: v's own, for a compaction of the history.
+    Summarize,
     /// A `Keyed` delivery into another actor's log. `to` is the
     /// recipient, when the world knows it (a trace names it only if the
     /// envelope ever landed); `call` is the call it carries out (none for
@@ -156,6 +158,8 @@ pub struct World {
     pub crashes: u8,
     pub interrupts: u8,
     pub duplicates: u8,
+    /// The user's `/compact`s.
+    pub compacts: u8,
     /// Answers given to calls not awaiting one.
     pub stale_answers: u8,
     pub client: Client,
@@ -186,6 +190,7 @@ impl World {
             crashes: 0,
             interrupts: 0,
             duplicates: 0,
+            compacts: 0,
             stale_answers: 0,
             client: Client {
                 cursor: Some(0),

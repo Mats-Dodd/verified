@@ -266,7 +266,9 @@ impl Builder {
             | Record::RulesLoaded { .. }
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
-            | Record::EpochBumped { .. } => {}
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
     }
 }
@@ -395,7 +397,9 @@ fn build(
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         })
         .unwrap_or_default();
     ModelRequest {

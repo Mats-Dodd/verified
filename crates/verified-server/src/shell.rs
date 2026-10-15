@@ -48,7 +48,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use verified_core::{
     Approved, Core, Corrupt, Decision, Effect, Event, Loaded, ModelExit, Outcome,
-    Rejection as CoreRejection, ToolCall, Verdict,
+    Rejection as CoreRejection, Summary, ToolCall, Verdict,
 };
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_domain::{
@@ -440,7 +440,10 @@ impl ActorHandle {
                 .into());
             }
             Outcome::Rejected(
-                CoreRejection::Mismatch | CoreRejection::UnknownCall | CoreRejection::NotRunning,
+                CoreRejection::Mismatch
+                | CoreRejection::UnknownCall
+                | CoreRejection::NotRunning
+                | CoreRejection::Running,
             )
             | Outcome::Stale => defect("a stop is accepted, a repeat, or refused"),
         };
@@ -778,7 +781,9 @@ impl Session {
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
                 | Record::TurnEnded { .. }
-                | Record::EpochBumped { .. } => None,
+                | Record::EpochBumped { .. }
+                | Record::CompactionStarted { .. }
+                | Record::Compacted { .. } => None,
             })
             .unwrap_or_else(|| defect("the rules in force are a RulesLoaded in the log"));
         (in_force != loaded.file.as_ref().map(|file| &file.body)).then_some(loaded)
@@ -819,7 +824,9 @@ impl Session {
                     | Event::Approve { .. }
                     | Event::Interrupt { .. }
                     | Event::ModelParts { .. }
-                    | Event::Woke { .. } => {}
+                    | Event::Woke { .. }
+                    | Event::Compact
+                    | Event::Summarized { .. } => {}
                 }
                 // A model's response is settled under the rules file as it
                 // is now: its calls are granted then (C1).
@@ -1011,7 +1018,10 @@ impl Session {
                 return Err(Rejection::UnknownActor { actor_id: self.id });
             }
             Outcome::Rejected(
-                CoreRejection::Mismatch | CoreRejection::UnknownCall | CoreRejection::NotRunning,
+                CoreRejection::Mismatch
+                | CoreRejection::UnknownCall
+                | CoreRejection::NotRunning
+                | CoreRejection::Running,
             )
             | Outcome::Stale => {
                 defect("a message is accepted, a repeat, full, stopped or to no actor")
@@ -1044,7 +1054,9 @@ impl Session {
                 | Record::TaskEnded { .. }
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
-                | Record::EpochBumped { .. } => None,
+                | Record::EpochBumped { .. }
+                | Record::CompactionStarted { .. }
+                | Record::Compacted { .. } => None,
             })
         });
         let turn = running.flatten().or_else(|| {
@@ -1065,7 +1077,9 @@ impl Session {
                     | Record::StopSent { .. }
                     | Record::CancelRequested { .. }
                     | Record::TurnEnded { .. }
-                    | Record::EpochBumped { .. } => None,
+                    | Record::EpochBumped { .. }
+                    | Record::CompactionStarted { .. }
+                    | Record::Compacted { .. } => None,
                 })
             })
         });
@@ -1113,7 +1127,9 @@ impl Session {
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
                 | Record::TurnEnded { .. }
-                | Record::EpochBumped { .. } => None,
+                | Record::EpochBumped { .. }
+                | Record::CompactionStarted { .. }
+                | Record::Compacted { .. } => None,
             })
     }
 
@@ -1150,7 +1166,8 @@ impl Session {
                 CoreRejection::Limit
                 | CoreRejection::Unborn
                 | CoreRejection::Mismatch
-                | CoreRejection::NotRunning,
+                | CoreRejection::NotRunning
+                | CoreRejection::Running,
             )
             | Outcome::Stale => {
                 defect("a verdict is accepted, for no call awaiting one, or stopped")
@@ -1185,7 +1202,8 @@ impl Session {
                 CoreRejection::Limit
                 | CoreRejection::Unborn
                 | CoreRejection::Mismatch
-                | CoreRejection::UnknownCall,
+                | CoreRejection::UnknownCall
+                | CoreRejection::Running,
             )
             | Outcome::Stale => {
                 defect("an interrupt is accepted, a repeat, not running or stopped")
@@ -1296,6 +1314,16 @@ impl Session {
                 self.seams.tasks.spawn(async move {
                     clock.sleep(delay).await;
                     report(&inbox, Event::Woke { id }).await;
+                });
+            }
+            // The summarize call is not built yet: it fails at once, so a
+            // compaction at a full context parks the actor as before, and
+            // one at a turn's end changes nothing.
+            Effect::Summarize { id } => {
+                let inbox = self.inbox.clone();
+                self.seams.tasks.spawn(async move {
+                    let summary = Summary::Failed(ModelFault::Other);
+                    report(&inbox, Event::Summarized { id, summary }).await;
                 });
             }
             // A stop has no deadline: it is sent until it lands (C2). Its
@@ -1893,7 +1921,9 @@ fn verdict_of(records: &[Record<Parsed>], call: &CallId) -> Option<WireVerdict> 
             | Record::Dispatched { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         })
         .last()
 }
@@ -1920,7 +1950,9 @@ fn was_cancelled(records: &[Record<Parsed>], turn: TurnId) -> bool {
         | Record::Dispatched { .. }
         | Record::ToolResult { .. }
         | Record::TurnEnded { .. }
-        | Record::EpochBumped { .. } => false,
+        | Record::EpochBumped { .. }
+        | Record::CompactionStarted { .. }
+        | Record::Compacted { .. } => false,
     })
 }
 

@@ -34,14 +34,30 @@ pub(crate) struct Audit {
     /// A stop landed: nothing more starts for the actor.
     pub(crate) stopped: bool,
     pub(crate) turns: usize,
-    /// A turn ended at the context bound: the mail after it may stay
-    /// unread (T4 and P1 have yet to decide what a full context does).
-    pub(crate) context_full: bool,
+    /// The last turn parked the actor: it ended at the context bound (no
+    /// summary made room), or was cancelled while compacting. Its mail
+    /// waits for new input (PRINCIPLES, not promised).
+    pub(crate) parked: bool,
+    /// Children dispatched `spawn`s named.
+    pub(crate) children: usize,
+    pub(crate) compactions: Compactions,
     /// Each task by its seq, and whether it ended.
     pub(crate) tasks: BTreeMap<u64, bool>,
     /// The seqs of the records that license a delivery: a `Keyed` call's
     /// `Dispatched` and a `StopSent`.
     pub(crate) licenses: BTreeSet<u64>,
+}
+
+/// What the log's compactions did.
+#[derive(Debug, Default)]
+pub(crate) struct Compactions {
+    /// A turn's step started after its history was compacted.
+    pub(crate) went_on: bool,
+    /// A compaction between turns wrote its summary.
+    pub(crate) landed: bool,
+    /// A turn started while a compaction between turns awaited its
+    /// summary, superseding it.
+    pub(crate) superseded: bool,
 }
 
 /// A rule the log broke.
@@ -93,6 +109,11 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
     let mut unresolved: BTreeSet<usize> = BTreeSet::new();
     let mut stepped = true;
     let mut messages = 0usize;
+    // A turn is running, and a compaction of it awaits its summary.
+    let mut in_turn = false;
+    let mut compacting = false;
+    let mut compacted = false;
+    let mut between = false;
     for (seq, (record, target)) in (0u64..).zip(named(log)) {
         match record {
             Record::Born { born } => {
@@ -148,6 +169,11 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 }
             }
             Record::TurnStarted { .. } => {
+                in_turn = true;
+                compacting = false;
+                compacted = false;
+                audit.compactions.superseded |= between;
+                between = false;
                 proposed = 0;
                 over.clear();
                 unresolved.clear();
@@ -158,6 +184,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 }
             }
             Record::StepStarted { carries, .. } => {
+                audit.compactions.went_on |= compacted;
                 if !carries.is_empty() && stepped && !unresolved.is_empty() {
                     audit.breaches.insert(Breach::Spliced);
                 }
@@ -202,6 +229,13 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                     audit.breaches.insert(Breach::OverBoundDispatched);
                 }
                 if let Some((number, proposal)) = target {
+                    if matches!(&proposal.request, Request::Run { args } if args.child().is_some())
+                    {
+                        audit.children = audit.children.saturating_add(1);
+                        if audit.children > limits.children_per_actor() {
+                            audit.breaches.insert(Breach::OverLimit);
+                        }
+                    }
                     match shape(proposal) {
                         Some((Class::Unsafe, false)) => {
                             unsafe_live.insert(number);
@@ -257,9 +291,20 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 crossed.extend(unsafe_live.iter().copied());
             }
             Record::TurnEnded { outcome, .. } => {
-                if *outcome == TurnOutcome::Failed(Failure::Limit(Limit::Context)) {
-                    audit.context_full = true;
-                }
+                audit.parked = *outcome == TurnOutcome::Failed(Failure::Limit(Limit::Context))
+                    || (*outcome == TurnOutcome::Cancelled && compacting);
+                in_turn = false;
+                compacting = false;
+            }
+            Record::CompactionStarted { .. } => {
+                compacting = in_turn;
+                between = !in_turn;
+            }
+            Record::Compacted { .. } => {
+                compacting = false;
+                compacted = in_turn;
+                audit.compactions.landed |= !in_turn;
+                between = false;
             }
             Record::ModelOutput { .. } | Record::StepReset { .. } => {}
         }
@@ -268,11 +313,12 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
 }
 
 impl Audit {
-    /// Whether all the actor's mail has been carried, unless it stopped or
-    /// reached its turn cap or a full context (T4's exceptions).
+    /// Whether all the actor's mail has been carried, unless it stopped,
+    /// reached its turn cap, or is parked at a full context (T4's
+    /// exceptions).
     pub(crate) fn read_all(&self, limits: &Limits) -> bool {
         self.stopped
-            || self.context_full
+            || self.parked
             || self.turns >= limits.turns_per_actor()
             || self.mail.iter().all(|id| self.carried.contains(id))
     }

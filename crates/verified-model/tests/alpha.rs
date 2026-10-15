@@ -6,7 +6,7 @@
 use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use proptest::prelude::*;
-use verified_core::{Core, Decision, Effect, Event, Loaded, ModelExit, Verdict};
+use verified_core::{Core, Decision, Effect, Event, Loaded, ModelExit, Summary, Verdict};
 use verified_domain::{
     Address, Body, CallId, EffectId, Envelope, EnvelopeId, Epoch, Exit, Limits, LimitsConfig,
     MessageId, Millis, ModelFault, Record, Tool, ToolName, TurnId, UnixMillis, Unstarted,
@@ -26,6 +26,7 @@ fn limits() -> Limits {
         turns_per_actor: count(3),
         messages_per_actor: count(3),
         tasks_per_actor: count(3),
+        children_per_actor: count(3),
         depth: 1,
         steps_per_turn: NonZeroU32::new(3).expect("non-zero"),
         calls_per_step: count(2),
@@ -66,6 +67,10 @@ enum Choice {
     Expire(u8),
     /// A completion for an effect that never was.
     Stale(u8, u16),
+    /// The user's `/compact`.
+    Compact,
+    /// A summarize call answers: a summary of this size, or a failure.
+    Summarized(u8, Option<u16>),
     Crash,
 }
 
@@ -94,6 +99,9 @@ fn choice() -> impl Strategy<Value = Choice> {
         any::<u8>().prop_map(Choice::Woke),
         any::<u8>().prop_map(Choice::Expire),
         (0u8..2, any::<u16>()).prop_map(|(kind, seq)| Choice::Stale(kind, seq)),
+        Just(Choice::Compact),
+        (any::<u8>(), proptest::option::of(0u16..900))
+            .prop_map(|(pick, size)| Choice::Summarized(pick, size)),
         Just(Choice::Crash),
     ]
 }
@@ -132,6 +140,7 @@ struct Seen {
     models: Vec<EffectId>,
     tools: Vec<EffectId>,
     sleeps: Vec<EffectId>,
+    summaries: Vec<EffectId>,
     asks: Vec<CallId>,
     /// Call ids minted so far, so that each is unique.
     calls: u32,
@@ -144,6 +153,7 @@ impl Seen {
                 Effect::CallModel { id, .. } => self.models.push(*id),
                 Effect::RunTool { call } => self.tools.push(call.effect()),
                 Effect::Sleep { id, .. } => self.sleeps.push(*id),
+                Effect::Summarize { id } => self.summaries.push(*id),
                 Effect::AskApproval { request } => self.asks.push(request.id().clone()),
                 Effect::CancelModel { .. } | Effect::CancelTool { .. } | Effect::Stop { .. } => {}
             }
@@ -273,6 +283,14 @@ impl Seen {
                     }
                 }
             }
+            Choice::Compact => Event::Compact,
+            Choice::Summarized(index, size) => Event::Summarized {
+                id: pick(&self.summaries, *index)?,
+                summary: match size {
+                    Some(size) => Summary::Written(measure(text(*size))),
+                    None => Summary::Failed(ModelFault::Other),
+                },
+            },
             Choice::Crash => return None,
         })
     }

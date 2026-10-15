@@ -137,6 +137,7 @@ fn limits() -> Limits {
         turns_per_actor: count(4),
         messages_per_actor: count(4),
         tasks_per_actor: count(4),
+        children_per_actor: count(4),
         depth: 1,
         steps_per_turn: NonZeroU32::new(4).expect("non-zero"),
         calls_per_step: count(4),
@@ -253,7 +254,8 @@ impl Driver {
                 | Effect::RunTool { .. }
                 | Effect::CancelTool { .. }
                 | Effect::Sleep { .. }
-                | Effect::Stop { .. } => None,
+                | Effect::Stop { .. }
+                | Effect::Summarize { .. } => None,
             })
             .expect("a model call");
         let from = self.log.len();
@@ -284,7 +286,9 @@ fn grants(records: &[Record<Shaped>]) -> Vec<(CallIx, Grant)> {
             | Record::ToolResult { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         })
         .collect()
 }

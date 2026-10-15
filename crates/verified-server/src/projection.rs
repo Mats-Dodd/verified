@@ -345,7 +345,11 @@ impl Projector {
             }
             Record::Born { born } => self.name = Some(born.name.clone()),
             Record::RulesLoaded { rules, .. } => self.rules = Some(rules.clone()),
-            Record::EpochBumped { .. } => {}
+            // The stream shows compaction in package B; until then, no
+            // chunk, as for an epoch.
+            Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
         chunks
     }

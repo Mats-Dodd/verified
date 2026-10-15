@@ -11,6 +11,7 @@
     )
 )]
 
+pub mod compaction;
 pub mod envelope;
 pub mod id;
 pub mod limits;
@@ -19,6 +20,7 @@ pub mod record;
 pub mod rules;
 pub mod shape;
 
+pub use compaction::{INSTRUCTION, OPEN_ENTRY_BYTES};
 pub use envelope::{Address, Body, Envelope, EnvelopeId};
 pub use id::{
     ActorId, ApprovalId, CallId, CallIx, EffectId, Epoch, IdEntropy, IdError, MessageId, PartId,
@@ -27,8 +29,8 @@ pub use id::{
 pub use limits::{Limits, LimitsConfig, Millis};
 pub use payload::{Abstract, Codec, Measured, Payload, Unit};
 pub use record::{
-    Class, Exit, Failure, Limit, ModelFault, Proposal, Record, Request, Reset, Tool, TurnOutcome,
-    Unstarted, named,
+    Class, Exit, Failure, Limit, ModelFault, OpenWork, Proposal, Record, Request, Reset, Tool,
+    TurnOutcome, Unstarted, named,
 };
 pub use rules::{ActorName, Born, Grant, NameError, Pattern, Rule, Rules};
 pub use shape::Shape;

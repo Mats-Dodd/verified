@@ -8,13 +8,14 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use proptest::prelude::*;
 use verified_core::{
-    Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Verdict, Violation,
+    Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Summary, Verdict,
+    Violation,
 };
 use verified_domain::{
     Abstract, ActorId, ActorName, Address, Body, Born, CallId, CallIx, EffectId, Envelope,
     EnvelopeId, Epoch, Exit, Failure, Grant, Limit, Limits, LimitsConfig, Measured, MessageId,
-    Millis, ModelFault, Payload, Proposal, Record, Request, Reset, Rules, Shape, StepId, TaskId,
-    Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
+    Millis, ModelFault, OpenWork, Payload, Proposal, Record, Request, Reset, Rules, Shape, StepId,
+    TaskId, Tool, TurnId, TurnOutcome, Unit, UnixMillis, Unstarted,
 };
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ fn small_config() -> LimitsConfig {
         turns_per_actor: count(4),
         messages_per_actor: count(4),
         tasks_per_actor: count(2),
+        children_per_actor: count(2),
         depth: 1,
         steps_per_turn: NonZeroU32::new(4).expect("non-zero"),
         calls_per_step: count(4),
@@ -248,7 +250,8 @@ fn model_call(effects: &[Effect<Abstract>]) -> EffectId {
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
             | Effect::Sleep { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .expect("a CallModel effect")
 }
@@ -264,7 +267,8 @@ fn tool_runs(effects: &[Effect<Abstract>]) -> Vec<(EffectId, CallId)> {
             | Effect::AskApproval { .. }
             | Effect::CancelTool { .. }
             | Effect::Sleep { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .collect()
 }
@@ -288,9 +292,27 @@ fn asked(effects: &[Effect<Abstract>]) -> Vec<CallId> {
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
             | Effect::Sleep { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .collect()
+}
+
+/// The summarize call among `effects`.
+fn summarize_of(effects: &[Effect<Abstract>]) -> EffectId {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Summarize { id } => Some(*id),
+            Effect::CallModel { .. }
+            | Effect::CancelModel { .. }
+            | Effect::AskApproval { .. }
+            | Effect::RunTool { .. }
+            | Effect::CancelTool { .. }
+            | Effect::Sleep { .. }
+            | Effect::Stop { .. } => None,
+        })
+        .expect("a Summarize effect")
 }
 
 const fn ended(outcome: TurnOutcome) -> Record<Abstract> {
@@ -821,7 +843,8 @@ fn interrupt_during_backoff_ends_at_once() {
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .expect("a backoff");
     driver.send(Event::Interrupt { turn: FIRST });
@@ -865,7 +888,8 @@ fn transient_model_failures_retry_on_schedule() {
                 | Effect::AskApproval { .. }
                 | Effect::RunTool { .. }
                 | Effect::CancelTool { .. }
-                | Effect::Stop { .. } => None,
+                | Effect::Stop { .. }
+                | Effect::Summarize { .. } => None,
             })
             .expect("a backoff");
         assert_eq!(wait, Millis::new(delay), "the schedule is data");
@@ -935,16 +959,32 @@ fn steps_per_turn_is_a_bound() {
     );
 }
 
+/// A step that would not fit the context is never sent: its beat compacts
+/// the history instead, and when even the summary leaves no room, the turn
+/// fails at the context bound with no second compaction. The message
+/// stays unread.
 #[test]
 fn context_is_checked_before_sending() {
     let mut driver = Driver::new(small_limits());
     let (_, effects) = driver.send(deliver(1, 5_000));
-    assert!(effects.is_empty(), "the model is never called");
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CallModel { .. })),
+        "the model is never called"
+    );
+    let summarize = summarize_of(&effects);
+    let (_, effects) = driver.send(Event::Summarized {
+        id: summarize,
+        summary: Summary::Written(payload(10)),
+    });
+    assert!(effects.is_empty(), "nothing more starts: {effects:?}");
     assert_eq!(
         driver.log.last(),
         Some(&ended(TurnOutcome::Failed(Failure::Limit(Limit::Context)))),
         "context limit"
     );
+    assert_eq!(driver.core.unread(), 1, "the message waits");
 }
 
 #[test]
@@ -968,7 +1008,8 @@ fn a_discarded_attempt_does_not_count_against_context() {
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .expect("a backoff");
     let (_, effects) = driver.send(Event::Woke { id: sleep });
@@ -1088,6 +1129,431 @@ fn reused_call_ids_fail_the_step() {
             ModelFault::Other
         )))],
         "never two live calls with one id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Model history compaction
+// ---------------------------------------------------------------------------
+
+/// The turn the log started last.
+fn last_turn(driver: &Driver) -> TurnId {
+    driver
+        .log
+        .iter()
+        .rev()
+        .find_map(|record| {
+            if let Record::TurnStarted { turn } = record {
+                Some(*turn)
+            } else {
+                None
+            }
+        })
+        .expect("a turn")
+}
+
+/// A first turn of 600 bytes that completes, then a second message of 600:
+/// the second turn's first step does not fit the 1 kB context, so its
+/// beat compacts. The summarize call's id.
+fn forced_at_the_first_step(driver: &mut Driver) -> EffectId {
+    let (_, effects) = driver.send(deliver(1, 600));
+    driver.finish(model_call(&effects), Vec::new());
+    let from = driver.log.len();
+    let (_, effects) = driver.send(deliver(2, 600));
+    let cut = u64::try_from(from).expect("a seq").saturating_add(2);
+    assert_eq!(
+        driver.since(from),
+        vec![
+            delivered(2, 600),
+            Record::TurnStarted {
+                turn: turn(cut.saturating_sub(1))
+            },
+            Record::CompactionStarted { through: cut },
+        ],
+        "the cut is now, before the step that does not fit"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CallModel { .. })),
+        "no step is sent"
+    );
+    let id = summarize_of(&effects);
+    assert_eq!(id.seq, cut, "the summarize call is licensed by its cut");
+    assert_eq!(
+        driver.core.unread(),
+        1,
+        "the unread message is after the cut"
+    );
+    id
+}
+
+/// A compaction forced at a turn's first step writes its summary, and the
+/// step it made room for starts, carrying the message waiting after the
+/// cut.
+#[test]
+fn a_forced_compaction_lets_the_first_step_start() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let turn = last_turn(&driver);
+    let from = driver.log.len();
+    let (outcome, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(50)),
+    });
+    assert_eq!(outcome, Outcome::Accepted, "the summary is the live one's");
+    assert_eq!(
+        driver.since(from),
+        vec![
+            Record::Compacted {
+                started: id.seq,
+                summary: payload(50),
+                open: OpenWork {
+                    tasks: Vec::new(),
+                    children: Vec::new(),
+                },
+            },
+            Record::StepStarted {
+                step: StepId { turn, index: 0 },
+                carries: vec![EnvelopeId::User(message(2))],
+            },
+        ],
+        "the conversation starts over from 50 bytes: 650 fit"
+    );
+    model_call(&effects);
+}
+
+/// A compaction forced at a step boundary after tools: the next step
+/// starts once the summary is written.
+#[test]
+fn a_forced_compaction_at_a_tools_beat_lets_the_turn_go_on() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    driver.send(Event::ModelParts {
+        id: call,
+        parts: payload(990),
+    });
+    let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+    let read = single_run(&effects, "read");
+    let (_, effects) = driver.tool_done(read, Exit::Ok);
+    let id = summarize_of(&effects);
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::CompactionStarted { through: id.seq }),
+        "1003 bytes do not fit: the beat compacts"
+    );
+    let (_, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(20)),
+    });
+    assert_eq!(driver.log.last(), Some(&started(1)), "the next step starts");
+    model_call(&effects);
+}
+
+/// A summary too big to make room fails the turn at the context bound,
+/// with no second compaction, and nothing starts another turn.
+#[test]
+fn a_summary_without_room_fails_the_turn() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let turn = last_turn(&driver);
+    let (_, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(500)),
+    });
+    assert!(effects.is_empty(), "no second summarize call: {effects:?}");
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)),
+        }),
+        "500 + 600 bytes do not fit"
+    );
+}
+
+/// A failed summarize call parks the actor: the turn fails at the context
+/// bound, its message waits, and no turn starts in that decision (no retry
+/// loop). The next message retries.
+#[test]
+fn a_failed_compaction_parks_the_actor_until_new_mail() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let turn = last_turn(&driver);
+    let from = driver.log.len();
+    let (_, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Failed(ModelFault::Other),
+    });
+    assert!(effects.is_empty(), "nothing starts: {effects:?}");
+    assert_eq!(
+        driver.since(from),
+        vec![Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)),
+        }],
+        "parked"
+    );
+    assert_eq!(driver.core.unread(), 1, "its message waits");
+    let (_, effects) = driver.send(deliver(3, 10));
+    let again = summarize_of(&effects);
+    assert!(again.seq > id.seq, "a new message retries: a new cut");
+}
+
+/// `/compact` unparks a parked actor: its summary makes room, and the
+/// waiting message starts a turn.
+#[test]
+fn compact_unparks_a_parked_actor() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    driver.send(Event::Summarized {
+        id,
+        summary: Summary::Failed(ModelFault::Other),
+    });
+    let (outcome, effects) = driver.send(Event::Compact);
+    assert_eq!(outcome, Outcome::Accepted, "idle: the history compacts");
+    let idle = summarize_of(&effects);
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::CompactionStarted { through: idle.seq }),
+        "the cut, between turns"
+    );
+    let from = driver.log.len();
+    let (_, effects) = driver.send(Event::Summarized {
+        id: idle,
+        summary: Summary::Written(payload(10)),
+    });
+    let turn = turn(u64::try_from(from).expect("a seq") + 1);
+    assert_eq!(
+        driver.since(from + 1),
+        vec![
+            Record::TurnStarted { turn },
+            Record::StepStarted {
+                step: StepId { turn, index: 0 },
+                carries: vec![EnvelopeId::User(message(2))],
+            },
+        ],
+        "the waiting message starts a turn that fits"
+    );
+    model_call(&effects);
+}
+
+/// `/compact` while a turn runs is refused; an unborn actor's too.
+#[test]
+fn compact_is_refused_while_a_turn_runs() {
+    let mut driver = Driver::new(small_limits());
+    driver.start();
+    let (outcome, effects) = driver.send(Event::Compact);
+    assert_eq!(outcome, Outcome::Rejected(Rejection::Running), "busy");
+    assert!(effects.is_empty(), "nothing starts");
+    let unborn = Core::<Abstract>::new(small_limits()).decide(Event::Compact);
+    assert_eq!(
+        unborn.outcome,
+        Outcome::Rejected(Rejection::Unborn),
+        "unborn"
+    );
+}
+
+/// A turn that ends past 80% of the context compacts between turns when
+/// no mail waits; its summary resets the conversation's size.
+#[test]
+fn a_turn_ending_past_four_fifths_compacts() {
+    let mut driver = Driver::new(small_limits());
+    let (_, effects) = driver.send(deliver(1, 850));
+    let (_, effects) = driver.finish(model_call(&effects), Vec::new());
+    let id = summarize_of(&effects);
+    assert_eq!(
+        driver.since(driver.log.len() - 2),
+        vec![
+            ended(TurnOutcome::Completed),
+            Record::CompactionStarted { through: id.seq },
+        ],
+        "850 bytes are past 800"
+    );
+    let (_, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(10)),
+    });
+    assert!(effects.is_empty(), "no mail: no turn");
+    let (_, effects) = driver.send(deliver(2, 900));
+    model_call(&effects);
+}
+
+/// When mail waits at a turn's end, the next turn starts instead; its beat
+/// compacts only if it must.
+#[test]
+fn waiting_mail_starts_a_turn_instead_of_compacting() {
+    let mut driver = Driver::new(small_limits());
+    let (_, effects) = driver.send(deliver(1, 850));
+    let call = model_call(&effects);
+    driver.send(deliver(2, 10));
+    let (_, effects) = driver.finish(call, Vec::new());
+    assert!(
+        !driver
+            .log
+            .iter()
+            .any(|record| matches!(record, Record::CompactionStarted { .. })),
+        "no compaction"
+    );
+    model_call(&effects);
+}
+
+/// A compaction between turns is superseded by a turn the mail starts: its
+/// late summary is stale.
+#[test]
+fn a_turn_supersedes_a_compaction_between_turns() {
+    let mut driver = Driver::new(small_limits());
+    let (_, effects) = driver.send(deliver(1, 850));
+    let (_, effects) = driver.finish(model_call(&effects), Vec::new());
+    let id = summarize_of(&effects);
+    let (_, effects) = driver.send(deliver(2, 100));
+    model_call(&effects);
+    let from = driver.log.len();
+    let (outcome, _) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(10)),
+    });
+    assert_eq!(outcome, Outcome::Stale, "superseded");
+    assert_eq!(driver.log.len(), from, "nothing recorded");
+}
+
+/// Esc during a forced compaction stops its summarize call and ends the
+/// turn `Cancelled`; the actor stays parked.
+#[test]
+fn esc_cancels_a_forced_compaction() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let turn = last_turn(&driver);
+    let (_, effects) = driver.send(Event::Interrupt { turn });
+    assert_eq!(
+        effects,
+        vec![Effect::CancelModel { id }],
+        "the call is stopped"
+    );
+    let (_, effects) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Failed(ModelFault::Cancelled),
+    });
+    assert!(effects.is_empty(), "nothing starts: {effects:?}");
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Cancelled,
+        }),
+        "cancelled"
+    );
+    assert_eq!(driver.core.unread(), 1, "parked: its message waits");
+}
+
+/// A stop during a forced compaction stops it like any foreground call.
+#[test]
+fn a_stop_cancels_a_forced_compaction() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let turn = last_turn(&driver);
+    let (_, effects) = driver.send(Event::Deliver {
+        envelope: Envelope {
+            body: Body::Stop,
+            ..envelope(9, 0)
+        },
+    });
+    assert!(
+        effects.contains(&Effect::CancelModel { id }),
+        "the call is stopped"
+    );
+    driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(10)),
+    });
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Cancelled,
+        }),
+        "a summary under a stop records nothing but the end"
+    );
+}
+
+/// A crash between the cut and its summary leaves a dangling start: the
+/// actor compacts again under a new cut, and the old call's late answer is
+/// stale.
+#[test]
+fn a_crash_mid_compaction_compacts_again() {
+    let mut driver = Driver::new(small_limits());
+    let id = forced_at_the_first_step(&mut driver);
+    let effects = driver.crash();
+    let again = summarize_of(&effects);
+    assert_eq!(again.epoch, Epoch(1), "in the new epoch");
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::CompactionStarted { through: again.seq }),
+        "a new cut"
+    );
+    let (outcome, _) = driver.send(Event::Summarized {
+        id,
+        summary: Summary::Written(payload(10)),
+    });
+    assert_eq!(outcome, Outcome::Stale, "the old call is stale");
+    let (_, effects) = driver.send(Event::Summarized {
+        id: again,
+        summary: Summary::Written(payload(10)),
+    });
+    model_call(&effects);
+}
+
+/// A crash during a compaction between turns: it starts again.
+#[test]
+fn a_crash_mid_compaction_between_turns_compacts_again() {
+    let mut driver = Driver::new(small_limits());
+    let (_, effects) = driver.send(deliver(1, 850));
+    let (_, effects) = driver.finish(model_call(&effects), Vec::new());
+    let id = summarize_of(&effects);
+    let effects = driver.crash();
+    let again = summarize_of(&effects);
+    assert!(again.seq > id.seq, "a new cut");
+    let (_, effects) = driver.send(Event::Summarized {
+        id: again,
+        summary: Summary::Written(payload(10)),
+    });
+    assert!(effects.is_empty(), "compacted, idle");
+    assert!(
+        matches!(driver.log.last(), Some(Record::Compacted { .. })),
+        "the summary lands"
+    );
+}
+
+/// A log whose cut is not its own record, or whose summary names no live
+/// compaction, is corrupt.
+#[test]
+fn a_cut_other_than_now_is_corrupt() {
+    let mut log = boot();
+    log.push(Record::CompactionStarted { through: 1 });
+    assert_eq!(
+        Core::recover(small_limits(), &log).map(|_| ()),
+        Err(Corrupt {
+            seq: 2,
+            violation: Violation::WrongCut
+        }),
+        "the cut is always now"
+    );
+    let mut log = boot();
+    log.push(Record::Compacted {
+        started: 1,
+        summary: payload(1),
+        open: OpenWork {
+            tasks: Vec::new(),
+            children: Vec::new(),
+        },
+    });
+    assert_eq!(
+        Core::recover(small_limits(), &log).map(|_| ()),
+        Err(Corrupt {
+            seq: 2,
+            violation: Violation::NotCompacting
+        }),
+        "no compaction awaits a summary"
     );
 }
 
@@ -1670,7 +2136,10 @@ impl Seen {
                 Effect::RunTool { call } => self.tools.push(call.effect()),
                 Effect::Sleep { id, .. } => self.sleeps.push(*id),
                 Effect::AskApproval { request } => self.asks.push(request.id().clone()),
-                Effect::CancelModel { .. } | Effect::CancelTool { .. } | Effect::Stop { .. } => {}
+                Effect::CancelModel { .. }
+                | Effect::CancelTool { .. }
+                | Effect::Stop { .. }
+                | Effect::Summarize { .. } => {}
             }
         }
     }

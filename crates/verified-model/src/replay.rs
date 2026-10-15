@@ -180,6 +180,7 @@ pub fn summary(world: &World) -> String {
                         Job::Model { batches } => format!("model({batches} batches)"),
                         Job::Tool { call, tool } => format!("{tool:?} {}", call.as_str()),
                         Job::Sleep => "sleep".to_owned(),
+                        Job::Summarize => "summarize".to_owned(),
                         Job::Deliver {
                             to, what, landing, ..
                         } => format!("{what:?} to {to:?} {landing:?}"),
@@ -297,7 +298,11 @@ fn landing(
                             None
                         }
                     }
-                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep | Job::Deliver { .. } => None,
+                    Job::Model { .. }
+                    | Job::Tool { .. }
+                    | Job::Sleep
+                    | Job::Summarize
+                    | Job::Deliver { .. } => None,
                 })
         })
         .ok_or_else(|| format!("no delivery in flight lands at slot {to} ({at:?})"))

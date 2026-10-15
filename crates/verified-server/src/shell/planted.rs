@@ -92,7 +92,9 @@ impl Session {
             | Record::TaskEnded { .. }
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
-            | Record::EpochBumped { .. } => {}
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         };
         for record in &self.records {
             track(record, &mut open, &mut injected);

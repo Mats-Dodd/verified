@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use stateright::{Model, Property};
-use verified_core::{Core, Decision, Event, Loaded, ModelExit, Outcome, Rejection, Verdict};
+use verified_core::{
+    Core, Decision, Event, Loaded, ModelExit, Outcome, Rejection, Summary, Verdict,
+};
 use verified_domain::{
     Abstract, ActorId, ActorName, Address, Body, Born, CallId, Class, EffectId, Envelope,
     EnvelopeId, Epoch, Exit, Grant, Limits, Measured, MessageId, ModelFault, Proposal, Record,
@@ -68,6 +70,10 @@ pub enum Kind {
     Woke,
     /// The shell's deadline for a run passed.
     Expire,
+    /// The user's `/compact`.
+    Compact,
+    /// A summarize call answered.
+    Summarize,
     OrphanExecute,
     OrphanComplete,
     Duplicate,
@@ -115,6 +121,8 @@ impl Action {
             Self::Deliver(_, Event::ToolDone { .. }) => Kind::ToolDone,
             Self::Deliver(_, Event::Woke { .. }) => Kind::Woke,
             Self::Deliver(_, Event::Expired { .. }) => Kind::Expire,
+            Self::Deliver(_, Event::Compact) => Kind::Compact,
+            Self::Deliver(_, Event::Summarized { .. }) => Kind::Summarize,
             Self::Execute(..) => Kind::Execute,
             Self::OrphanExecute(..) => Kind::OrphanExecute,
             Self::OrphanComplete(..) => Kind::OrphanComplete,
@@ -215,6 +223,13 @@ pub struct Bounded {
     /// The rules file every actor's shell loads (`None`: there is none, so
     /// the default rules); the harness takes it.
     pub rules: Option<Rules>,
+    /// The size of each of the user's messages.
+    pub message_bytes: u64,
+    /// The sizes of the summaries a summarize call may write (one that
+    /// makes room, one that does not).
+    pub summaries: Vec<u64>,
+    /// `/compact`s the user may send the first root.
+    pub compacts: u8,
 }
 
 /// A deliberately broken shell, to show the properties can fail.
@@ -354,13 +369,18 @@ fn stop_id(index: u8) -> MessageId {
 /// The user's message `message` to `actor`.
 #[must_use]
 pub const fn message(actor: ActorId, message: MessageId) -> Event<Abstract> {
+    sized(actor, message, 1)
+}
+
+/// The user's message `message` to `actor`, of `bytes`.
+const fn sized(actor: ActorId, message: MessageId, bytes: u64) -> Event<Abstract> {
     Event::Deliver {
         envelope: Envelope {
             id: EnvelopeId::User(message),
             from: Address::User,
             to: actor,
             reply_to: None,
-            body: Body::Text(size(1)),
+            body: Body::Text(size(bytes)),
         },
     }
 }
@@ -432,16 +452,22 @@ fn admits(id: EffectId, flight: &Flight, durable: bool, event: &Event<Abstract>)
                     // timeout).
                     Exit::Ok | Exit::Failed | Exit::Unknown => flight.executed,
                 },
-                Job::Model { .. } | Job::Sleep => false,
+                Job::Model { .. } | Job::Sleep | Job::Summarize => false,
             },
         ),
         Event::Woke { id } => (id, matches!(flight.job, Job::Sleep)),
+        Event::Summarized { id, summary } => (
+            id,
+            matches!(flight.job, Job::Summarize)
+                && (flight.cancelled || !matches!(summary, Summary::Failed(ModelFault::Cancelled))),
+        ),
         Event::Born { .. }
         | Event::Rules { .. }
         | Event::Deliver { .. }
         | Event::Approve { .. }
         | Event::Interrupt { .. }
-        | Event::Expired { .. } => return false,
+        | Event::Expired { .. }
+        | Event::Compact => return false,
     };
     *of == id && admitted
 }
@@ -767,6 +793,7 @@ impl Harness {
                 Staged::Start(*effect, job)
             }
             Work::Sleep { id, .. } => Staged::Start(*id, Job::Sleep),
+            Work::Summarize { id } => Staged::Start(*id, Job::Summarize),
             Work::Stop { id, child } => Staged::Start(
                 *id,
                 Job::Deliver {
@@ -800,7 +827,9 @@ impl Harness {
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
                 | Event::Woke { .. }
-                | Event::Expired { .. } => None,
+                | Event::Expired { .. }
+                | Event::Compact
+                | Event::Summarized { .. } => None,
             }),
         }
     }
@@ -844,7 +873,9 @@ impl Harness {
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
                 | Event::Woke { .. }
-                | Event::Expired { .. } => None,
+                | Event::Expired { .. }
+                | Event::Compact
+                | Event::Summarized { .. } => None,
             }),
         }
     }
@@ -873,7 +904,9 @@ impl Harness {
                 | Event::ModelDone { .. }
                 | Event::ToolDone { .. }
                 | Event::Woke { .. }
-                | Event::Expired { .. } => None,
+                | Event::Expired { .. }
+                | Event::Compact
+                | Event::Summarized { .. } => None,
             }),
         }
     }
@@ -929,7 +962,10 @@ impl Harness {
         let core = self.core(world, slot)?;
         let completion = matches!(
             event,
-            Event::ModelDone { .. } | Event::ToolDone { .. } | Event::Woke { .. }
+            Event::ModelDone { .. }
+                | Event::ToolDone { .. }
+                | Event::Woke { .. }
+                | Event::Summarized { .. }
         );
         if completion && let Some(actor) = world.actors.get_mut(slot) {
             actor.last = Some(event.clone());
@@ -975,6 +1011,10 @@ impl Harness {
                 output: size(1),
             },
             Job::Sleep => Event::Woke { id },
+            Job::Summarize => Event::Summarized {
+                id,
+                summary: Summary::Failed(ModelFault::Other),
+            },
         }
     }
 
@@ -1104,7 +1144,10 @@ impl Harness {
                                 || delivered(actor, EnvelopeId::User(id))
                                 || state.steers < bounded.steers
                             {
-                                actions.push(Action::Deliver(slot, message(self.born.actor, id)));
+                                actions.push(Action::Deliver(
+                                    slot,
+                                    sized(self.born.actor, id, bounded.message_bytes),
+                                ));
                             }
                         }
                     }
@@ -1113,6 +1156,14 @@ impl Harness {
                             slot,
                             stop(self.born.actor, stop_id(state.stops)),
                         ));
+                    }
+                    // Between turns (one while a turn runs is refused, as
+                    // the core's tests check).
+                    if state.compacts < bounded.compacts
+                        && core.born().is_some()
+                        && core.running().is_none()
+                    {
+                        actions.push(Action::Deliver(slot, Event::Compact));
                     }
                 }
                 let answers = |call: &CallId, actions: &mut Vec<Action>| {
@@ -1156,6 +1207,7 @@ impl Harness {
                                     }
                                 } | Event::Approve { .. }
                                     | Event::Interrupt { .. }
+                                    | Event::Compact
                             )
                     })
                     .map(|(at, event)| Action::Deliver(*at, event.clone())),
@@ -1297,6 +1349,18 @@ impl Harness {
             })
             .to_vec(),
             Job::Sleep => vec![Event::Woke { id }],
+            // A summary that makes room or one that does not, a failure,
+            // and, once asked to stop, a stop.
+            Job::Summarize => bounded
+                .summaries
+                .iter()
+                .map(|bytes| Summary::Written(size(*bytes)))
+                .chain([
+                    Summary::Failed(ModelFault::Other),
+                    Summary::Failed(ModelFault::Cancelled),
+                ])
+                .map(|summary| Event::Summarized { id, summary })
+                .collect(),
             Job::Deliver { landing, .. } => {
                 let exit = match landing {
                     Landing::Answered(exit) => *exit,
@@ -1404,7 +1468,8 @@ impl Harness {
             | Rejection::Unborn
             | Rejection::Mismatch
             | Rejection::UnknownCall
-            | Rejection::NotRunning => Exit::NotStarted(Unstarted::Refused),
+            | Rejection::NotRunning
+            | Rejection::Running => Exit::NotStarted(Unstarted::Refused),
         };
         let next = match event {
             None => {
@@ -1435,7 +1500,9 @@ impl Harness {
                 let id_of = envelope.id;
                 let (call, what) = match &world.actor(slot)?.flights.get(&id)?.job {
                     Job::Deliver { call, what, .. } => (call.clone(), *what),
-                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep => return None,
+                    Job::Model { .. } | Job::Tool { .. } | Job::Sleep | Job::Summarize => {
+                        return None;
+                    }
                 };
                 match self.deliver(world, to, Event::Deliver { envelope })? {
                     Outcome::Accepted => {
@@ -1789,6 +1856,7 @@ impl Model for Harness {
                     Event::Interrupt { .. } => {
                         world.interrupts = world.interrupts.saturating_add(1);
                     }
+                    Event::Compact => world.compacts = world.compacts.saturating_add(1),
                     Event::Expired { id } => {
                         // v stops waiting; the run may still act and report,
                         // as an orphan.
@@ -1822,7 +1890,9 @@ impl Model for Harness {
                             world.acked.insert((*to, *envelope));
                         }
                     }
-                    Event::ModelDone { id, .. } | Event::Woke { id } => {
+                    Event::ModelDone { id, .. }
+                    | Event::Woke { id }
+                    | Event::Summarized { id, .. } => {
                         world.actors.get_mut(slot)?.flights.remove(id)?;
                     }
                 }
@@ -2244,6 +2314,23 @@ impl Model for Harness {
             Property::sometimes(
                 "a delivery lands again after a crash",
                 |_, world: &World| world.crashes > 0 && !world.acked.is_empty(),
+            ),
+            Property::sometimes(
+                "a forced compaction lets its turn go on",
+                |model: &Self, world: &World| {
+                    model.audits(world).any(|audit| audit.compactions.went_on)
+                },
+            ),
+            Property::sometimes("an idle compaction lands", |model: &Self, world: &World| {
+                model.audits(world).any(|audit| audit.compactions.landed)
+            }),
+            Property::sometimes(
+                "a compaction is superseded",
+                |model: &Self, world: &World| {
+                    model
+                        .audits(world)
+                        .any(|audit| audit.compactions.superseded)
+                },
             ),
         ]
     }

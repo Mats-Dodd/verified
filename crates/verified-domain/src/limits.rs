@@ -37,6 +37,7 @@ pub struct Limits {
     turns_per_actor: usize,
     messages_per_actor: usize,
     tasks_per_actor: usize,
+    children_per_actor: usize,
     depth: u32,
     steps_per_turn: u32,
     calls_per_step: usize,
@@ -67,6 +68,13 @@ impl Limits {
         self.tasks_per_actor
     }
 
+    /// Children one actor ever spawns; a `spawn` past it does not start.
+    /// It bounds what a `Compacted` lists as open.
+    #[must_use]
+    pub const fn children_per_actor(&self) -> usize {
+        self.children_per_actor
+    }
+
     /// The deepest spawn: a root actor is at depth 0.
     #[must_use]
     pub const fn depth(&self) -> u32 {
@@ -94,7 +102,8 @@ impl Limits {
     }
 
     /// Conversation size the model is sent; a step that would exceed it
-    /// fails before the call.
+    /// compacts the history first, and fails before the call if no summary
+    /// makes room.
     #[must_use]
     pub const fn context_bytes(&self) -> u64 {
         self.context_bytes
@@ -136,6 +145,7 @@ impl Limits {
             turns_per_actor: config.turns_per_actor.get(),
             messages_per_actor: config.messages_per_actor.get(),
             tasks_per_actor: config.tasks_per_actor.get(),
+            children_per_actor: config.children_per_actor.get(),
             depth: config.depth,
             steps_per_turn: config.steps_per_turn.get(),
             calls_per_step: config.calls_per_step.get(),
@@ -169,6 +179,7 @@ pub struct LimitsConfig {
     pub turns_per_actor: NonZeroUsize,
     pub messages_per_actor: NonZeroUsize,
     pub tasks_per_actor: NonZeroUsize,
+    pub children_per_actor: NonZeroUsize,
     pub depth: u32,
     pub steps_per_turn: NonZeroU32,
     pub calls_per_step: NonZeroUsize,
@@ -193,6 +204,7 @@ impl LimitsConfig {
             turns_per_actor: NonZeroUsize::new(1024).expect(nonzero),
             messages_per_actor: NonZeroUsize::new(1024).expect(nonzero),
             tasks_per_actor: NonZeroUsize::new(64).expect(nonzero),
+            children_per_actor: NonZeroUsize::new(64).expect(nonzero),
             depth: 3,
             steps_per_turn: NonZeroU32::new(64).expect(nonzero),
             calls_per_step: NonZeroUsize::new(16).expect(nonzero),

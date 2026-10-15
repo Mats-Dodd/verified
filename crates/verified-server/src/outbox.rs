@@ -58,7 +58,8 @@ fn landed(outcome: Outcome, landed: &str) -> (Exit, String) {
             Rejection::Unborn
             | Rejection::Mismatch
             | Rejection::UnknownCall
-            | Rejection::NotRunning,
+            | Rejection::NotRunning
+            | Rejection::Running,
         )
         | Outcome::Stale => (
             Exit::NotStarted(Unstarted::Refused),
@@ -123,7 +124,8 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
                         | Rejection::Unborn
                         | Rejection::Mismatch
                         | Rejection::UnknownCall
-                        | Rejection::NotRunning => Exit::NotStarted(Unstarted::Refused),
+                        | Rejection::NotRunning
+                        | Rejection::Running => Exit::NotStarted(Unstarted::Refused),
                     };
                     return (exit, format!("not spawned: {name}'s birth was refused"));
                 }
@@ -148,7 +150,8 @@ pub(crate) async fn deliver(registry: &Registry, work: Outbound) -> (Exit, Strin
                         Rejection::Unborn
                         | Rejection::Mismatch
                         | Rejection::UnknownCall
-                        | Rejection::NotRunning,
+                        | Rejection::NotRunning
+                        | Rejection::Running,
                     )
                     | Outcome::Stale,
                 ) => (Exit::Unknown, format!("{spawned}; its prompt was refused")),

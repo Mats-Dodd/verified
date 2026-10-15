@@ -242,7 +242,9 @@ fn spawned(records: &[Record<Parsed>]) -> impl Iterator<Item = ActorId> + '_ {
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         })
         .flatten()
         .filter_map(|call| match &call.request {
@@ -307,7 +309,9 @@ impl RegistryTask {
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => None,
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
         });
         let (handle, running) = Session::start(
             actor,

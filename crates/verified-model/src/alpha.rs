@@ -17,7 +17,7 @@
 //! that the core commutes with α: `decide` on α of a state and an event
 //! decides α of what `decide` decides on them.
 
-use verified_core::{Decision, Effect, Event, ModelExit, Outcome};
+use verified_core::{Decision, Effect, Event, ModelExit, Outcome, Summary};
 use verified_domain::{
     Abstract, ActorId, Body, CallId, CallIx, EffectId, Envelope, Measured, Millis, Payload,
     Proposal, Record, Request, Shape, StepId, Tool, Unit,
@@ -115,6 +115,16 @@ pub fn record<P: Payload>(record: &Record<P>) -> Record<Abstract> {
             outcome: *outcome,
         },
         Record::EpochBumped { epoch } => Record::EpochBumped { epoch: *epoch },
+        Record::CompactionStarted { through } => Record::CompactionStarted { through: *through },
+        Record::Compacted {
+            started,
+            summary,
+            open,
+        } => Record::Compacted {
+            started: *started,
+            summary: measured(summary),
+            open: open.clone(),
+        },
     }
 }
 
@@ -157,6 +167,14 @@ pub fn event<P: Payload>(event: &Event<P>) -> Event<Abstract> {
         },
         Event::Woke { id } => Event::Woke { id: *id },
         Event::Expired { id } => Event::Expired { id: *id },
+        Event::Compact => Event::Compact,
+        Event::Summarized { id, summary } => Event::Summarized {
+            id: *id,
+            summary: match summary {
+                Summary::Written(text) => Summary::Written(measured(text)),
+                Summary::Failed(fault) => Summary::Failed(*fault),
+            },
+        },
     }
 }
 
@@ -196,6 +214,9 @@ pub enum Work {
         id: EffectId,
         child: ActorId,
     },
+    Summarize {
+        id: EffectId,
+    },
 }
 
 /// α of an effect.
@@ -228,6 +249,7 @@ pub fn work<P: Payload>(effect: &Effect<P>) -> Work {
             id: *id,
             child: *child,
         },
+        Effect::Summarize { id } => Work::Summarize { id: *id },
     }
 }
 

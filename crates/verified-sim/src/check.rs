@@ -154,7 +154,9 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
                     | Record::StepFinished { .. }
                     | Record::CancelRequested { .. }
                     | Record::TurnEnded { .. }
-                    | Record::EpochBumped { .. } => {}
+                    | Record::EpochBumped { .. }
+                    | Record::CompactionStarted { .. }
+                    | Record::Compacted { .. } => {}
                 }
             }
             Record::Born { .. }
@@ -168,7 +170,9 @@ fn calls(log: &[Record<Parsed>], found: &mut Vec<Violation>) -> Vec<Call> {
             | Record::StepReset { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
     }
     calls
@@ -208,7 +212,9 @@ fn tasks(log: &[Record<Parsed>]) -> Vec<(u64, Option<ToolArgs>)> {
             | Record::TaskEnded { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
     }
     started
@@ -241,7 +247,9 @@ fn born(log: &[Record<Parsed>]) -> Option<&verified_domain::Born> {
         | Record::StopSent { .. }
         | Record::CancelRequested { .. }
         | Record::TurnEnded { .. }
-        | Record::EpochBumped { .. } => None,
+        | Record::EpochBumped { .. }
+        | Record::CompactionStarted { .. }
+        | Record::Compacted { .. } => None,
     })
 }
 
@@ -322,7 +330,9 @@ fn carried(
             | Record::StopSent { .. }
             | Record::CancelRequested { .. }
             | Record::TurnEnded { .. }
-            | Record::EpochBumped { .. } => {}
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
         }
     }
     let started = log
@@ -797,7 +807,9 @@ fn told(
                     | Record::StopSent { .. }
                     | Record::CancelRequested { .. }
                     | Record::TurnEnded { .. }
-                    | Record::EpochBumped { .. } => None,
+                    | Record::EpochBumped { .. }
+                    | Record::CompactionStarted { .. }
+                    | Record::Compacted { .. } => None,
                 })
             }
         };

@@ -201,7 +201,9 @@ pub fn harness(limits: Limits, trace: &[(ActorId, Observed)]) -> Harness {
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
                 | Record::TurnEnded { .. }
-                | Record::EpochBumped { .. } => {}
+                | Record::EpochBumped { .. }
+                | Record::CompactionStarted { .. }
+                | Record::Compacted { .. } => {}
             }
         }
     }

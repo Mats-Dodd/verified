@@ -145,6 +145,11 @@ pub enum Effect<P: Payload> {
     /// Deliver a stop to `child`, keyed by `id.seq` (its `StopSent`);
     /// answered by `ToolDone` for `id`.
     Stop { id: EffectId, child: ActorId },
+    /// Summarize the model's history up to the cut of the
+    /// `CompactionStarted` at `id.seq`: v's own housekeeping, not a turn's
+    /// step, needing no grant. The shell builds the request from the log;
+    /// answered by `Summarized`. Stopped by `CancelModel { id }`.
+    Summarize { id: EffectId },
 }
 
 /// Why a command was refused.
@@ -164,6 +169,8 @@ pub enum Rejection {
     UnknownCall,
     /// No turn with that id is running.
     NotRunning,
+    /// A turn is running: the history is compacted only between turns.
+    Running,
 }
 
 /// What `decide` made of its event.

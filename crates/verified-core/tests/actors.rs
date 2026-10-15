@@ -6,7 +6,8 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use proptest::prelude::*;
 use verified_core::{
-    Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Verdict, Violation,
+    Core, Corrupt, Decision, Effect, Event, ModelExit, Outcome, Rejection, Summary, Verdict,
+    Violation,
 };
 use verified_domain::{
     Abstract, ActorId, ActorName, Address, Body, Born, CallId, CallIx, EffectId, Envelope,
@@ -25,6 +26,7 @@ fn config() -> LimitsConfig {
         turns_per_actor: count(8),
         messages_per_actor: count(8),
         tasks_per_actor: count(2),
+        children_per_actor: count(2),
         depth: 1,
         steps_per_turn: NonZeroU32::new(8).expect("non-zero"),
         calls_per_step: count(4),
@@ -267,7 +269,9 @@ impl Driver {
                 | Record::StopSent { .. }
                 | Record::CancelRequested { .. }
                 | Record::TurnEnded { .. }
-                | Record::EpochBumped { .. } => None,
+                | Record::EpochBumped { .. }
+                | Record::CompactionStarted { .. }
+                | Record::Compacted { .. } => None,
             })
             .filter(|carries| !carries.is_empty())
             .collect()
@@ -284,7 +288,8 @@ fn model_call(effects: &[Effect<Abstract>]) -> EffectId {
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
             | Effect::Sleep { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .expect("a CallModel effect")
 }
@@ -300,7 +305,8 @@ fn runs(effects: &[Effect<Abstract>]) -> Vec<(EffectId, CallId, u64)> {
             | Effect::AskApproval { .. }
             | Effect::CancelTool { .. }
             | Effect::Sleep { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .collect()
 }
@@ -855,7 +861,8 @@ fn a_retry_carries_nothing_new() {
             | Effect::AskApproval { .. }
             | Effect::RunTool { .. }
             | Effect::CancelTool { .. }
-            | Effect::Stop { .. } => None,
+            | Effect::Stop { .. }
+            | Effect::Summarize { .. } => None,
         })
         .expect("a backoff");
     driver.send(Event::Woke { id: sleep });
@@ -1057,6 +1064,34 @@ fn spawns_are_bounded_by_depth() {
     );
 }
 
+/// Limits: a `spawn` past `children_per_actor` does not start, so what a
+/// compaction lists as open is bounded.
+#[test]
+fn spawns_are_bounded_by_children_per_actor() {
+    let mut driver = Driver::new();
+    let spawn = |name: &str, number: u64| {
+        call(
+            name,
+            Shape::Spawn {
+                subject: b"helper".to_vec(),
+                child: ActorId::from_parts(at(10 + number), &[7; 10]),
+            },
+        )
+    };
+    proposing(
+        &mut driver,
+        vec![spawn("a", 1), spawn("b", 2), spawn("c", 3)],
+    );
+    assert!(
+        driver.log.contains(&Record::ToolResult {
+            call: CallIx(2),
+            exit: Exit::NotStarted(Unstarted::Limit),
+            output: None
+        }),
+        "the third child is past the bound"
+    );
+}
+
 fn call_spawn() -> Proposal<Abstract> {
     call(
         "spawn",
@@ -1223,6 +1258,10 @@ enum Choice {
     Done(u8, u8),
     Expire(u8),
     Woke(u8),
+    /// The user's `/compact`.
+    Compact,
+    /// A summarize call answers: a summary, or a failure.
+    Summarized(u8, bool),
     Crash,
 }
 
@@ -1238,6 +1277,8 @@ fn choice() -> impl Strategy<Value = Choice> {
         4 => (any::<u8>(), 0u8..4).prop_map(|(pick, exit)| Choice::Done(pick, exit)),
         1 => any::<u8>().prop_map(Choice::Expire),
         1 => any::<u8>().prop_map(Choice::Woke),
+        1 => Just(Choice::Compact),
+        1 => (any::<u8>(), any::<bool>()).prop_map(|(pick, written)| Choice::Summarized(pick, written)),
         1 => Just(Choice::Crash),
     ]
 }
@@ -1258,6 +1299,7 @@ struct Seen {
     models: Vec<EffectId>,
     runs: Vec<EffectId>,
     sleeps: Vec<EffectId>,
+    summaries: Vec<EffectId>,
     asks: Vec<CallId>,
     calls: u32,
 }
@@ -1270,6 +1312,7 @@ impl Seen {
                 Effect::RunTool { call } => self.runs.push(call.effect()),
                 Effect::Stop { id, .. } => self.runs.push(*id),
                 Effect::Sleep { id, .. } => self.sleeps.push(*id),
+                Effect::Summarize { id } => self.summaries.push(*id),
                 Effect::AskApproval { request } => self.asks.push(request.id().clone()),
                 Effect::CancelModel { .. } | Effect::CancelTool { .. } => {}
             }
@@ -1354,6 +1397,15 @@ impl Seen {
             },
             Choice::Woke(index) => Event::Woke {
                 id: pick(&self.sleeps, *index)?,
+            },
+            Choice::Compact => Event::Compact,
+            Choice::Summarized(index, written) => Event::Summarized {
+                id: pick(&self.summaries, *index)?,
+                summary: if *written {
+                    Summary::Written(payload(7))
+                } else {
+                    Summary::Failed(ModelFault::Other)
+                },
             },
             Choice::Crash => return None,
         })
