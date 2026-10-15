@@ -57,8 +57,9 @@ use verified_domain::{
 };
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    ActorSummary, Approve, ApproveReply, Cancel, CancelReply, Outcome as WireOutcome, Rejection,
-    SendMessage, SendMessageReply, StopActor, StopReply, Verdict as WireVerdict,
+    ActorSummary, Approve, ApproveReply, Cancel, CancelReply, Compact, CompactReply,
+    Outcome as WireOutcome, Rejection, SendMessage, SendMessageReply, StopActor, StopReply,
+    Verdict as WireVerdict,
 };
 use verified_wire::stream::{Freshness, Offset, encode_chunks};
 
@@ -68,7 +69,7 @@ use crate::env::Env;
 use crate::history;
 use crate::limits::ServerLimits;
 use crate::log::{Log, LogError};
-use crate::model::Model;
+use crate::model::{Model, ModelRequest};
 use crate::outbox::{self, Outbound};
 use crate::payload::{Boundary, ModelPart, Parsed, ToolArgs, ToolOutput, measure, proposal};
 use crate::projection::Projector;
@@ -228,6 +229,10 @@ enum Input {
     Cancel {
         command: Cancel,
         reply: Reply<CancelReply>,
+    },
+    Compact {
+        command: Compact,
+        reply: Reply<CompactReply>,
     },
     Read {
         from: Offset,
@@ -485,6 +490,17 @@ impl ActorHandle {
     /// Nothing to cancel, or the session is gone.
     pub async fn cancel(&self, command: Cancel) -> Result<CancelReply, CommandError> {
         Ok(self.ask(|reply| Input::Cancel { command, reply }).await??)
+    }
+
+    /// Your `/compact`: summarizes the actor's history between turns.
+    ///
+    /// # Errors
+    /// A turn is running, the actor is stopped or full, or the session is
+    /// gone.
+    pub async fn compact(&self, command: Compact) -> Result<CompactReply, CommandError> {
+        Ok(self
+            .ask(|reply| Input::Compact { command, reply })
+            .await??)
     }
 
     /// Chunks from `from` to the end of the stream (bounded per read).
@@ -804,7 +820,7 @@ impl Session {
         match input {
             Input::Done(event) => {
                 match &event {
-                    Event::ModelDone { id, .. } => {
+                    Event::ModelDone { id, .. } | Event::Summarized { id, .. } => {
                         self.cancels.remove(id);
                     }
                     Event::ToolDone { id, .. } => {
@@ -825,8 +841,7 @@ impl Session {
                     | Event::Interrupt { .. }
                     | Event::ModelParts { .. }
                     | Event::Woke { .. }
-                    | Event::Compact
-                    | Event::Summarized { .. } => {}
+                    | Event::Compact => {}
                 }
                 // A model's response is settled under the rules file as it
                 // is now: its calls are granted then (C1).
@@ -902,6 +917,16 @@ impl Session {
                     Persisted::Refused => drop(reply.send(Err(self.full()))),
                 }
             }
+            Input::Compact {
+                command: Compact {},
+                reply,
+            } => match self.decide(Event::Compact).await? {
+                Persisted::Done(outcome, effects) => {
+                    drop(reply.send(self.compact_answer(outcome)));
+                    self.start_effects(effects);
+                }
+                Persisted::Refused => drop(reply.send(Err(self.full()))),
+            },
             Input::Read { from, reply } => drop(reply.send(self.read(from))),
             Input::Records { reply } => drop(reply.send(self.records.clone())),
             Input::Summary { reply } => drop(reply.send(crate::projection::summary(
@@ -1211,6 +1236,33 @@ impl Session {
         }
     }
 
+    fn compact_answer(&self, outcome: Outcome) -> Result<CompactReply, Rejection> {
+        match outcome {
+            Outcome::Accepted => Ok(CompactReply {
+                outcome: WireOutcome::Created,
+            }),
+            Outcome::Rejected(CoreRejection::Running) => {
+                Err(Rejection::TurnRunning { actor_id: self.id })
+            }
+            Outcome::Rejected(CoreRejection::Stopped) => {
+                Err(Rejection::ActorStopped { actor_id: self.id })
+            }
+            Outcome::Rejected(CoreRejection::Unborn) => {
+                Err(Rejection::UnknownActor { actor_id: self.id })
+            }
+            Outcome::Exists
+            | Outcome::Rejected(
+                CoreRejection::Limit
+                | CoreRejection::Mismatch
+                | CoreRejection::UnknownCall
+                | CoreRejection::NotRunning,
+            )
+            | Outcome::Stale => {
+                defect("a compact is accepted, or refused while running, stopped or unborn")
+            }
+        }
+    }
+
     fn read(&self, from: Offset) -> StreamRead {
         let tail = self.core.seq();
         let start = from.seq().min(tail);
@@ -1316,15 +1368,26 @@ impl Session {
                     report(&inbox, Event::Woke { id }).await;
                 });
             }
-            // The summarize call is not built yet: it fails at once, so a
-            // compaction at a full context parks the actor as before, and
-            // one at a turn's end changes nothing.
+            // v's housekeeping: the conversation so far, summarized under
+            // the same bound as a step's call (one budget).
             Effect::Summarize { id } => {
-                let inbox = self.inbox.clone();
-                self.seams.tasks.spawn(async move {
-                    let summary = Summary::Failed(ModelFault::Other);
-                    report(&inbox, Event::Summarized { id, summary }).await;
-                });
+                let request = history::summarize(
+                    &self.records,
+                    &self.config.system,
+                    self.config.limits.model_max_tokens,
+                );
+                #[cfg(feature = "sim")]
+                crate::shim::observe(crate::shim::Observation::Summarizing { actor: self.id, id });
+                let cancel = CancellationToken::new();
+                self.cancels.insert(id, cancel.clone());
+                let task = SummaryTask {
+                    model: Arc::clone(&self.seams.model),
+                    inbox: self.inbox.clone(),
+                    config: Arc::clone(&self.config),
+                    id,
+                    cancel,
+                };
+                self.seams.tasks.spawn(task.run(request));
             }
             // A stop has no deadline: it is sent until it lands (C2). Its
             // only waits are its parent's spawn of the child, if one is in
@@ -1667,6 +1730,73 @@ enum Next {
     Window,
 }
 
+/// A summarize call: the model's text, within `summary_bytes`. Tool calls
+/// it proposes are ignored; no text at all fails it.
+struct SummaryTask {
+    model: Arc<dyn Model>,
+    inbox: mpsc::Sender<Input>,
+    config: Arc<ShellConfig>,
+    id: EffectId,
+    cancel: CancellationToken,
+}
+
+impl SummaryTask {
+    async fn run(self, request: ModelRequest) {
+        let (sender, receiver) = mpsc::channel(self.config.limits.model_parts_queue);
+        // Stops the stream when the summary grows too large; an interrupt
+        // still stops both.
+        let stop = self.cancel.child_token();
+        let (streamed, written) = tokio::join!(
+            self.model.stream(&request, sender, &stop),
+            self.collect(receiver, &stop),
+        );
+        let summary = match (written, streamed) {
+            (Err(TooLarge), _) => Summary::Failed(ModelFault::TooLarge),
+            (Ok(_), Err(error)) => Summary::Failed(error.core_fault()),
+            (Ok(text), Ok(())) if text.trim().is_empty() => Summary::Failed(ModelFault::Other),
+            (Ok(text), Ok(())) => Summary::Written(measure(text)),
+        };
+        report(
+            &self.inbox,
+            Event::Summarized {
+                id: self.id,
+                summary,
+            },
+        )
+        .await;
+    }
+
+    /// The response's text, its blocks a blank line apart.
+    async fn collect(
+        &self,
+        mut receiver: mpsc::Receiver<ModelPart>,
+        stop: &CancellationToken,
+    ) -> Result<String, TooLarge> {
+        let limit = self.config.limits.summary_bytes;
+        let mut text = String::new();
+        while let Some(part) = receiver.recv().await {
+            let delta = match &part {
+                ModelPart::TextStart { .. } if !text.is_empty() => "\n\n",
+                ModelPart::TextDelta { delta, .. } => delta.as_str(),
+                ModelPart::TextStart { .. }
+                | ModelPart::TextEnd { .. }
+                | ModelPart::ToolInputStart { .. }
+                | ModelPart::ToolInputDelta { .. }
+                | ModelPart::ToolInputEnd { .. }
+                | ModelPart::ToolCall { .. }
+                | ModelPart::Finish { .. } => continue,
+            };
+            if text.len().saturating_add(delta.len()) > limit {
+                stop.cancel();
+                while receiver.recv().await.is_some() {}
+                return Err(TooLarge);
+            }
+            text.push_str(delta);
+        }
+        Ok(text)
+    }
+}
+
 /// The JSON length of `body`, as a log line holds it.
 fn json_len<T: serde::Serialize>(body: &T) -> usize {
     serde_json::to_vec(body).map_or_else(
@@ -1779,7 +1909,7 @@ impl Batcher {
 }
 
 impl ModelTask {
-    async fn run(self, request: crate::model::ModelRequest) {
+    async fn run(self, request: ModelRequest) {
         let (sender, receiver) = mpsc::channel(self.config.limits.model_parts_queue);
         // The batcher stops the stream through its own token when the
         // response is too large to record; an interrupt still stops both.

@@ -41,8 +41,9 @@ use verified_domain::Millis;
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId};
 use verified_wire::chunk::UiChunk;
 use verified_wire::command::{
-    ActorList, Approve, ApproveReply, Cancel, CancelReply, CreateActor, CreateActorReply,
-    DecodeError, Rejection, SendMessage, SendMessageReply, StopActor, StopReply, decode_reply,
+    ActorList, Approve, ApproveReply, Cancel, CancelReply, Compact, CompactReply, CreateActor,
+    CreateActorReply, DecodeError, Rejection, SendMessage, SendMessageReply, StopActor, StopReply,
+    decode_reply,
 };
 use verified_wire::sse::{SseDecoder, SseError};
 use verified_wire::stream::{Control, Offset, StreamError, StreamEvent, query};
@@ -116,6 +117,7 @@ impl ClientError {
                 | Rejection::NoPendingApproval { .. }
                 | Rejection::ApprovalExistsWithDifferentVerdict { .. }
                 | Rejection::TurnNotRunning { .. }
+                | Rejection::TurnRunning { .. }
                 | Rejection::ActorStopped { .. }
                 | Rejection::ActorFull { .. } => Recovery::GiveUp,
             },
@@ -151,6 +153,8 @@ pub enum Command {
         actor: ActorId,
         turn: TurnId,
     },
+    /// Compacts `actor`'s model history (`/compact`).
+    Compact(ActorId),
     /// Stops `actor` and every actor it spawned.
     Stop {
         actor: ActorId,
@@ -177,6 +181,10 @@ pub enum Answer {
     Cancelled {
         turn_id: TurnId,
         result: Result<CancelReply, ClientError>,
+    },
+    Compacted {
+        actor: ActorId,
+        result: Result<CompactReply, ClientError>,
     },
     Stopped {
         stop_id: MessageId,
@@ -271,6 +279,12 @@ impl Client {
                         format!("/actors/{actor}/cancel"),
                         Cancel { turn_id: turn }.encode(),
                     )
+                    .await,
+            },
+            Command::Compact(actor) => Answer::Compacted {
+                actor,
+                result: self
+                    .post(format!("/actors/{actor}/compact"), Compact {}.encode())
                     .await,
             },
             Command::Stop { actor, body } => Answer::Stopped {

@@ -22,8 +22,8 @@ use verified_domain::{
     Shape, Tool, TurnOutcome, Unstarted,
 };
 use verified_wire::chunk::{
-    EffectEnd, EnvelopeData, FinishReason, StepCarriesData, TaskEndedData, TaskStartedData,
-    TurnEndReason, TurnEndedData, TurnStartedData, UiChunk,
+    CompactedData, EffectEnd, EnvelopeData, FinishReason, StepCarriesData, TaskEndedData,
+    TaskStartedData, TurnEndReason, TurnEndedData, TurnStartedData, UiChunk,
 };
 use verified_wire::command::{ActorState, ActorSummary, TaskSummary};
 
@@ -345,11 +345,15 @@ impl Projector {
             }
             Record::Born { born } => self.name = Some(born.name.clone()),
             Record::RulesLoaded { rules, .. } => self.rules = Some(rules.clone()),
-            // The stream shows compaction in package B; until then, no
-            // chunk, as for an epoch.
-            Record::EpochBumped { .. }
-            | Record::CompactionStarted { .. }
-            | Record::Compacted { .. } => {}
+            // A cut shows once its summary is written: a failed one
+            // changes nothing the reader sees.
+            Record::Compacted { summary, .. } => chunks.push(UiChunk::Compacted {
+                payload: CompactedData {
+                    summary: summary.body.clone(),
+                    bytes: summary.bytes,
+                },
+            }),
+            Record::EpochBumped { .. } | Record::CompactionStarted { .. } => {}
         }
         chunks
     }

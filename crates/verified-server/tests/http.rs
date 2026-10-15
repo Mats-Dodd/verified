@@ -31,8 +31,8 @@ use verified_server::shell::{Seams, ShellConfig};
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
-    ActorList, ActorState, CreateActor, CreateActorReply, MessageText, Outcome, Rejection,
-    SendMessage, SendMessageReply, StopActor, StopReply, decode_reply,
+    ActorList, ActorState, Compact, CompactReply, CreateActor, CreateActorReply, MessageText,
+    Outcome, Rejection, SendMessage, SendMessageReply, StopActor, StopReply, decode_reply,
 };
 use verified_wire::sse::SseDecoder;
 use verified_wire::stream::{Freshness, StreamEvent};
@@ -758,4 +758,83 @@ async fn a_silent_model_times_out_as_a_network_failure() {
         matches!(&idle, Err(ModelError::Network(why)) if why.contains("a gap in the response")),
         "{idle:?}"
     );
+}
+
+#[tokio::test]
+async fn compact_is_refused_while_a_turn_runs_and_starts_between_turns() {
+    let (addr, tasks) = start().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let base = format!("http://{addr}");
+    let limits = WireLimits::DEFAULT;
+    let session = session_at(21);
+    let (status, _) = call(
+        &client,
+        Method::POST,
+        format!("{base}/actors"),
+        CreateActor { actor_id: session }.encode(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "created");
+    let compact = format!("{base}/actors/{session}/compact");
+    let (status, _) = call(
+        &client,
+        Method::POST,
+        compact.clone(),
+        b"{\"x\":1}".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "malformed body");
+
+    let message = SendMessage {
+        message_id: MessageId::from_parts(UnixMillis::new(1_700_000_000_001).expect("t"), &[5; 10]),
+        text: MessageText::parse("slow please".to_owned(), &limits).expect("text"),
+    };
+    let (status, _) = call(
+        &client,
+        Method::POST,
+        format!("{base}/actors/{session}/messages"),
+        message.encode(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "a turn starts");
+    let (status, body) = call(&client, Method::POST, compact.clone(), Compact {}.encode()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a turn is running");
+    assert_eq!(
+        decode_reply::<Rejection>(&body, &limits).ok(),
+        Some(Rejection::TurnRunning { actor_id: session }),
+        "typed"
+    );
+
+    let idle = async {
+        loop {
+            let (_, body) = call(&client, Method::GET, format!("{base}/actors"), Vec::new()).await;
+            let list: ActorList = decode_reply(&body, &limits).expect("a list");
+            if list
+                .actors
+                .iter()
+                .any(|actor| actor.actor_id == session && actor.state == ActorState::Idle)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    within(Duration::from_secs(20), idle)
+        .await
+        .expect("the turn ends");
+    let (status, body) = call(&client, Method::POST, compact, Compact {}.encode()).await;
+    assert_eq!(status, StatusCode::CREATED, "a compaction starts");
+    let reply: CompactReply = decode_reply(&body, &limits).expect("a reply");
+    assert_eq!(reply.outcome, Outcome::Created, "new");
+
+    let unknown = session_at(22);
+    let (status, _) = call(
+        &client,
+        Method::POST,
+        format!("{base}/actors/{unknown}/compact"),
+        Compact {}.encode(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no such actor");
+    tasks.shutdown().cancel();
 }

@@ -110,6 +110,17 @@ pub struct TaskEndedData {
     pub text: String,
 }
 
+/// `data` of [`UiChunk::Compacted`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactedData {
+    /// The summary the model is sent from here on, in place of everything
+    /// before the cut. The log, and the transcript, keep all of it.
+    pub summary: String,
+    /// Its size as the actor's context counts it.
+    pub bytes: u64,
+}
+
 /// `data` of [`UiChunk::TurnStarted`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,6 +255,13 @@ pub enum UiChunk {
         #[serde(rename = "data")]
         payload: TaskStartedData,
     },
+    /// The model's history was compacted: from here on it is sent this
+    /// summary, the actor's open work, and what follows.
+    #[serde(rename = "data-compacted")]
+    Compacted {
+        #[serde(rename = "data")]
+        payload: CompactedData,
+    },
     /// A task ended. This is also its notification: an envelope from `v`,
     /// `{"task": <id>}`, waiting in the mailbox until a step carries it.
     #[serde(rename = "data-task-end")]
@@ -283,6 +301,7 @@ impl UiChunk {
             Self::StepCarries { .. } => "data-step-carries",
             Self::TaskStarted { .. } => "data-task-start",
             Self::TaskEnded { .. } => "data-task-end",
+            Self::Compacted { .. } => "data-compacted",
         }
     }
 }
@@ -315,6 +334,19 @@ mod tests {
             serde_json::to_value(&chunk).expect("serializes"),
             json!({"type":"tool-input-available","toolCallId":"toolu_1","toolName":"read","input":{"path":"a.rs"}})
         );
+    }
+
+    #[test]
+    fn a_compaction_carries_its_summary() {
+        let chunk = UiChunk::Compacted {
+            payload: CompactedData {
+                summary: "done so far".to_owned(),
+                bytes: 13,
+            },
+        };
+        let value = json!({"type":"data-compacted","data":{"summary":"done so far","bytes":13u64}});
+        assert_eq!(serde_json::to_value(&chunk).expect("serializes"), value);
+        assert_eq!(decode(&value), chunk);
     }
 
     #[test]

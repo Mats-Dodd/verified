@@ -103,6 +103,7 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
             }
             Entry::Shell(
                 Observation::Requested { .. }
+                | Observation::Summarizing { .. }
                 | Observation::Passed(
                     Barrier::GroupWritten { .. }
                     | Barrier::Delivering { .. }

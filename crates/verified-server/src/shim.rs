@@ -577,6 +577,12 @@ pub enum Observation {
         id: verified_domain::EffectId,
         said: Vec<String>,
     },
+    /// The summarize call `id` of `actor` is about to be sent: its
+    /// `CompactionStarted` (at `id.seq`) must be durable (T1).
+    Summarizing {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+    },
     /// A barrier was reached.
     Passed(Barrier),
 }

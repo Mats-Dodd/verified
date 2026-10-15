@@ -601,6 +601,14 @@ impl App {
                 }
                 Cmd::None
             }
+            Answer::Compacted { actor, result } => {
+                if actor == self.actor
+                    && let Err(error) = result
+                {
+                    self.notice = Some(format!("cannot compact: {}", explain(&error)));
+                }
+                Cmd::None
+            }
             Answer::Stopped { stop_id, result } => {
                 if self
                     .stopping
@@ -958,7 +966,8 @@ fn refusal(rejection: &Rejection) -> String {
         | Rejection::MessageExistsWithDifferentText { .. }
         | Rejection::NoPendingApproval { .. }
         | Rejection::ApprovalExistsWithDifferentVerdict { .. }
-        | Rejection::TurnNotRunning { .. } => None,
+        | Rejection::TurnNotRunning { .. }
+        | Rejection::TurnRunning { .. } => None,
     };
     match hint {
         Some(hint) => format!("{rejection} ({hint})"),

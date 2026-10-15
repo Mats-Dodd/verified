@@ -25,8 +25,13 @@ pub struct ServerLimits {
     pub model_parts_queue: usize,
     /// Most streamed parts one model call may produce before it is failed.
     pub model_parts_per_call: usize,
-    /// `max_tokens` sent with every model request.
+    /// `max_tokens` sent with every model request, a summarize call's
+    /// included: if a step would fit, so does its summary (one budget).
     pub model_max_tokens: u32,
+    /// Largest summary a summarize call may write; past it the call fails
+    /// (`ModelFault::TooLarge`). [`ServerLimits::check`] makes sure its
+    /// `Compacted` fits a log line.
+    pub summary_bytes: usize,
     /// Largest error body read from a failed model response.
     pub model_error_body_bytes: usize,
     /// Longest a model call waits to dial and handshake (TCP and TLS).
@@ -110,6 +115,10 @@ const PROJECTION_GROWTH: usize = 2;
 /// JSON escapes a byte into at most six (`\u00XX`).
 const ESCAPED: usize = 6;
 
+/// The most one entry of a `Compacted`'s open work (a task's id, a child's)
+/// adds to its line as JSON: a quoted id and a comma.
+const OPEN_ENTRY_JSON: usize = 48;
+
 /// Why a [`ServerLimits`] cannot run a daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("limits: {what} needs {needed} bytes, more than {have}")]
@@ -170,6 +179,17 @@ impl ServerLimits {
             budget,
         )?;
         fits(
+            "a summary at its bound, escaped, with its open work",
+            self.summary_bytes.checked_mul(ESCAPED).and_then(|bytes| {
+                self.core
+                    .tasks_per_actor()
+                    .checked_add(self.core.children_per_actor())
+                    .and_then(|entries| entries.checked_mul(OPEN_ENTRY_JSON))
+                    .and_then(|entries| bytes.checked_add(entries))
+            }),
+            budget,
+        )?;
+        fits(
             "a record's frame",
             RECORD_OVERHEAD.checked_add(1),
             self.log_line_bytes,
@@ -223,6 +243,7 @@ impl ServerLimits {
             model_parts_queue: 256,
             model_parts_per_call: 65_536,
             model_max_tokens: 8_192,
+            summary_bytes: 32 << 10,
             model_error_body_bytes: 64 << 10,
             model_connect_timeout: Millis::new(10_000),
             model_response_timeout: Millis::new(60_000),
@@ -246,6 +267,36 @@ impl ServerLimits {
             deadline_slack: Millis::new(30_000),
             deliver_deadline: Millis::new(60_000),
             task_timeout: Millis::new(1_800_000),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use verified_domain::id::{ActorId, TaskId, UnixMillis};
+
+    use super::{OPEN_ENTRY_JSON, ServerLimits};
+
+    #[test]
+    fn v0_fits_every_record() {
+        assert_eq!(ServerLimits::v0().check(), Ok(()), "v0's limits fit");
+    }
+
+    #[test]
+    fn an_open_entry_fits_its_json_bound() {
+        let child = ActorId::from_parts(
+            UnixMillis::new(UnixMillis::MAX).expect("a time"),
+            &[u8::MAX; 10],
+        );
+        for json in [
+            serde_json::to_vec(&child).expect("an id serializes"),
+            serde_json::to_vec(&TaskId(u64::MAX)).expect("an id serializes"),
+        ] {
+            assert!(
+                json.len().saturating_add(1) <= OPEN_ENTRY_JSON,
+                "{} bytes and a comma fit",
+                json.len()
+            );
         }
     }
 }

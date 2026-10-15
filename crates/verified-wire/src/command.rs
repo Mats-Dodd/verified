@@ -17,6 +17,8 @@
 //!   running turn: it enters at the next step boundary;
 //! - `POST /actors/{id}/approvals` [`Approve`], for that actor's calls;
 //! - `POST /actors/{id}/cancel` [`Cancel`] (Esc);
+//! - `POST /actors/{id}/compact` [`Compact`] (`/compact`): summarizes the
+//!   actor's history between turns; refused while a turn runs;
 //! - `POST /actors/{id}/stop` [`StopActor`]: a 200 means the stop is durably
 //!   in the actor's mailbox; the actor and every actor it spawned stop;
 //! - `GET /actors/{id}/stream?offset=…`, the actor's stream.
@@ -212,6 +214,28 @@ impl Cancel {
     }
 }
 
+/// Compacts an actor's model history between turns.
+///
+/// v summarizes the conversation so far, and the model is sent the summary
+/// from then on; the log keeps everything. It carries no id: a repeat
+/// compacts again, which is harmless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compact {}
+
+impl Compact {
+    /// # Errors
+    /// An oversized or malformed body.
+    pub fn decode(body: &[u8], limits: &WireLimits) -> Result<Self, DecodeError> {
+        json_body(body, limits)
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        json_of(self)
+    }
+}
+
 /// Stops an actor: it revokes everything it holds and stops every actor it
 /// spawned. The stop id is the `TigerBeetle` id: a repeat is "exists".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +300,14 @@ pub struct ApproveReply {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CancelReply {
     pub turn_id: TurnId,
+    pub outcome: Outcome,
+}
+
+/// Reply to [`Compact`]: the compaction started. Its summary lands in the
+/// stream (`data-compacted`) once written; a failed one changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactReply {
     pub outcome: Outcome,
 }
 
@@ -381,6 +413,10 @@ pub enum Rejection {
     ApprovalExistsWithDifferentVerdict { call_id: CallId, verdict: Verdict },
     #[error("turn {turn_id} is not running")]
     TurnNotRunning { turn_id: TurnId },
+    /// A turn is running: the actor compacts between turns, or at a beat
+    /// when a step will not fit.
+    #[error("a turn is running")]
+    TurnRunning { actor_id: ActorId },
     /// The actor was stopped: it takes nothing more.
     #[error("actor {actor_id} is stopped")]
     ActorStopped { actor_id: ActorId },
@@ -408,6 +444,7 @@ impl Rejection {
             | Self::NoPendingApproval { .. }
             | Self::ApprovalExistsWithDifferentVerdict { .. }
             | Self::TurnNotRunning { .. }
+            | Self::TurnRunning { .. }
             | Self::ActorStopped { .. }
             | Self::ActorFull { .. } => 409,
             Self::TooManyActors { .. } | Self::TooManyFollowers { .. } => 503,
@@ -481,6 +518,28 @@ mod tests {
         let body = cancel.encode();
         assert_eq!(body, br#"{"turnId":"7"}"#.to_vec());
         assert_eq!(Cancel::decode(&body, &LIMITS).ok(), Some(cancel));
+    }
+
+    #[test]
+    fn compact_has_an_empty_body() {
+        assert_eq!(Compact {}.encode(), b"{}".to_vec());
+        assert_eq!(Compact::decode(b"{}", &LIMITS).ok(), Some(Compact {}));
+        assert!(
+            matches!(
+                Compact::decode(br#"{"x":1}"#, &LIMITS),
+                Err(DecodeError::Json(_))
+            ),
+            "unknown fields are refused"
+        );
+        let busy = Rejection::TurnRunning {
+            actor_id: ActorId::parse("01a10400-0000-7000-8000-000000000001").expect("an id"),
+        };
+        assert_eq!(busy.status(), 409, "a conflict with the running turn");
+        assert_eq!(
+            encode_reply(&busy),
+            br#"{"error":"turn-running","actorId":"01a10400-0000-7000-8000-000000000001"}"#
+                .to_vec()
+        );
     }
 
     #[test]

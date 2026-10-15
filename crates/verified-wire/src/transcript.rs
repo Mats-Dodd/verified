@@ -3,7 +3,8 @@
 //! The transcript is an actor's conversation: its turns, each with the
 //! envelopes its steps carried (a user's message, a message from another
 //! actor, a task's notification) and the reply; the envelopes that landed
-//! and wait in the mailbox; and its tasks. An envelope lands
+//! and wait in the mailbox; its tasks; and its latest compaction. An
+//! envelope lands
 //! (`data-envelope`, or a task's end, which is its own notification) and
 //! waits until a step carries it (`data-step-carries`): a message sent
 //! while a turn runs steers it, and enters that turn at its next step.
@@ -569,7 +570,8 @@ impl ReplyBuilder {
             | UiChunk::TurnEnded { .. }
             | UiChunk::StepCarries { .. }
             | UiChunk::TaskStarted { .. }
-            | UiChunk::TaskEnded { .. } => {}
+            | UiChunk::TaskEnded { .. }
+            | UiChunk::Compacted { .. } => {}
         }
         Ok(())
     }
@@ -629,6 +631,17 @@ pub struct TaskView {
     /// How it ended and what it said; `None` while it runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<(EffectEnd, String)>,
+}
+
+/// The latest compaction of the model's history: what the model is sent in
+/// place of everything before it. The transcript keeps all of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Compaction {
+    pub summary: String,
+    pub bytes: u64,
+    /// The turns started before it: it follows the last of them.
+    pub turns: usize,
 }
 
 /// One turn: what its steps carried and everything the stream says about
@@ -777,6 +790,7 @@ pub struct Transcript {
     turns: Vec<TranscriptTurn>,
     queued: Vec<Mail>,
     tasks: BTreeMap<TaskId, TaskView>,
+    compacted: Option<Compaction>,
     stopped: bool,
     limits: FoldLimits,
 }
@@ -788,6 +802,7 @@ impl Transcript {
             turns: Vec::with_capacity(limits.max_turns),
             queued: Vec::new(),
             tasks: BTreeMap::new(),
+            compacted: None,
             stopped: false,
             limits: FoldLimits {
                 turns: limits.max_turns,
@@ -821,6 +836,12 @@ impl Transcript {
     #[must_use]
     pub const fn tasks(&self) -> &BTreeMap<TaskId, TaskView> {
         &self.tasks
+    }
+
+    /// The latest compaction, if the history was ever compacted.
+    #[must_use]
+    pub const fn compacted(&self) -> Option<&Compaction> {
+        self.compacted.as_ref()
     }
 
     /// A stop landed: the actor starts nothing more.
@@ -922,6 +943,19 @@ impl Transcript {
                 Ok(())
             }
             UiChunk::StepCarries { id, payload } => self.carry(chunk, *id, &payload.envelopes),
+            UiChunk::Compacted { payload } => {
+                if payload.summary.len() > self.limits.part_bytes {
+                    return Err(FoldError::PartTooLarge {
+                        limit: self.limits.part_bytes,
+                    });
+                }
+                self.compacted = Some(Compaction {
+                    summary: payload.summary.clone(),
+                    bytes: payload.bytes,
+                    turns: self.turns.len(),
+                });
+                Ok(())
+            }
             UiChunk::TaskStarted { id, payload } => {
                 if self.tasks.contains_key(id) {
                     return Err(FoldError::Task {

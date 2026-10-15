@@ -439,6 +439,7 @@ fn a_small_log() -> ServerLimits {
     let mut limits = hosts::limits();
     limits.wire.max_message_text_bytes = 1_000;
     limits.tool_output_bytes = 1_000;
+    limits.summary_bytes = 1_000;
     limits.log_line_bytes = 16usize << 10u32;
     limits.log_file_bytes = u64::try_from(limits.log_line_bytes).expect("small");
     limits
@@ -830,6 +831,7 @@ fn a_log_that_fills_at_a_dispatch(file_bytes: u64) -> Scenario {
     let mut limits = hosts::limits();
     limits.wire.max_message_text_bytes = 1_000;
     limits.tool_output_bytes = 1_000;
+    limits.summary_bytes = 1_000;
     limits.log_line_bytes = 13_200;
     limits.log_file_bytes = file_bytes;
     Scenario {

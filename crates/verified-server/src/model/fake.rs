@@ -24,6 +24,12 @@
 //! - an envelope from an agent or from v is scripted by its text, without
 //!   the header the history gives it
 //! - anything else   streams `Echo: <message>`, a word per delta
+//! - a summarize call (the last block is the built-in instruction) is
+//!   answered `Summary: N messages, B bytes.`: a digest that quotes
+//!   nothing, so a message is told only where a step carries it. N counts
+//!   the messages the summary stands for, an earlier summary's included,
+//!   so tool call ids stay unique across cuts. Scripts never read the
+//!   summary or the open work beside it
 //!
 //! A last user message of only tool results is answered with the script's
 //! next step, or `Result: <first result>` once the script is done.
@@ -49,6 +55,9 @@ use tokio::sync::mpsc;
 use verified_domain::Millis;
 use verified_wire::sse::SseEvent;
 
+use verified_domain::INSTRUCTION;
+
+use crate::history::{OPEN_HEADER, SUMMARY_HEADER};
 use crate::payload::{tool_name, tool_named};
 use crate::seam::{Clock, Tasks};
 
@@ -149,6 +158,47 @@ fn words(text: &str) -> Vec<String> {
     words
 }
 
+/// The text of a text block, unless v wrote it at a cut (the summary, the
+/// open work): no script reads those.
+fn scripted(block: &Value) -> &str {
+    let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.starts_with(SUMMARY_HEADER) || text.starts_with(OPEN_HEADER) {
+        ""
+    } else {
+        text
+    }
+}
+
+/// How many messages the summary that opens `messages` stands for: 0 with
+/// none.
+fn summarized(messages: &[Value]) -> usize {
+    messages
+        .first()
+        .and_then(|first| first.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| text.strip_prefix(SUMMARY_HEADER))
+        .and_then(|summary| summary.strip_prefix("Summary: "))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `messages` is a summarize call's: its last block is the
+/// instruction.
+fn summarizing(messages: &[Value]) -> bool {
+    messages
+        .last()
+        .and_then(|last| last.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.last())
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        == Some(INSTRUCTION)
+}
+
 /// The text of `message`, and its tool results' (`content`, `is_error`),
 /// in order.
 fn said_in(message: &Value) -> (String, Vec<(String, bool)>) {
@@ -164,7 +214,7 @@ fn said_in(message: &Value) -> (String, Vec<(String, bool)>) {
         .unwrap_or_default()
     {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("text") => text.push_str(scripted(block)),
             Some("tool_result") => results.push((
                 block
                     .get("content")
@@ -273,7 +323,7 @@ fn last_said(request: &Value) -> (String, Option<(String, bool)>) {
         .unwrap_or_default()
     {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("text") => text.push_str(scripted(block)),
             Some("tool_result") if result.is_none() => {
                 let content = block
                     .get("content")
@@ -461,8 +511,23 @@ pub fn reply(request: &Value) -> Reply {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let turn = messages.len();
+    // Messages so far, those a summary stands for included: tool call ids
+    // never repeat across a cut.
+    let turn = summarized(messages).saturating_add(messages.len());
     let quick = Millis::new(0);
+    if summarizing(messages) {
+        let bytes = serde_json::to_string(messages).map_or(0, |json| json.len());
+        let mut events = vec![message_start()];
+        events.extend(text_block(
+            0,
+            &words(&format!("Summary: {turn} messages, {bytes} bytes.")),
+        ));
+        events.extend(message_end("end_turn"));
+        return Reply::Events {
+            events,
+            pace: quick,
+        };
+    }
     let (script, step, results) = script(messages);
     let from = sender(&script).map(str::to_owned);
     // A later step of a script runs its next part, its placeholders filled
@@ -633,7 +698,7 @@ impl futures_core::Stream for Chunks {
 mod tests {
     use serde_json::json;
 
-    use super::{Reply, malformed, reply};
+    use super::{INSTRUCTION, OPEN_HEADER, Reply, SUMMARY_HEADER, malformed, reply};
 
     /// The tool calls `reply` proposes: each one's name and input.
     fn proposed(reply: &Reply) -> Vec<(String, serde_json::Value)> {
@@ -737,6 +802,67 @@ mod tests {
         );
         assert!(malformed(&request(vec![text, result])).is_some(), "spliced");
         assert!(malformed(&request(Vec::new())).is_some(), "unanswered");
+    }
+
+    /// The text `reply` streams.
+    fn text(reply: &Reply) -> String {
+        let Reply::Events { events, .. } = reply else {
+            return String::new();
+        };
+        events
+            .iter()
+            .filter_map(|event| event.pointer("/delta/text").and_then(|text| text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_summarize_call_is_answered_with_a_digest() {
+        let request = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "secret plans"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Echo: secret plans"}]},
+            {"role": "user", "content": [{"type": "text", "text": INSTRUCTION}]},
+        ]});
+        let summary = text(&reply(&request));
+        assert!(summary.starts_with("Summary: 3 messages, "), "{summary}");
+        assert!(!summary.contains("secret"), "a digest quotes nothing");
+        assert!(proposed(&reply(&request)).is_empty(), "and calls no tool");
+    }
+
+    #[test]
+    fn scripts_skip_the_summary_and_count_what_it_stands_for() {
+        let summary = format!("{SUMMARY_HEADER}Summary: 9 messages, 400 bytes.");
+        let request = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": summary},
+                {"type": "text", "text": format!("{OPEN_HEADER}task 3 is running")},
+                {"type": "text", "text": "read a.txt"},
+            ]},
+        ]});
+        let events = match reply(&request) {
+            Reply::Events { events, .. } => events,
+            Reply::Status { .. } => Vec::new(),
+        };
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .pointer("/content_block/id")
+                    .and_then(|id| id.as_str())
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["toolu_10_0"],
+            "the script, its id past every earlier one"
+        );
+        let after = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": summary}]},
+        ]});
+        assert_eq!(
+            text(&reply(&after)),
+            "Echo: ",
+            "a summary alone scripts nothing"
+        );
     }
 
     #[test]

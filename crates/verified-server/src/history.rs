@@ -10,11 +10,21 @@
 //! rendered as text from their exit and reason. Consecutive messages of one
 //! role merge. Every payload is already its parsed type: nothing here
 //! guesses or substitutes.
+//!
+//! After a compaction the conversation starts from the latest `Compacted`:
+//! its summary and the actor's open work, as one message of the user's at
+//! its cut, then what follows the cut as before. The log is read whole all
+//! the same: mail delivered before the cut and not yet carried is told at
+//! the step that carries it, and the turn's calls keep their numbers.
+//! A summarize call is sent the conversation as it is now, the latest
+//! summary included, with [`INSTRUCTION`] after it.
 
 use std::collections::BTreeMap;
 
 use verified_domain::id::{CallId, ToolName};
-use verified_domain::{Address, Body, EnvelopeId, Exit, Record, Request, Unstarted};
+use verified_domain::{
+    Address, Body, EnvelopeId, Exit, INSTRUCTION, OpenWork, Record, Request, Unstarted,
+};
 
 use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
 use crate::payload::{ModelPart, Parsed, ToolInput};
@@ -52,6 +62,27 @@ struct Builder {
     splice: bool,
     /// The planted defect: a task's end is never told ([`untold`]).
     untold: bool,
+}
+
+/// What opens the summary at a cut: the model reads what follows as its
+/// own summary of everything before it.
+pub const SUMMARY_HEADER: &str = "Summary of the conversation before this point:\n\n";
+
+/// What opens each line of open work beside a summary.
+pub const OPEN_HEADER: &str = "[v] open: ";
+
+/// The lines that tell the model its open work beside a summary, one per
+/// running task and per child, each within `OPEN_ENTRY_BYTES`.
+pub fn open_lines(open: &OpenWork) -> impl Iterator<Item = String> + '_ {
+    let tasks = open
+        .tasks
+        .iter()
+        .map(|task| format!("{OPEN_HEADER}task {task} is running"));
+    let children = open
+        .children
+        .iter()
+        .map(|child| format!("{OPEN_HEADER}you spawned child {child}"));
+    tasks.chain(children)
 }
 
 /// The model-facing text of a result the core synthesized.
@@ -99,6 +130,18 @@ impl Builder {
             Some(last) if last.role == role => last.content.extend(content),
             Some(_) | None => self.messages.push(Message { role, content }),
         }
+    }
+
+    /// Starts the conversation over at a cut: the summary and the open
+    /// work, as the user's. The step the cut closed is in the summary.
+    fn restart(&mut self, summary: &str, open: &OpenWork) {
+        self.messages.clear();
+        self.step = None;
+        let mut said = vec![Content::Text {
+            text: format!("{SUMMARY_HEADER}{summary}"),
+        }];
+        said.extend(open_lines(open).map(|text| Content::Text { text }));
+        self.push(Role::User, said);
     }
 
     /// Ends the open step: its text, the calls that have results, then the
@@ -334,6 +377,26 @@ pub fn untold(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mode
     build(records, system, max_tokens, (false, true))
 }
 
+/// The request for a summarize call, its `CompactionStarted` the last record.
+///
+/// The conversation so far, from the latest summary, then [`INSTRUCTION`].
+/// Mail not yet carried is not in it (T4: a cut never holds unread mail).
+#[must_use]
+pub fn summarize(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    let mut request = request(records, system, max_tokens);
+    let instruction = Content::Text {
+        text: INSTRUCTION.to_owned(),
+    };
+    match request.messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(instruction),
+        Some(_) | None => request.messages.push(Message {
+            role: Role::User,
+            content: vec![instruction],
+        }),
+    }
+    request
+}
+
 /// The text blocks of `request`'s last message, if it is the user's turn:
 /// where what the step about to run carried is told.
 #[must_use]
@@ -369,8 +432,26 @@ fn build(
         splice,
         untold,
     };
+    // The latest summary, and the cut it starts the conversation at.
+    let cut = records.iter().rev().find_map(|record| {
+        if let Record::Compacted {
+            started,
+            summary,
+            open,
+        } = record
+        {
+            Some((*started, &summary.body, open))
+        } else {
+            None
+        }
+    });
     for (seq, record) in (0u64..).zip(records) {
         builder.record(seq, record);
+        if let Some((started, summary, open)) = cut
+            && seq == started
+        {
+            builder.restart(summary, open);
+        }
     }
     // The step about to run has no parts yet; a previous step closes here.
     if let Some(step) = &builder.step
@@ -407,5 +488,31 @@ fn build(
         messages: builder.messages,
         max_tokens,
         tools,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use verified_domain::id::{ActorId, TaskId, UnixMillis};
+    use verified_domain::{OPEN_ENTRY_BYTES, OpenWork};
+
+    use super::open_lines;
+
+    #[test]
+    fn every_open_line_fits_its_entry() {
+        let child = ActorId::from_parts(
+            UnixMillis::new(UnixMillis::MAX).expect("a time"),
+            &[u8::MAX; 10],
+        );
+        let open = OpenWork {
+            tasks: vec![TaskId(u64::MAX)],
+            children: vec![child],
+        };
+        let lines: Vec<String> = open_lines(&open).collect();
+        assert_eq!(lines.len(), 2, "a line per task and per child");
+        for line in lines {
+            let bytes = u64::try_from(line.len()).expect("a short line");
+            assert!(bytes <= OPEN_ENTRY_BYTES, "{line} is within its entry");
+        }
     }
 }

@@ -2,7 +2,7 @@
 //! addressed by its id.
 //!
 //! - `POST /actors`, `/actors/{id}/messages`, `/approvals`, `/cancel`,
-//!   `/stop`:
+//!   `/compact`, `/stop`:
 //!   commands with client-minted ids; a repeat answers `exists`
 //!   (`TigerBeetle`), a conflicting repeat is a 409 rejection. A message is
 //!   answered once it is durably in the actor's mailbox; to a busy actor it
@@ -33,8 +33,8 @@ use axum::routing::{get, post};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use verified_domain::id::ActorId;
 use verified_wire::command::{
-    ActorList, Approve, Cancel, CreateActor, CreateActorReply, Outcome as WireOutcome, Rejection,
-    SendMessage, StopActor, encode_reply,
+    ActorList, Approve, Cancel, Compact, CreateActor, CreateActorReply, Outcome as WireOutcome,
+    Rejection, SendMessage, StopActor, encode_reply,
 };
 use verified_wire::sse::KEEP_ALIVE;
 use verified_wire::stream::{
@@ -85,6 +85,7 @@ pub fn router(app: App) -> Router {
         .route("/actors/{id}/messages", post(send_message))
         .route("/actors/{id}/approvals", post(approve))
         .route("/actors/{id}/cancel", post(cancel))
+        .route("/actors/{id}/compact", post(compact))
         .route("/actors/{id}/stop", post(stop))
         .route("/actors/{id}/stream", get(read_stream))
         .layer(DefaultBodyLimit::max(body_limit))
@@ -231,6 +232,21 @@ async fn cancel(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> 
         Err(error) => return rejection(&Rejection::from(error)),
     };
     match handle.cancel(command).await {
+        Ok(reply) => json(created(reply.outcome), encode_reply(&reply)),
+        Err(error) => command_error(&error),
+    }
+}
+
+async fn compact(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
+    let handle = match session(&app, &id).await {
+        Ok(handle) => handle,
+        Err(response) => return *response,
+    };
+    let command = match Compact::decode(&body, &app.limits.wire) {
+        Ok(command) => command,
+        Err(error) => return rejection(&Rejection::from(error)),
+    };
+    match handle.compact(command).await {
         Ok(reply) => json(created(reply.outcome), encode_reply(&reply)),
         Err(error) => command_error(&error),
     }

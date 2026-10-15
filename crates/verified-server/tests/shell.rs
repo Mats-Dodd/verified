@@ -20,7 +20,9 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::id::{ActorId, CallId, IdEntropy, MessageId, TurnId, UnixMillis};
-use verified_domain::{Exit, Grant, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome};
+use verified_domain::{
+    Exit, Grant, INSTRUCTION, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome,
+};
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
     BashGrant, DirEntry, EditGrant, EntryKind, Env, EnvError, ExecOptions, ExitStatus, Kept,
@@ -28,6 +30,8 @@ use verified_server::env::{
 };
 use verified_server::limits::ServerLimits;
 use verified_server::log::{Log, LogError, LogStore, MemDisk, MemLogStore};
+use verified_server::model::{Content, Model, ModelError, ModelRequest};
+use verified_server::payload::ModelPart;
 use verified_server::payload::{Parsed, ProjectPath};
 use verified_server::projection::Projector;
 use verified_server::seam::{Clock, OsEntropy, SystemClock, Tasks};
@@ -35,7 +39,7 @@ use verified_server::shell::{ActorHandle, CommandError, Planted, Seams, ShellCon
 use verified_wire::WireLimits;
 use verified_wire::chunk::{TurnEndReason, UiChunk};
 use verified_wire::command::{
-    Approve, Cancel, MessageText, Outcome, Rejection, SendMessage, Verdict,
+    Approve, Cancel, Compact, MessageText, Outcome, Rejection, SendMessage, Verdict,
 };
 use verified_wire::stream::Offset;
 use verified_wire::transcript::Transcript;
@@ -221,10 +225,21 @@ async fn boot_on(
     limits: ServerLimits,
     planted: Planted,
 ) -> Daemon {
+    boot_model(store, env, limits, planted, |model| model).await
+}
+
+/// Boots on the scripted model as `wrap` makes it.
+async fn boot_model(
+    store: Arc<dyn LogStore>,
+    env: Arc<dyn Env>,
+    limits: ServerLimits,
+    planted: Planted,
+    wrap: impl FnOnce(Arc<dyn Model>) -> Arc<dyn Model>,
+) -> Daemon {
     let tasks = Tasks::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let seams = Seams {
-        model: Arc::new(fake_model(&limits, &clock, &tasks).await),
+        model: wrap(Arc::new(fake_model(&limits, &clock, &tasks).await)),
         env,
         clock,
         entropy: Arc::new(OsEntropy),
@@ -1027,6 +1042,7 @@ fn small_limits() -> ServerLimits {
     let mut small = limits();
     small.wire.max_message_text_bytes = 1_000;
     small.tool_output_bytes = 1_000;
+    small.summary_bytes = 1_000;
     small.log_line_bytes = 16usize << 10u32;
     small.log_file_bytes = 48u64 << 10u32;
     small
@@ -1651,10 +1667,14 @@ async fn a_background_command_resolves_at_once_and_notifies_when_it_ends() {
     let request = verified_server::history::request(&log, "", 16);
     let started = format!("Started task {task}");
     assert!(
-        request.messages.iter().flat_map(|message| &message.content).any(|content| matches!(
-            content,
-            verified_server::model::Content::ToolResult { text, .. } if text.starts_with(&started)
-        )),
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(
+                content,
+                Content::ToolResult { text, .. } if text.starts_with(&started)
+            )),
         "the model learns its task, to cancel it: {:?}",
         request.messages
     );
@@ -2740,6 +2760,288 @@ async fn an_exact_rule_grants_its_command_alone() {
             .collect::<Vec<_>>(),
         ["echo a"],
         "the rule's own command runs without asking"
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// A context of 1000 bytes: a short turn fits, a message of 800 bytes after
+/// it does not.
+fn small_context() -> ServerLimits {
+    let mut limits = limits();
+    limits.core = Limits::new(LimitsConfig {
+        retry_schedule: vec![Millis::new(1), Millis::new(1)],
+        context_bytes: core::num::NonZeroU64::new(1_000).expect("nonzero"),
+        ..LimitsConfig::v0()
+    });
+    limits
+}
+
+/// The scripted model, except that a summarize call waits for its cancel.
+#[derive(Debug)]
+struct StalledSummaries {
+    model: Arc<dyn Model>,
+}
+
+#[async_trait]
+impl Model for StalledSummaries {
+    async fn stream(
+        &self,
+        request: &ModelRequest,
+        parts: mpsc::Sender<ModelPart>,
+        cancel: &CancellationToken,
+    ) -> Result<(), ModelError> {
+        let summarizing = request
+            .messages
+            .last()
+            .and_then(|message| message.content.last())
+            .is_some_and(|block| matches!(block, Content::Text { text } if text == INSTRUCTION));
+        if summarizing {
+            cancel.cancelled().await;
+            return Err(ModelError::Interrupted);
+        }
+        self.model.stream(request, parts, cancel).await
+    }
+}
+
+fn stalled(model: Arc<dyn Model>) -> Arc<dyn Model> {
+    Arc::new(StalledSummaries { model })
+}
+
+/// Each `Compacted`'s cut and summary, in log order.
+fn summaries(log: &[Record<Parsed>]) -> Vec<(u64, String)> {
+    log.iter()
+        .filter_map(|record| {
+            if let Record::Compacted {
+                started, summary, ..
+            } = record
+            {
+                Some((*started, summary.body.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The seqs of every `CompactionStarted`.
+fn cuts(log: &[Record<Parsed>]) -> Vec<u64> {
+    (0u64..)
+        .zip(log)
+        .filter_map(|(seq, record)| {
+            matches!(record, Record::CompactionStarted { .. }).then_some(seq)
+        })
+        .collect()
+}
+
+fn turn_outcome(log: &[Record<Parsed>], turn: TurnId) -> Option<TurnOutcome> {
+    log.iter().find_map(|record| {
+        if let Record::TurnEnded {
+            turn: ended,
+            outcome,
+        } = record
+            && *ended == turn
+        {
+            Some(*outcome)
+        } else {
+            None
+        }
+    })
+}
+
+/// A short turn, then a message that does not fit beside it: the second
+/// turn's first beat compacts. Returns that turn.
+async fn overflow(handle: &ActorHandle) -> TurnId {
+    let first = handle.send_message(send(1, "hi")).await.expect("accepted");
+    until(handle, ended(first.turn_id)).await;
+    let log = records(handle).await;
+    assert!(cuts(&log).is_empty(), "a short turn needs no compaction");
+    handle
+        .send_message(send(2, &"x".repeat(800)))
+        .await
+        .expect("accepted")
+        .turn_id
+}
+
+#[tokio::test]
+async fn a_full_context_compacts_at_the_beat_and_the_turn_goes_on() {
+    let daemon = boot_with(
+        &MemDisk::new(),
+        Arc::new(MemEnv::default()),
+        small_context(),
+    )
+    .await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let turn = overflow(&handle).await;
+    // The turn ends past 80% of the context: it compacts again, idle, and
+    // the second summary is made from the first (summary-on-summary).
+    let log = until_log(&handle, |log| summaries(log).len() == 2).await;
+    assert_eq!(
+        turn_outcome(&log, turn),
+        Some(TurnOutcome::Completed),
+        "the turn goes on once the summary is written"
+    );
+    let found = summaries(&log);
+    let (cut, first) = found.first().expect("a summary at the beat");
+    assert!(first.starts_with("Summary: 3 messages"), "{first}");
+    let (_, second) = found.get(1).expect("a summary at the turn's end");
+    assert!(
+        second.starts_with("Summary: 6 messages"),
+        "the second stands for the first's messages too: {second}"
+    );
+    let carried = (0u64..).zip(&log).find_map(|(seq, record)| {
+        if let Record::StepStarted { step, carries } = record
+            && step.turn == turn
+            && !carries.is_empty()
+        {
+            Some(seq)
+        } else {
+            None
+        }
+    });
+    assert!(
+        carried.is_some_and(|carried| carried > *cut),
+        "the message waits behind the cut and its step carries it after"
+    );
+    let transcript = fold(&handle).await;
+    assert_eq!(
+        reply_text(&transcript, 1),
+        format!("Echo: {}", "x".repeat(800)),
+        "the model was told the message after the summary"
+    );
+    let compacted = transcript
+        .compacted()
+        .expect("the stream shows the summary");
+    assert_eq!(compacted.summary, *second, "the latest summary");
+    assert_eq!(compacted.turns, 2, "after both turns");
+    daemon.tasks.shutdown().cancel();
+}
+
+#[tokio::test]
+async fn esc_cancels_a_compaction_and_the_actor_stays_parked() {
+    let disk = MemDisk::new();
+    let store = Arc::new(MemLogStore::new(
+        disk.clone(),
+        small_context().log_line_bytes,
+        small_context().log_file_bytes,
+    ));
+    let daemon = boot_model(
+        store,
+        Arc::new(MemEnv::default()),
+        small_context(),
+        Planted::None,
+        stalled,
+    )
+    .await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let turn = overflow(&handle).await;
+    until_log(&handle, |log| !cuts(log).is_empty()).await;
+    handle
+        .cancel(Cancel { turn_id: turn })
+        .await
+        .expect("cancelling");
+    let log = until_log(&handle, |log| turn_outcome(log, turn).is_some()).await;
+    assert_eq!(
+        turn_outcome(&log, turn),
+        Some(TurnOutcome::Cancelled),
+        "Esc ends the turn"
+    );
+    assert!(summaries(&log).is_empty(), "nothing was summarized");
+    let summary = handle.summary().await.expect("runs").expect("born");
+    assert_eq!(summary.unread, 1, "the message waits, unread");
+    assert!(
+        !log.iter().any(|record| matches!(
+            record,
+            Record::TurnStarted { turn: started } if *started > turn
+        )),
+        "no turn starts by itself"
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+#[tokio::test]
+async fn a_crash_mid_compaction_compacts_again() {
+    let disk = MemDisk::new();
+    let store = Arc::new(MemLogStore::new(
+        disk.clone(),
+        small_context().log_line_bytes,
+        small_context().log_file_bytes,
+    ));
+    let first = boot_model(
+        store,
+        Arc::new(MemEnv::default()),
+        small_context(),
+        Planted::None,
+        stalled,
+    )
+    .await;
+    let (_, handle) = first.registry.create(session_id()).await.expect("created");
+    let turn = overflow(&handle).await;
+    let log = until_log(&handle, |log| !cuts(log).is_empty()).await;
+    let dangling = cuts(&log);
+    first.tasks.shutdown().cancel();
+    drop(handle);
+
+    let second = boot_with(&disk, Arc::new(MemEnv::default()), small_context()).await;
+    let handle = second
+        .registry
+        .lookup(session_id())
+        .await
+        .expect("recovered");
+    let log = until_log(&handle, |log| turn_outcome(log, turn).is_some()).await;
+    assert_eq!(
+        turn_outcome(&log, turn),
+        Some(TurnOutcome::Completed),
+        "the turn goes on after the restart"
+    );
+    let (started, _) = summaries(&log).first().cloned().expect("summarized");
+    assert!(
+        !dangling.contains(&started),
+        "the summary completes a new cut, not the dangling one"
+    );
+    second.tasks.shutdown().cancel();
+}
+
+#[tokio::test]
+async fn compact_between_turns_and_never_during_one() {
+    let daemon = boot(&MemDisk::new(), Arc::new(MemEnv::default())).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let first = handle
+        .send_message(send(1, "hello there"))
+        .await
+        .expect("accepted");
+    until(&handle, ended(first.turn_id)).await;
+    let reply = handle.compact(Compact {}).await.expect("compacting");
+    assert_eq!(reply.outcome, Outcome::Created, "a compaction started");
+    let log = until_log(&handle, |log| !summaries(log).is_empty()).await;
+    assert!(
+        log.iter()
+            .all(|record| !matches!(record, Record::TurnStarted { turn } if *turn > first.turn_id)),
+        "a compaction is no turn"
+    );
+    let busy = handle
+        .send_message(send(2, "slow down"))
+        .await
+        .expect("accepted");
+    until(&handle, |chunks| {
+        chunks
+            .iter()
+            .any(|chunk| matches!(chunk, UiChunk::TextDelta { delta, .. } if delta == "."))
+    })
+    .await;
+    let refused = handle.compact(Compact {}).await;
+    assert!(
+        matches!(
+            refused,
+            Err(CommandError::Rejected(Rejection::TurnRunning { .. }))
+        ),
+        "refused while a turn runs: {refused:?}"
+    );
+    until(&handle, ended(busy.turn_id)).await;
+    let transcript = fold(&handle).await;
+    assert_eq!(
+        reply_text(&transcript, 1),
+        ".".repeat(40),
+        "the next turn runs after the summary"
     );
     daemon.tasks.shutdown().cancel();
 }
