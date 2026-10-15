@@ -1019,7 +1019,7 @@ fn first_task_end(log: &[Record<Parsed>]) -> Option<(Exit, String)> {
 
 /// A real background command: the call resolves at its start, the real
 /// shell runs on, and its end is recorded with what it printed. A second
-/// one past its own timeout is killed and ends `Unknown` (B2, H2).
+/// one past its own timeout is killed and ends `Unknown` (P2, T2).
 #[tokio::test]
 async fn a_real_background_command_runs_on_and_times_out_honestly() {
     let project = scratch("background").await;

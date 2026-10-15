@@ -22,7 +22,7 @@
 //!
 //! Storage is the world. Should the log refuse an append (its file is
 //! full), nothing was written and nothing is applied, and the session fails
-//! stop (L3): it decides nothing more, starts no effect and acknowledges no
+//! stop (T1): it decides nothing more, starts no effect and acknowledges no
 //! command, answering each one full. It keeps serving its stream, and runs
 //! already started report into nothing. A restart replays the same log and
 //! carries on until an append is refused again; a turn left running stays
@@ -117,56 +117,56 @@ pub enum Planted {
     /// dispatch). The replay must catch the second act.
     #[cfg(feature = "sim")]
     RunTwice,
-    /// Persist an `Unknown` result as `NotStarted` (breaks H2 in the shell,
+    /// Persist an `Unknown` result as `NotStarted` (breaks T2 in the shell,
     /// below the core). The replay must catch the durable records differing
     /// from the decided ones.
     #[cfg(feature = "sim")]
     UnknownAsNotStarted,
     /// Report a command stopped mid-run as `NotStarted`, as `Interrupted`
-    /// did before H2: a run that may have acted claims it never began. The
+    /// did before T2: a run that may have acted claims it never began. The
     /// replay must catch the report of a run that acted.
     #[cfg(feature = "sim")]
     StoppedAsNotStarted,
     /// Start a decision's effects although the log refused its records
-    /// (breaks L3's fail-stop: nothing acts without a durable record).
+    /// (breaks T1's fail-stop: nothing acts without a durable record).
     #[cfg(feature = "sim")]
     ActAfterRefusal,
-    /// Arm no deadline (breaks B2): a run that never reports is waited on
+    /// Arm no deadline (breaks P2): a run that never reports is waited on
     /// for good.
     #[cfg(feature = "sim")]
     NoDeadline,
-    /// Acknowledge a delivery before its `Delivered` is durable (breaks L3
-    /// and O2): a sender may record `Ok` for an envelope its recipient
+    /// Acknowledge a delivery before its `Delivered` is durable (breaks T1
+    /// and C2): a sender may record `Ok` for an envelope its recipient
     /// never holds.
     #[cfg(feature = "sim")]
     AckBeforeAppend,
     /// Mint a fresh envelope id when a `Keyed` call is run again after a
-    /// crash (breaks O2): the recipient takes it twice.
+    /// crash (breaks C2): the recipient takes it twice.
     #[cfg(feature = "sim")]
     FreshKeyOnResume,
     /// Deliver a `send` or `spawn` before its `Dispatched` is durable
-    /// (breaks A1 between logs).
+    /// (breaks C1 between logs).
     #[cfg(feature = "sim")]
     DeliverBeforePersist,
     /// Count a message consumed when it is injected into a running turn,
-    /// not when a model call carrying it starts (breaks L4): when that turn
+    /// not when a model call carrying it starts (breaks T3): when that turn
     /// ends before carrying it (Esc), the turn it would start is dropped,
     /// and the message is never read.
     #[cfg(feature = "sim")]
     ConsumeAtInjection,
-    /// Drop a stop's delivery to a child and report it done (breaks O2 for
+    /// Drop a stop's delivery to a child and report it done (breaks C2 for
     /// a stop): the child runs on though its parent stopped.
     #[cfg(feature = "sim")]
     StopSkipsChildren,
     /// Render a message where it was delivered, between a running step's
-    /// `tool_use` and its results (breaks L5's well-formed history).
+    /// `tool_use` and its results (breaks T3's well-formed history).
     #[cfg(feature = "sim")]
     SpliceSteering,
     /// Never tell the model a task's end, though the step that carries it
-    /// records it consumed (breaks H3 and L4: the model never sees it).
+    /// records it consumed (breaks T3: the model never sees it).
     #[cfg(feature = "sim")]
     UntoldTaskEnds,
-    /// Acknowledge a group commit without its fsync (breaks L3): a crash
+    /// Acknowledge a group commit without its fsync (breaks T1): a crash
     /// loses records the shell acted on. The simulation's log store
     /// plants it ([`crate::log::FileLogStore::skipping_sync`]).
     #[cfg(feature = "sim")]
@@ -375,8 +375,8 @@ impl ActorHandle {
     }
 
     /// Delivers `envelope` to this actor's mailbox, answered once its
-    /// `Delivered` is durable (L3): `Accepted`, `Exists` for an id it
-    /// already holds (O2), or why it was refused. A full log refuses it as
+    /// `Delivered` is durable (T1): `Accepted`, `Exists` for an id it
+    /// already holds (C2), or why it was refused. A full log refuses it as
     /// `Rejected(Limit)`.
     ///
     /// # Errors
@@ -395,7 +395,7 @@ impl ActorHandle {
     }
 
     /// Your stop: revokes everything this actor holds, and stops every
-    /// actor it spawned (A3). `Exists` on a repeat of `stop`.
+    /// actor it spawned (C3). `Exists` on a repeat of `stop`.
     ///
     /// # Errors
     /// The actor is gone (the daemon is stopping).
@@ -541,7 +541,7 @@ pub struct Session {
     /// Where deliveries to other actors go.
     registry: Registry,
     cancels: BTreeMap<EffectId, CancellationToken>,
-    /// The deadline of each run in flight (B2): cancelled when it reports.
+    /// The deadline of each run in flight (P2): cancelled when it reports.
     deadlines: BTreeMap<EffectId, CancellationToken>,
     /// Each child this session's spawn delivery last ran for, and a token
     /// cancelled once that delivery is done: a stop to the child waits for
@@ -551,7 +551,7 @@ pub struct Session {
     /// JSON bytes of `records` and `chunks`, against `actor_bytes`.
     held_bytes: usize,
     /// Why the log stopped taking records, once it has: from then on the
-    /// session fails stop (L3).
+    /// session fails stop (T1).
     full: Option<String>,
 }
 
@@ -730,7 +730,7 @@ impl Session {
         self.persist(decision).await
     }
 
-    /// The log refused an append: the session fails stop (L3). It records
+    /// The log refused an append: the session fails stop (T1). It records
     /// why, and asks every model call and run it holds to stop, since
     /// nothing they say could be recorded. Each was dispatched durably;
     /// what it reports is dropped, and a restart resolves it from the log.
@@ -742,7 +742,7 @@ impl Session {
     }
 
     /// The rules file as it is now, if its text differs from the text in
-    /// force (or no rules were ever loaded): what to record (A2).
+    /// force (or no rules were ever loaded): what to record (C1).
     #[expect(
         clippy::needless_pass_by_ref_mut,
         reason = "`&mut` keeps the future `Send`: a session is not `Sync` (its log is not)"
@@ -822,7 +822,7 @@ impl Session {
                     | Event::Woke { .. } => {}
                 }
                 // A model's response is settled under the rules file as it
-                // is now: its calls are granted then (A2).
+                // is now: its calls are granted then (C1).
                 if matches!(event, Event::ModelDone { .. })
                     && let Persisted::Refused = self.reload_rules().await?
                 {
@@ -907,7 +907,7 @@ impl Session {
     }
 
     /// Records the rules file if its text differs from the text in force
-    /// (A2): a change takes effect from the next decision on. Refused once
+    /// (C1): a change takes effect from the next decision on. Refused once
     /// the log is full.
     async fn reload_rules(&mut self) -> Result<Persisted, ShellError> {
         let Some(Loaded { rules, file }) = self.rules_changed().await else {
@@ -921,9 +921,9 @@ impl Session {
         Ok(persisted)
     }
 
-    /// Delivers `envelope`, from anyone (L3: durable, then answered). The
+    /// Delivers `envelope`, from anyone (T1: durable, then answered). The
     /// rules file is read first: whatever it starts runs under the rules as
-    /// they are now (A2).
+    /// they are now (C1).
     async fn deliver(&mut self, envelope: Envelope<Parsed>) -> Result<Persisted, ShellError> {
         if let Persisted::Refused = self.reload_rules().await? {
             return Ok(Persisted::Refused);
@@ -1298,7 +1298,7 @@ impl Session {
                     report(&inbox, Event::Woke { id }).await;
                 });
             }
-            // A stop has no deadline: it is sent until it lands (O2). Its
+            // A stop has no deadline: it is sent until it lands (C2). Its
             // only waits are its parent's spawn of the child, if one is in
             // flight, then the registry and the child's append.
             Effect::Stop { id, child } => {
@@ -1343,7 +1343,7 @@ impl Session {
     }
 
     /// Runs an approved call (a foreground run or a task's), and arms its
-    /// deadline (B2).
+    /// deadline (P2).
     fn run_call(&mut self, call: ToolCall<Approved, Parsed>) {
         let id = call.effect();
         let deadline = self.config.limits.deadline(call.args());
@@ -1423,7 +1423,7 @@ impl Session {
     /// Runs delivery `work` for effect `id` as its own task: once `after`
     /// (a spawn of the same child in flight) is done, between the two
     /// barriers, cancelling `done` once it has landed. A session's loop
-    /// never awaits it (B1).
+    /// never awaits it (P1).
     fn send_out(
         &self,
         id: EffectId,
@@ -1448,7 +1448,7 @@ impl Session {
 
     /// What a `send` or `spawn` call delivers. The envelope's id is minted
     /// from the call's key, the seq of its durable `Dispatched`, so a rerun
-    /// after a crash delivers the same id and lands once (O2).
+    /// after a crash delivers the same id and lands once (C2).
     fn outbound(&self, call: &ToolCall<Approved, Parsed>) -> Outbound {
         let key = call.key();
         // The planted defect: a rerun mints a fresh id, as if the key were

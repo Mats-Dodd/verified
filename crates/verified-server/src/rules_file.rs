@@ -1,4 +1,4 @@
-//! The rules file, `.verified/v.toml`: the grants you write in advance (A2).
+//! The rules file, `.verified/v.toml`: the grants you write in advance (C1).
 //!
 //! ```toml
 //! # Allow rules only; anything no rule allows asks you.

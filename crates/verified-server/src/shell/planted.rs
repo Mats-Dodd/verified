@@ -128,7 +128,7 @@ impl Session {
 /// The planted defect: `records` with every `Unknown` result made a
 /// `NotStarted` report, as if the shell knew the call never ran. It invents
 /// the report (an empty output): the core refuses a synthesized `NotStarted`
-/// for a dispatched call (H2), so a shell can only lie past it this way.
+/// for a dispatched call (T2), so a shell can only lie past it this way.
 fn unknown_as_not_started(mut records: Vec<Record<Parsed>>) -> Vec<Record<Parsed>> {
     for record in &mut records {
         if let Record::ToolResult { exit, output, .. } = record

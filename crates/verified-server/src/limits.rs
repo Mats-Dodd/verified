@@ -46,7 +46,7 @@ pub struct ServerLimits {
     pub log_line_bytes: usize,
     /// Largest log file: an append past it is refused, and recovery refuses
     /// a larger file. Storage is the world: once an append is refused the
-    /// session fails stop (L3) and takes no more records.
+    /// session fails stop (T1) and takes no more records.
     pub log_file_bytes: u64,
     /// Largest file the `read` tool or an `edit` reads.
     pub file_bytes: u64,
@@ -81,12 +81,12 @@ pub struct ServerLimits {
     /// Most rules one rules file may hold; one with more grants nothing.
     pub rules_count: usize,
     /// How much longer than a run's own bound v waits for its report
-    /// before it stops waiting and records `Unknown` (B2). A `read` or an
+    /// before it stops waiting and records `Unknown` (P2). A `read` or an
     /// `edit` has no bound of its own: this is its deadline.
     pub deadline_slack: Millis,
     /// The deadline of a delivery between actors (a `send`, a `spawn`):
     /// the recipient's append, bounded. A stop has none: it is sent until
-    /// it lands (O2).
+    /// it lands (C2).
     pub deliver_deadline: Millis,
     /// How long a background `bash` may run before its process group is
     /// killed: its own timeout, as `exec_timeout` is a foreground one's.
@@ -187,7 +187,7 @@ impl ServerLimits {
 
     /// When v stops waiting for a run of `args` and records `Unknown`: past
     /// the run's own timeout and drains, so a run's honest report normally
-    /// comes first (B2). `None` for a run that reports at once (`tasks`)
+    /// comes first (P2). `None` for a run that reports at once (`tasks`)
     /// or is a timer (`wake`), and for a `cancel`, which the core does.
     /// A stop is no call and has none.
     #[must_use]

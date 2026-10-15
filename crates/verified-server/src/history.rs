@@ -310,7 +310,7 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
     build(records, system, max_tokens, (false, false))
 }
 
-/// The planted defect `Planted::SpliceSteering` (breaks L5).
+/// The planted defect `Planted::SpliceSteering` (breaks T3).
 ///
 /// The request with each message rendered where it was delivered, so one
 /// that arrived while a step's calls ran sits between their `tool_use` and
@@ -321,7 +321,7 @@ pub fn spliced(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
     build(records, system, max_tokens, (true, false))
 }
 
-/// The planted defect `Planted::UntoldTaskEnds` (breaks H3 and L4 as the
+/// The planted defect `Planted::UntoldTaskEnds` (breaks T3 as the
 /// model sees them).
 ///
 /// The request without any task's end: a step that carries one records it

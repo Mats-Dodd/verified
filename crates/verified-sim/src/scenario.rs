@@ -213,7 +213,7 @@ fn actor_turn(rng: &mut ChaCha8Rng, index: usize) -> String {
         5 => format!("wake {nap} ; bg sleep 50 then tasks"),
         6 => format!("spawn {CHILD} spawn {CHILD} reply deep {index}"),
         7 => format!("spawn {CHILD} hello then send $child more {index}"),
-        // A run that never reports: only v's deadline ends it (B2).
+        // A run that never reports: only v's deadline ends it (P2).
         8 => format!("spawn {CHILD} bash hang"),
         _ => format!("spawn {CHILD} bg sleep {nap} then cancel $task"),
     }

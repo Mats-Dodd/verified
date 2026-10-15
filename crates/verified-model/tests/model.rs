@@ -132,7 +132,7 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
         );
         // The log refuses it too ("every durable prefix recovers"): a
         // synthesized `NotStarted` for a dispatched call claims more than v
-        // knows (H2).
+        // knows (T2).
         assert_eq!(
             checker
                 .discovery("an Unsafe call is dispatched at most once across crashes")
@@ -169,7 +169,7 @@ fn leaving_an_unsafe_call_dispatched_after_a_crash_is_caught() {
     }
 }
 
-/// A2: a grant names a rule in force that fits its call. A shell that
+/// C1: a grant names a rule in force that fits its call. A shell that
 /// approves what it should ask about, by the first rule in force (the
 /// default `read: allow`), is caught by the audit, and the core refuses
 /// the log too.
@@ -193,7 +193,7 @@ fn approval_by_a_rule_that_does_not_match_is_caught() {
     }
 }
 
-/// A2: a shell that grants in the user's name what the user never
+/// C1: a shell that grants in the user's name what the user never
 /// approved. `spec_apply` accepts a `Grant::User` (it cannot see the
 /// command), so only the audit against the user's commands catches it.
 #[test]
@@ -359,7 +359,7 @@ fn caught(harness: Harness, bug: Bug, caught: &[&'static str]) {
     }
 }
 
-/// O2 and A1: sends and spawns across a crash on either side of the
+/// C2 and C1: sends and spawns across a crash on either side of the
 /// delivery. An acknowledged delivery is in its recipient's log once, no
 /// call takes effect twice, and every envelope follows its durable license.
 #[test]
@@ -376,7 +376,7 @@ fn deliveries_across_crashes() {
     assert!(states > 500, "a real state space: {states}");
 }
 
-/// A1: an outbox that delivers before the `Dispatched` licensing it is
+/// C1: an outbox that delivers before the `Dispatched` licensing it is
 /// durable; a crash then loses the license, and the envelope stays.
 #[test]
 fn delivering_before_the_license_is_durable_is_caught() {
@@ -387,7 +387,7 @@ fn delivering_before_the_license_is_durable_is_caught() {
     );
 }
 
-/// O2: a rerun sent under a fresh key after a crash is a second envelope
+/// C2: a rerun sent under a fresh key after a crash is a second envelope
 /// its recipient cannot tell from a new one.
 #[test]
 fn minting_a_fresh_key_on_resume_is_caught() {
@@ -398,7 +398,7 @@ fn minting_a_fresh_key_on_resume_is_caught() {
     );
 }
 
-/// O2 and L3: the sender is told its envelope landed before the append is
+/// C2 and T1: the sender is told its envelope landed before the append is
 /// durable; a crash loses it.
 #[test]
 fn acknowledging_before_the_append_is_durable_is_caught() {
@@ -409,7 +409,7 @@ fn acknowledging_before_the_append_is_durable_is_caught() {
     );
 }
 
-/// H1 and H3: tasks across a crash end once each, and every task has ended
+/// T2 and T3: tasks across a crash end once each, and every task has ended
 /// at quiescence; their notifications coalesce.
 #[test]
 fn tasks_across_crashes() {
@@ -424,7 +424,7 @@ fn tasks_across_crashes() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// H1: a resume that ends again a task that already ended.
+/// T2: a resume that ends again a task that already ended.
 #[test]
 fn ending_a_task_twice_after_a_crash_is_caught() {
     caught(
@@ -437,7 +437,7 @@ fn ending_a_task_twice_after_a_crash_is_caught() {
     );
 }
 
-/// H1 and H3: a resume that drops a running task's `Unknown` end leaves it
+/// T2 and T3: a resume that drops a running task's `Unknown` end leaves it
 /// running for good, and its actor is never notified.
 #[test]
 fn leaving_a_task_running_after_a_crash_is_caught() {
@@ -448,7 +448,7 @@ fn leaving_a_task_running_after_a_crash_is_caught() {
     );
 }
 
-/// H1: runs report while Esc, a `cancel` and their deadlines race them; a
+/// T2: runs report while Esc, a `cancel` and their deadlines race them; a
 /// known outcome is never followed by another.
 #[test]
 fn completions_race_cancels_and_deadlines() {
@@ -463,7 +463,7 @@ fn completions_race_cancels_and_deadlines() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// L4 and L5: the user's messages steer a turn awaiting approval, with Esc
+/// T3: the user's messages steer a turn awaiting approval, with Esc
 /// and a crash anywhere. Every envelope is carried once, at a step
 /// boundary.
 #[test]
@@ -479,7 +479,7 @@ fn steering_cancels_and_crashes() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// L4 and L5: a steered message lands at the next step of its own turn.
+/// T3: a steered message lands at the next step of its own turn.
 #[test]
 fn steering_across_steps() {
     let states = check(
@@ -494,7 +494,7 @@ fn steering_across_steps() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// L4: a step that never carries the mail at the head of the mailbox
+/// T3: a step that never carries the mail at the head of the mailbox
 /// leaves it unread at quiescence.
 #[test]
 fn skipping_the_mail_at_a_step_is_caught() {
@@ -505,7 +505,7 @@ fn skipping_the_mail_at_a_step_is_caught() {
     );
 }
 
-/// L4: a step that carries again what a step carried before.
+/// T3: a step that carries again what a step carried before.
 #[test]
 fn carrying_an_envelope_twice_is_caught() {
     caught(
@@ -515,7 +515,7 @@ fn carrying_an_envelope_twice_is_caught() {
     );
 }
 
-/// L5: a message spliced into a step whose calls are still running.
+/// T3: a message spliced into a step whose calls are still running.
 #[test]
 fn splicing_a_message_into_a_step_is_caught() {
     caught(
@@ -525,7 +525,7 @@ fn splicing_a_message_into_a_step_is_caught() {
     );
 }
 
-/// B1: two actors answer each other's every message; neither waits for
+/// P1: two actors answer each other's every message; neither waits for
 /// the other, and the world settles within its limits.
 #[test]
 fn an_actor_cycle_goes_quiet() {
@@ -536,7 +536,7 @@ fn an_actor_cycle_goes_quiet() {
     assert!(states > 100, "a real state space: {states}");
 }
 
-/// B1: a `send` that waits for its recipient's turn to end is an `ask`:
+/// P1: a `send` that waits for its recipient's turn to end is an `ask`:
 /// two actors asking each other never settle.
 #[test]
 fn a_blocking_send_deadlocks_and_is_caught() {
@@ -547,7 +547,7 @@ fn a_blocking_send_deadlocks_and_is_caught() {
     );
 }
 
-/// B2: a run that goes silent resolves `Unknown` at its deadline.
+/// P2: a run that goes silent resolves `Unknown` at its deadline.
 #[test]
 fn hung_runs_resolve_by_their_deadline() {
     let states = check(
@@ -557,7 +557,7 @@ fn hung_runs_resolve_by_their_deadline() {
     assert!(states > 100, "a real state space: {states}");
 }
 
-/// B2: without a deadline, a silent run is waited on for ever.
+/// P2: without a deadline, a silent run is waited on for ever.
 #[test]
 fn waiting_on_a_run_that_never_reports_is_caught() {
     caught(
@@ -567,7 +567,7 @@ fn waiting_on_a_run_that_never_reports_is_caught() {
     );
 }
 
-/// B3: a chain of spawns stops at the cap on actors, and a stop of the
+/// P3: a chain of spawns stops at the cap on actors, and a stop of the
 /// root reaches its child; the world settles within its limits.
 #[test]
 fn chatter_goes_quiet_within_limits() {
@@ -582,7 +582,7 @@ fn chatter_goes_quiet_within_limits() {
     assert!(states > 100, "a real state space: {states}");
 }
 
-/// B3: a registry that ignores its cap on actors.
+/// P3: a registry that ignores its cap on actors.
 #[test]
 fn a_missing_actor_limit_is_caught() {
     caught(
@@ -592,7 +592,7 @@ fn a_missing_actor_limit_is_caught() {
     );
 }
 
-/// O2 for a stop: the user stops a root whose child runs a command, with
+/// C2 for a stop: the user stops a root whose child runs a command, with
 /// deadlines and a crash anywhere. Every stop reaches its child.
 #[test]
 fn stops_across_deadlines_and_crashes() {
@@ -603,7 +603,7 @@ fn stops_across_deadlines_and_crashes() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// O2: a stop given up on at a deadline, then lost to a crash, never
+/// C2: a stop given up on at a deadline, then lost to a crash, never
 /// reaches the child.
 #[test]
 fn giving_up_on_a_stop_at_its_deadline_is_caught() {
@@ -614,7 +614,7 @@ fn giving_up_on_a_stop_at_its_deadline_is_caught() {
     );
 }
 
-/// O2: a stop that lands while its child's spawn is in flight finds the
+/// C2: a stop that lands while its child's spawn is in flight finds the
 /// child unborn, and the spawn then births a child that runs on.
 #[test]
 fn a_stop_before_its_childs_birth_is_caught() {
@@ -1416,7 +1416,7 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
 /// A run stopped before it acted did not act: its return, observed
 /// `stopped`, takes no `Execute`, so the call resolves `NotStarted` while
 /// still `Dispatched`. The same report from a run that acted claims more
-/// than v knows (H2), and the replay refuses it.
+/// than v knows (T2), and the replay refuses it.
 #[test]
 fn a_stopped_run_did_not_act() {
     let harness = Harness::bounded(

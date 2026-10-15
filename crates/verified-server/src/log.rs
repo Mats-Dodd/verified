@@ -660,7 +660,7 @@ impl FileLogStore {
     }
 
     /// This store, its logs acknowledging appends without their fsync: the
-    /// planted defect `Planted::SkipFsync` (breaks L3), for the
+    /// planted defect `Planted::SkipFsync` (breaks T1), for the
     /// simulation's mutation tests.
     #[cfg(feature = "sim")]
     #[must_use]
@@ -809,7 +809,7 @@ mod tests {
 
     const MAX_LINE: usize = 1 << 16;
 
-    /// Storage is the world (L3): a full disk or a spent quota refuses an
+    /// Storage is the world (T1): a full disk or a spent quota refuses an
     /// append, as the log's own cap does; any other IO error crashes.
     #[test]
     fn a_full_disk_refuses_and_other_errors_crash() {

@@ -13,7 +13,7 @@
 //!
 //! - I5 at quiescence every turn of every actor ended and every call
 //!   resolved, unless the actor's log refused an append since the last
-//!   boot: storage is the world, and a full log fails stop (L3) with its
+//!   boot: storage is the world, and a full log fails stop (T1) with its
 //!   turn as it was.
 //! - I6 exactly: each stream read the TUI folded, `from..next`, arrived as
 //!   the projection of exactly the root's records `from..next`, and the
@@ -27,32 +27,32 @@
 //!   edits are durable: after the final crash each file holds what the last
 //!   write to it that finished wrote, or what a write that overlapped that
 //!   one wrote (two racing renames land in either order).
-//! - I8 each message the user typed is in the root's log exactly once (O2,
-//!   L3), but the one it gave up on when the actor took no more, which is
+//! - I8 each message the user typed is in the root's log exactly once (C2,
+//!   T1), but the one it gave up on when the actor took no more, which is
 //!   there at most once.
 //! - I9 every `send` or `spawn` that resolved `Ok` is in its recipient's
-//!   log exactly once at quiescence (O2): its envelope, minted from the
+//!   log exactly once at quiescence (C2): its envelope, minted from the
 //!   call's key. And every envelope an actor minted names the record of
 //!   its log that licensed it: a `send` or `spawn` to that recipient, or a
 //!   stop of it (a `Keyed` rerun reuses its key).
 //! - I10 every envelope an actor holds (a message, a notification) is
 //!   carried by at most one model call, and at quiescence by exactly one,
-//!   unless the actor stopped or reached its turn limit (L4).
-//! - I11 at quiescence every task ended (H1); each end is its one
-//!   notification (H3).
+//!   unless the actor stopped or reached its turn limit (T3).
+//! - I11 at quiescence every task ended (T2); each end is its one
+//!   notification (T3).
 //! - I12 at quiescence every actor a stopped actor spawned is stopped
 //!   too (the stop cascade).
 //! - I13 every request the model was sent is a well-formed conversation
-//!   (L5): each `tool_use` answered by exactly one result in the next
+//!   (T3): each `tool_use` answered by exactly one result in the next
 //!   message, before any text there.
-//! - I14 every model call is told what its step carried (H3, L4): each
+//! - I14 every model call is told what its step carried (T3): each
 //!   envelope its `StepStarted` carries is in the request's last message,
 //!   a message by its text and a task's end as that task's notification.
 //! - I15 every effect with a deadline resolved by it, in simulated time
-//!   (B2): its result is durable within its deadline of its `Dispatched`,
+//!   (P2): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between. Which effects have one, and
 //!   how long, is this check's own table (`due`), not the shell's.
-//! - I16 fail-stop (L3): from an actor's refused append until the daemon
+//! - I16 fail-stop (T1): from an actor's refused append until the daemon
 //!   boots again, nothing more of its log is acknowledged and none of its
 //!   runs or deliveries starts.
 
@@ -816,12 +816,12 @@ fn told(
     }
 }
 
-/// I15's table: the deadline every run of `args` must resolve by (B2),
+/// I15's table: the deadline every run of `args` must resolve by (P2),
 /// written out apart from the shell's `ServerLimits::deadline`, so a shell
 /// that arms none is caught. Every run has one but a timer's (it waits on
 /// purpose), a `tasks` listing's (it reads the actor's own log) and a
 /// `cancel`'s (the core resolves it). A stop is no call and has none: it is
-/// sent until it lands (O2).
+/// sent until it lands (C2).
 fn due(args: &ToolArgs, limits: &ServerLimits) -> Option<Duration> {
     let millis = |millis: verified_domain::Millis| Duration::from_millis(millis.get());
     let slack = millis(limits.deadline_slack);

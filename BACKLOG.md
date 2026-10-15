@@ -9,6 +9,7 @@ Each item is marked:
 - **Decided:** agreed in discussion, waiting to be written into the docs or
   code.
 - **Open:** a real question, with no direction yet.
+- **Next:** decided, and the next thing to design or build.
 - **Idea:** worth remembering, not yet discussed.
 
 When an item lands, delete it from here. The commit that lands it carries
@@ -75,18 +76,24 @@ the reasoning.
     projection (paths, host, program name).
   - Rules match on `Scope`, never on raw `Args`.
   - α preserves `Scope`.
-- **The beat.** *Leaning.*
-  - Name the step boundary "the beat": the one moment outside input enters
-    the model (steering, notifications), and where limits and headroom are
-    checked.
-  - TigerBeetle's lesson: run at your own pace and batch; don't react to
-    each event.
-- **Headroom as an invariant (B4/B5).** *Leaning.*
-  - At every beat there's room for the next step in every resource **v
-    owns**: context bytes, mailbox, task and actor slots.
-  - **Not storage.** Admission is refused at the downbeat (`NotStarted`),
-    never mid-work. This structurally prevents the bug class of B1
-    (the context budget).
+- **Build the two Planned parts of the ten promises.** *Decided.*
+  - **C1, what runs is what you granted:** the fake `Env` compares every
+    run's arguments with the `Approved` call in the log, on every run.
+    Planted bug: a shell that swaps a call's arguments after approval.
+  - **P3, the beat:** check headroom for the next step at every step
+    boundary and end the turn there when there is none; don't start a turn
+    with no room for its first step (today a turn starts into a full
+    context and fails at once). Planted bug: a limit checked after the
+    step it bounds.
+- **Decided against, in the ten-promise round:**
+  - **A red-button promise** ("a stop takes effect within a bound"). Not a
+    promise; listed under Not promised.
+  - **"No agent gains authority"** as its own clause. It follows from C1
+    (grants come only from you), and isn't worth its own check.
+  - **A limit ending the actor.** A limit ends the turn; the actor lives,
+    and its mail waits (T3: at most one model call, never dropped).
+- **The beat.** *Leaning,* now part of P3. TigerBeetle's lesson: run at
+  your own pace and batch; don't react to each event.
 
 ## 3. Public API (`docs/rfcs/0002-api.md`)
 
@@ -122,7 +129,7 @@ the reasoning.
   stop intake, signal once, wait a bounded time, release storage, write
   nothing. Confirm when implementing that it adds no second recovery path.
 - **Open: should actors ever `follow` other actors?** The default is no:
-  information enters a model only as envelopes (L4). It could become a
+  information enters a model only as envelopes (T3). It could become a
   `Safe` read tool later.
 - **Structured message bodies** between agents. *Idea,* as a future `Body`
   variant (a deliberate breaking change).
@@ -212,7 +219,7 @@ across them. *Leaning,* all of it.
   blocking. *Idea.* Possibly cleaner than ad hoc `reply_to`.
 - **Virtual actors as an explicit design point:** an actor with an empty
   mailbox costs nothing and is woken by a message. *Idea.*
-- **Context compaction.** *Open.*
+- **Context compaction.** *Next.*
   - The model's context grows without bound for long-lived actors (the LSM
     analogy: recent turns as the mutable table, summaries as older levels).
   - v owns *when* and the guarantee of headroom; the summary's quality
@@ -225,11 +232,11 @@ across them. *Leaning,* all of it.
     `{hash, bytes}` in the control record);
   - headroom on the log once v owns its storage.
 - **A VOPR-style liveness mode.** *Leaning.* Run the simulation, heal every
-  fault, and assert the system goes quiet within a bound. It's the check B2
-  and B3 (Bounded) need.
-- **What a full context does to the mailbox.** *Open.* B4 (headroom) stays
-  Planned until this is decided; L4's "exactly one" is exempt for an actor
-  whose context filled. Likely settled together with compaction.
+  fault, and assert the system goes quiet within a bound. It's the check P2
+  and P3 need.
+- **A full context parks the actor.** *Decided* (in `PRINCIPLES.md`, Not
+  promised): its turns end at the first beat and its mail waits. Compaction
+  unparks it.
 - **The default rules.** *Open.* The default is exactly `read: allow`, so
   `wake`, `tasks`, `cancel`, `send` and `spawn` all ask unless
   `.verified/v.toml` allows them. The draft API proposes dropping defaults

@@ -38,7 +38,7 @@ const GLANCE: Millis = Millis::new(100);
 /// Glances a running turn may go without a new record, and no prompt, before
 /// the user presses Esc: three simulated minutes, past any tool's timeout.
 /// A turn stalls only when its log is full and the session failed stop
-/// (L3); Esc then learns the session takes no more.
+/// (T1); Esc then learns the session takes no more.
 const STALL: usize = 1_800;
 /// Mixed into the seed for the TUI's entropy.
 const TUI_SALT: u64 = 0x7475_6900;

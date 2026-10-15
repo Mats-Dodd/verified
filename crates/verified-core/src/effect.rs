@@ -92,7 +92,7 @@ impl<P: Payload> ToolCall<Approved, P> {
 
     /// The key a `Keyed` call's target deduplicates on: the seq of the
     /// `Dispatched` record that licensed it. A rerun after a crash keeps it
-    /// (only the epoch changes), so the target accepts the call once (O2).
+    /// (only the epoch changes), so the target accepts the call once (C2).
     #[must_use]
     pub const fn key(&self) -> (key: u64)
         ensures

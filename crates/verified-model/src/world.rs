@@ -73,7 +73,7 @@ pub struct Flight {
     /// The side effect happened (tools only; others start executed).
     pub executed: bool,
     pub cancelled: bool,
-    /// The world made it silent: it never reports (B2). Only its deadline
+    /// The world made it silent: it never reports (P2). Only its deadline
     /// resolves it.
     pub hung: bool,
 }
@@ -165,11 +165,11 @@ pub struct World {
     pub stale_changed: bool,
     /// The calls each envelope a recipient appended carries out: its
     /// sender's slot and call, by the recipient's slot and the envelope's
-    /// id. A delivery takes effect when its append is durable (O2).
+    /// id. A delivery takes effect when its append is durable (C2).
     pub carried_out: BTreeMap<(Slot, EnvelopeId), (Slot, CallId)>,
     /// Deliveries acknowledged to their sender (`ToolDone` `Ok` decided):
     /// the recipient's slot and the envelope's id. An acknowledgement
-    /// means the append is durable (O2, L3).
+    /// means the append is durable (C2, T1).
     pub acked: BTreeSet<(Slot, EnvelopeId)>,
 }
 

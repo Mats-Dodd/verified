@@ -1,4 +1,4 @@
-//! Grants: every permission comes from the user (A2).
+//! Grants: every permission comes from the user (C1).
 //!
 //! A call may start under a live approval command (`Grant::User`) or under
 //! a rule the user wrote in advance in the rules file, `v.toml`
@@ -210,7 +210,7 @@ pub struct Born {
     /// The name rules match on.
     pub name: ActorName,
     /// Who spawned it (`None`: the user made it). Display only: no grant
-    /// reads it (A2).
+    /// reads it (C1).
     pub parent: Option<ActorId>,
     /// Spawn depth: a root is 0, a child its parent's plus one.
     pub depth: u32,

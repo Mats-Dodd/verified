@@ -375,7 +375,7 @@ fn first_step(said: &str, from: Option<&str>) -> String {
     }
 }
 
-/// Why a Messages request body is not a well-formed conversation (L5).
+/// Why a Messages request body is not a well-formed conversation (T3).
 ///
 /// The provider would refuse it: every `tool_use` has exactly one
 /// `tool_result`, in the next message, and the results come before any

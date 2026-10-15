@@ -336,10 +336,10 @@ fn proposing(driver: &mut Driver, calls: Vec<Proposal<Abstract>>) -> Vec<Effect<
 }
 
 // ---------------------------------------------------------------------------
-// Tasks (B1, H1, H3)
+// Tasks (P1, T2, T3)
 // ---------------------------------------------------------------------------
 
-/// B1, H3: a background call resolves `Ok` in the decision that dispatches
+/// P1, T3: a background call resolves `Ok` in the decision that dispatches
 /// it, so the turn goes on without waiting; the task's end is one
 /// `TaskEnded`, its notification, and it starts the next turn.
 #[test]
@@ -403,7 +403,7 @@ fn a_background_call_resolves_at_its_start_and_its_end_notifies_once() {
     assert_eq!(outcome, Outcome::Stale, "a task ends once");
 }
 
-/// H1: of a task's report and its deadline, the first wins; the deadline
+/// T2: of a task's report and its deadline, the first wins; the deadline
 /// is v cancelling: `Unknown`, and the run is asked to stop.
 #[test]
 fn a_deadline_ends_a_task_unknown() {
@@ -508,7 +508,7 @@ fn cancel_revokes_a_task() {
     );
 }
 
-/// A3: a running task is signalled once: a repeated `cancel` of it, a stop
+/// C3: a running task is signalled once: a repeated `cancel` of it, a stop
 /// or its deadline after the cancel signal nothing more.
 #[test]
 fn a_task_is_signalled_once() {
@@ -551,7 +551,7 @@ fn a_task_is_signalled_once() {
     assert!(!effects.contains(&signal), "nor its deadline: {effects:?}");
 }
 
-/// A3: a call is signalled once: its deadline after Esc signalled it
+/// C3: a call is signalled once: its deadline after Esc signalled it
 /// records `Unknown` and signals nothing more.
 #[test]
 fn a_deadline_after_esc_signals_nothing_more() {
@@ -575,7 +575,7 @@ fn a_deadline_after_esc_signals_nothing_more() {
     );
 }
 
-/// O1, H1: after a crash a running `Unsafe` task ends `Unknown` and never
+/// C2, T2: after a crash a running `Unsafe` task ends `Unknown` and never
 /// runs again; a `Safe` one (a timer) runs again under the same seq.
 #[test]
 fn a_crash_ends_an_unsafe_task_unknown_and_reruns_a_timer() {
@@ -630,10 +630,10 @@ fn tasks_are_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// The mailbox (L4, L5) and steering
+// The mailbox (T3) and steering
 // ---------------------------------------------------------------------------
 
-/// L4: notifications that arrive together are carried by one model call;
+/// T3: notifications that arrive together are carried by one model call;
 /// a user message is carried alone, after them.
 #[test]
 fn notifications_coalesce_and_a_user_message_is_carried_alone() {
@@ -679,7 +679,7 @@ fn notifications_coalesce_and_a_user_message_is_carried_alone() {
     assert_eq!(driver.core.unread(), 0, "each consumed once");
 }
 
-/// L5 and steering: a user message while the step waits for approvals
+/// T3 and steering: a user message while the step waits for approvals
 /// denies them ("the user steered"), and lands at the step's boundary,
 /// after every result of the step.
 #[test]
@@ -795,7 +795,7 @@ fn a_message_during_the_model_call_steers_its_step() {
     assert!(has_model_call(&effects), "and the message is carried next");
 }
 
-/// L4: an envelope is consumed when a model call carrying it starts, not
+/// T3: an envelope is consumed when a model call carrying it starts, not
 /// when it arrives: one that arrived and was never carried (the turn was
 /// cancelled first) starts the next turn.
 #[test]
@@ -868,10 +868,10 @@ fn a_retry_carries_nothing_new() {
 }
 
 // ---------------------------------------------------------------------------
-// Stops (A3) and the stop cascade
+// Stops (C3) and the stop cascade
 // ---------------------------------------------------------------------------
 
-/// A3: a stop revokes everything the actor holds: the turn is cancelled,
+/// C3: a stop revokes everything the actor holds: the turn is cancelled,
 /// what awaits approval never starts, a timer never fires, a running
 /// command is signalled, every child is sent a stop; and nothing starts
 /// after it.
@@ -946,7 +946,7 @@ fn a_stop_revokes_everything_and_stops_every_child() {
     );
 }
 
-/// A3: a crash that tears a stop's group (the `Delivered` durable, the
+/// C3: a crash that tears a stop's group (the `Delivered` durable, the
 /// rest not) is finished on resume: the turn is cancelled and every child
 /// stopped.
 #[test]
@@ -988,7 +988,7 @@ fn a_torn_stop_is_finished_on_resume() {
     assert!(runs(&effects).is_empty(), "nothing reruns under a stop");
 }
 
-/// A3: a stop lands whatever the actor holds: the message limit bounds
+/// C3: a stop lands whatever the actor holds: the message limit bounds
 /// mail, never the stop that ends a runaway actor.
 #[test]
 fn a_stop_lands_at_the_message_limit() {
@@ -1013,7 +1013,7 @@ fn a_stop_lands_at_the_message_limit() {
     assert!(driver.core.stopped(), "and the actor is stopped");
 }
 
-/// A3: after a crash a stopped actor starts nothing of its own again: a
+/// C3: after a crash a stopped actor starts nothing of its own again: a
 /// timer it held ends `NotStarted` and never reruns.
 #[test]
 fn a_crash_after_a_stop_reruns_no_timer() {
@@ -1068,10 +1068,10 @@ fn call_spawn() -> Proposal<Abstract> {
 }
 
 // ---------------------------------------------------------------------------
-// Keyed calls (O2)
+// Keyed calls (C2)
 // ---------------------------------------------------------------------------
 
-/// O2: a `Keyed` call dispatched before a crash runs again with the same
+/// C2: a `Keyed` call dispatched before a crash runs again with the same
 /// key (the seq of its `Dispatched`), so its target can accept it once.
 #[test]
 fn a_keyed_call_reruns_with_its_key() {
@@ -1091,7 +1091,7 @@ fn a_keyed_call_reruns_with_its_key() {
     assert_eq!(rekey, key, "under the same key");
 }
 
-/// O2 and A3: a `Keyed` call whose turn was cancelled before a crash is
+/// C2 and C3: a `Keyed` call whose turn was cancelled before a crash is
 /// not sent again: it resolves `Unknown` (it may have taken effect once).
 #[test]
 fn a_keyed_call_cancelled_before_a_crash_resolves_unknown() {
@@ -1124,7 +1124,7 @@ fn a_keyed_call_cancelled_before_a_crash_resolves_unknown() {
 // The log
 // ---------------------------------------------------------------------------
 
-/// L1: a log that consumes out of order, delivers to a stopped actor,
+/// State is the replay: a log that consumes out of order, delivers to a stopped actor,
 /// ends a task twice or stops a stranger does not replay.
 #[test]
 fn a_log_breaking_the_mailbox_or_the_tasks_is_corrupt() {
@@ -1182,7 +1182,7 @@ fn a_log_breaking_the_mailbox_or_the_tasks_is_corrupt() {
     );
 }
 
-/// L4: a step carries exactly the batch at the head of the mailbox.
+/// T3: a step carries exactly the batch at the head of the mailbox.
 #[test]
 fn a_log_carrying_other_than_the_head_is_corrupt() {
     let mut driver = Driver::new();
@@ -1381,8 +1381,8 @@ proptest! {
 
     /// With deliveries, steering, tasks, stops and crashes: decide never
     /// panics, apply takes every record decide made, recovery reproduces
-    /// the live state, no envelope is carried twice (L4) and no task ends
-    /// twice (H1).
+    /// the live state, no envelope is carried twice (T3) and no task ends
+    /// twice (T2).
     #[test]
     fn actors_recover_and_carry_each_envelope_once(
         choices in proptest::collection::vec(choice(), 0..80),

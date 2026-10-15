@@ -2,22 +2,22 @@
 //!
 //! An envelope is delivered by appending a `Delivered` record to its
 //! recipient's log, and the recipient answers only once that append is
-//! durable (L3), so a sender records `Ok` only for an envelope its
+//! durable (T1), so a sender records `Ok` only for an envelope its
 //! recipient holds. The recipient deduplicates by the envelope's id, which
 //! the sender minted from the seq of the record that licensed the delivery
 //! (a call's `Dispatched`, a `StopSent`): a `Keyed` delivery run again
-//! after a crash carries the same id and lands once (O2).
+//! after a crash carries the same id and lands once (C2).
 //!
 //! Each delivery runs as its own task and reports to its actor's inbox as
 //! any run does. A session's loop never awaits one, and a delivery awaits
 //! only the registry (which awaits no session) and its recipient's bounded
-//! append, so actors cannot deadlock on each other (B1). What comes back is
+//! append, so actors cannot deadlock on each other (P1). What comes back is
 //! the outcome: a delivery is not cancelled mid-flight, and a `send`'s or a
-//! `spawn`'s deadline bounds it (B2). A stop has none: it is sent until it
-//! lands (O2), and its only waits are those of any delivery.
+//! `spawn`'s deadline bounds it (P2). A stop has none: it is sent until it
+//! lands (C2), and its only waits are those of any delivery.
 //!
 //! Once a spawn has made its child, it has acted: whatever its prompt
-//! meets, it is never `NotStarted` (H2).
+//! meets, it is never `NotStarted` (T2).
 
 use verified_core::{Outcome, Rejection};
 use verified_domain::{Address, Body, Born, Envelope, Exit, Unstarted};

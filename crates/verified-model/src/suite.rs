@@ -234,7 +234,7 @@ pub fn actor_limits() -> Limits {
     })
 }
 
-/// O2 and A1: an actor sends to another, or spawns it, and the daemon may
+/// C2 and C1: an actor sends to another, or spawns it, and the daemon may
 /// crash anywhere, on either side of a delivery.
 #[must_use]
 pub fn deliveries_across_crashes() -> Harness {
@@ -257,7 +257,7 @@ pub fn deliveries_across_crashes() -> Harness {
     )
 }
 
-/// H1 and H3: a command in the background and a timer, each a task; the
+/// T2 and T3: a command in the background and a timer, each a task; the
 /// daemon may crash anywhere. Two tasks and three turns an actor.
 ///
 /// # Panics
@@ -281,7 +281,7 @@ pub fn tasks_across_crashes() -> Harness {
     )
 }
 
-/// H1: reports race cancels, Esc and deadlines, for a call and for a task.
+/// T2: reports race cancels, Esc and deadlines, for a call and for a task.
 #[must_use]
 pub fn completions_race_cancels_and_deadlines() -> Harness {
     Harness::bounded(
@@ -315,7 +315,7 @@ fn steering(steps: u32, bounded: Bounded) -> Harness {
     )
 }
 
-/// L4 and L5: the user's messages steer a turn that waits for an approval,
+/// T3: the user's messages steer a turn that waits for an approval,
 /// with Esc and a crash anywhere; a step a turn, so a steered message
 /// lands in the next turn.
 #[must_use]
@@ -330,7 +330,7 @@ pub fn steering_cancels_and_crashes() -> Harness {
     )
 }
 
-/// L4 and L5: a steered message lands at the next step of its turn, or
+/// T3: a steered message lands at the next step of its turn, or
 /// after Esc, in the next turn.
 #[must_use]
 pub fn steering_across_steps() -> Harness {
@@ -343,7 +343,7 @@ pub fn steering_across_steps() -> Harness {
     )
 }
 
-/// B1: two actors that answer every message with one to the other.
+/// P1: two actors that answer every message with one to the other.
 #[must_use]
 pub fn an_actor_cycle_goes_quiet() -> Harness {
     Harness::bounded(
@@ -356,7 +356,7 @@ pub fn an_actor_cycle_goes_quiet() -> Harness {
     )
 }
 
-/// B2: a run, in the foreground or as a task, may go silent; its deadline
+/// P2: a run, in the foreground or as a task, may go silent; its deadline
 /// resolves it.
 #[must_use]
 pub fn hung_runs_resolve_by_their_deadline() -> Harness {
@@ -374,7 +374,7 @@ pub fn hung_runs_resolve_by_their_deadline() -> Harness {
     )
 }
 
-/// B3: a chain of spawns past the registry's cap on actors, and a stop of
+/// P3: a chain of spawns past the registry's cap on actors, and a stop of
 /// the root that cascades.
 #[must_use]
 pub fn chatter_goes_quiet_within_limits() -> Harness {
@@ -396,7 +396,7 @@ pub fn chatter_goes_quiet_within_limits() -> Harness {
     )
 }
 
-/// O2 for a stop: a root spawns a child that runs a command, the user
+/// C2 for a stop: a root spawns a child that runs a command, the user
 /// stops the root, and a run or a delivery may miss its deadline and the
 /// daemon crash anywhere. The stop reaches the child.
 #[must_use]

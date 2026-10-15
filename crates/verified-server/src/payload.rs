@@ -947,7 +947,7 @@ mod tests {
     }
 }
 
-/// A2's subject half: a rule's `exact` or `prefix` is matched against the
+/// C1's subject half: a rule's `exact` or `prefix` is matched against the
 /// call's subject, which must be exactly the command or path the log
 /// records and the approval shows.
 #[cfg(test)]

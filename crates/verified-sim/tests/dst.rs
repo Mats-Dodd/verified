@@ -317,7 +317,7 @@ fn a_crash_while_a_command_runs_is_after_it_acted() {
 }
 
 /// What the shell makes durable is what the core decided, as a mutation
-/// test: a shell that persists an `Unknown` result as `NotStarted` (H2,
+/// test: a shell that persists an `Unknown` result as `NotStarted` (T2,
 /// broken below the core) leaves the model where a group commit becomes
 /// durable holding other records than the model's.
 #[test]
@@ -343,7 +343,7 @@ fn persisting_unknown_as_not_started_fails_the_replay() {
     );
 }
 
-/// H2, as a mutation test: a shell whose stopped command reports
+/// T2, as a mutation test: a shell whose stopped command reports
 /// `NotStarted`, as `Interrupted` did, claims a run that acted never began.
 /// The replay refuses the report: the model admits `NotStarted` only from a
 /// cancelled run that never acted.
@@ -450,7 +450,7 @@ fn a_small_log() -> ServerLimits {
 /// an append.
 const FILLING: [(u64, Option<u64>); 4] = [(28, None), (53, None), (77, None), (28, Some(37_659))];
 
-/// Storage is the world: a full log fails stop (L3). From the first refused
+/// Storage is the world: a full log fails stop (T1). From the first refused
 /// append until the daemon boots again, nothing is acknowledged and no tool
 /// run starts, and the run is still a path of the model: the refused
 /// decisions never reached the core.
@@ -602,7 +602,7 @@ fn the_actor_scenarios_break_nothing() {
     }
 }
 
-/// A1 between logs, as a mutation test: a shell that delivers a spawn
+/// C1 between logs, as a mutation test: a shell that delivers a spawn
 /// before its `Dispatched` is durable is caught by the replay, at the
 /// child's log, which the model has no license to create yet.
 #[test]
@@ -628,7 +628,7 @@ fn delivering_a_spawn_before_its_dispatch_is_durable_fails_the_replay() {
     );
 }
 
-/// O2, as a mutation test: a recipient that acknowledges a delivery
+/// C2, as a mutation test: a recipient that acknowledges a delivery
 /// before its `Delivered` is durable lets its sender record `Ok` for an
 /// envelope a crash could still lose. The replay refuses the sender's
 /// result while the append is pending.
@@ -659,7 +659,7 @@ fn a_spawn_crashing_at_its_delivery() -> Scenario {
     }
 }
 
-/// O2, as a mutation test: a shell that mints a fresh envelope id when it
+/// C2, as a mutation test: a shell that mints a fresh envelope id when it
 /// runs a `Keyed` call again after a crash delivers it twice. I9 finds the
 /// second envelope licensed by no record, and the replay finds no delivery
 /// in flight that carries it.
@@ -697,7 +697,7 @@ fn a_steer_lost_to_esc() -> Scenario {
     }])
 }
 
-/// L4, as a mutation test: a shell that counts a steered message consumed
+/// T3, as a mutation test: a shell that counts a steered message consumed
 /// when it lands, not when a model call carries it, loses it to Esc. I10
 /// finds it unread at quiescence, and the replay finds the next turn
 /// missing from the log.
@@ -737,7 +737,7 @@ fn a_steer_while_a_command_runs() -> Scenario {
     }])
 }
 
-/// L5, as a mutation test: a history that renders a steer where it was
+/// T3, as a mutation test: a history that renders a steer where it was
 /// delivered sends the model the message between the command's `tool_use`
 /// and its result. The fake provider refuses such a conversation (I13).
 #[test]
@@ -768,7 +768,7 @@ fn a_background_command() -> Scenario {
     Scenario::of(vec![TurnPlan::granted("bg touch t0")])
 }
 
-/// H3 and L4, as a mutation test: a shell that never tells the model a
+/// T3, as a mutation test: a shell that never tells the model a
 /// task's end, though the step that carries it records it consumed. I14
 /// finds a model call whose request lacks what its step carried.
 #[test]
@@ -791,9 +791,9 @@ fn a_silent_run() -> Scenario {
     Scenario::of(vec![TurnPlan::granted("bash hang")])
 }
 
-/// B2, as a mutation test: a shell that arms no deadline waits on a
+/// P2, as a mutation test: a shell that arms no deadline waits on a
 /// silent run for good, so its report is lost. I15 finds the run still
-/// open long past its deadline, and I5 (H1: a result for every call at
+/// open long past its deadline, and I5 (T2: a result for every call at
 /// quiescence) a world that never goes quiet; with deadlines it resolves
 /// `Unknown` by it.
 #[test]
@@ -803,7 +803,7 @@ fn a_cancel_that_waits_for_a_silent_run_fails() {
     assert!(broke(&outcome, "I5"), "{:#?}", outcome.violations);
 }
 
-/// L3, as a mutation test: a log that acknowledges appends it never
+/// T1, as a mutation test: a log that acknowledges appends it never
 /// synced loses them to a crash. The replay finds a boot on fewer records
 /// than were acknowledged.
 #[test]
@@ -839,7 +839,7 @@ fn a_log_that_fills_at_a_dispatch(file_bytes: u64) -> Scenario {
     }
 }
 
-/// L3's fail-stop, as a mutation test: a shell that starts a refused
+/// T1's fail-stop, as a mutation test: a shell that starts a refused
 /// decision's effects acts without a durable record. Some log size in a
 /// range (the sizes of ids and texts move it a little) refuses the
 /// decision that dispatches the command; I16 finds the run started after
@@ -864,7 +864,7 @@ fn acting_after_a_refused_append_fails_the_check() {
         .expect("the fair shell fails stop there and breaks nothing");
 }
 
-/// B3 in the simulation: two actors that answer each other's every
+/// P3 in the simulation: two actors that answer each other's every
 /// message chatter until the limits stop them, and the world goes quiet.
 #[test]
 fn chattering_actors_go_quiet_within_their_limits() {

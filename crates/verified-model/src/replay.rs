@@ -50,7 +50,7 @@ pub enum Observed {
     /// birth, are a delivery's steps landing.
     Decided(Event<Abstract>, Vec<Rec>),
     /// A full log refused the boot's resume: nothing of it was written, and
-    /// none of its effects start. The shell fails stop (L3): it decides
+    /// none of its effects start. The shell fails stop (T1): it decides
     /// nothing more until it boots again. A refused `Decided` never reaches
     /// the model: the simulation's fold drops it, since the core never took
     /// its event.
@@ -67,7 +67,7 @@ pub enum Observed {
     /// `NotStarted`: it saw its cancel before acting).
     Ran { id: EffectId, stopped: bool },
     /// A tool run will never return: it ignores its cancel and its kill,
-    /// so only v's deadline resolves it (B2).
+    /// so only v's deadline resolves it (P2).
     Hung(EffectId),
     /// The client folded the record at this offset of the first root's
     /// log. Only the offset: what it folded there is the simulation's I6

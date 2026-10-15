@@ -1377,7 +1377,7 @@ impl LogStore for Watched {
     }
 }
 
-/// L3's fail-stop, checked: an approved `bash` whose `Dispatched` the log
+/// T1's fail-stop, checked: an approved `bash` whose `Dispatched` the log
 /// refuses. What broke it, if anything: the approval acknowledged, the
 /// command run, or anything appended after the refusal.
 async fn fail_stop(planted: Planted, refusal: Act) -> Result<(), String> {
@@ -1441,7 +1441,7 @@ async fn fail_stop(planted: Planted, refusal: Act) -> Result<(), String> {
 
 /// Storage is the world: a refused append halts the session. Nothing acts
 /// without its durable record, nothing is acknowledged, and nothing more
-/// is appended (L3).
+/// is appended (T1).
 #[tokio::test]
 async fn a_refused_append_fails_stop() {
     fail_stop(Planted::None, Act::Refuse)
@@ -1458,7 +1458,7 @@ async fn a_full_disk_fails_stop() {
         .expect("nothing acts or is acknowledged once the disk is full");
 }
 
-/// The planted bug for L3's fail-stop: a shell that starts a decision's
+/// The planted bug for T1's fail-stop: a shell that starts a decision's
 /// effects although the log refused its records. The check must catch it.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -1469,7 +1469,7 @@ async fn acting_after_a_refused_append_is_caught() {
     assert!(broken.contains("acted"), "{broken}");
 }
 
-/// The rules file grants in advance (A2): a rule that fits runs the call
+/// The rules file grants in advance (C1): a rule that fits runs the call
 /// without asking, under a grant naming the rule and the `RulesLoaded` that
 /// holds it, with the file's text in the log. The file is read again before
 /// each message: once it is gone, the same command asks.
@@ -1613,8 +1613,8 @@ fn task_end(log: &[Record<Parsed>], task: u64) -> Option<(Exit, Option<String>)>
 }
 
 /// A background command resolves its call at its durable start (no turn
-/// waits for it, B1), runs on as a task, and its end reaches the actor as
-/// a notification a later model call carries (H3).
+/// waits for it, P1), runs on as a task, and its end reaches the actor as
+/// a notification a later model call carries (T3).
 #[tokio::test]
 async fn a_background_command_resolves_at_once_and_notifies_when_it_ends() {
     let env = Arc::new(MemEnv::default());
@@ -1687,7 +1687,7 @@ async fn a_timer_wakes_its_actor() {
 
 /// `tasks` lists the actor's tasks, and `cancel` signals a running one,
 /// which then records what came back: a command stopped mid-run is
-/// `Unknown` (H2).
+/// `Unknown` (T2).
 #[tokio::test]
 async fn tasks_lists_and_cancel_signals_a_running_task() {
     let env = Arc::new(MemEnv::default());
@@ -1732,7 +1732,7 @@ async fn tasks_lists_and_cancel_signals_a_running_task() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// B2, checked: a foreground `bash` and a background one whose runs never
+/// P2, checked: a foreground `bash` and a background one whose runs never
 /// report (they ignore their cancel). What broke, if anything: a call or a
 /// task not resolved `Unknown` within two seconds of its deadline.
 async fn deadlines(planted: Planted) -> Result<(), String> {
@@ -1788,7 +1788,7 @@ async fn deadlines(planted: Planted) -> Result<(), String> {
     }
 }
 
-/// Every in-flight effect resolves by its deadline (B2): a run that never
+/// Every in-flight effect resolves by its deadline (P2): a run that never
 /// reports is `Unknown` once v stops waiting.
 #[tokio::test]
 async fn a_run_that_never_reports_resolves_unknown_at_its_deadline() {
@@ -1797,7 +1797,7 @@ async fn a_run_that_never_reports_resolves_unknown_at_its_deadline() {
         .expect("every run resolves by its deadline");
 }
 
-/// The planted bug for B2: no deadline is armed. The check must catch the
+/// The planted bug for P2: no deadline is armed. The check must catch the
 /// wait.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -1808,7 +1808,7 @@ async fn waiting_on_a_run_that_never_reports_is_caught() {
     assert!(broken.contains("past its deadline"), "{broken}");
 }
 
-/// B2 beyond `bash`, checked: a `read` and an `edit` whose file never
+/// P2 beyond `bash`, checked: a `read` and an `edit` whose file never
 /// answers, a `send` whose recipient's append never returns, and a `spawn`
 /// whose child's birth never does. What broke, if anything: a call not
 /// resolved `Unknown` within two seconds of its deadline.
@@ -1875,7 +1875,7 @@ async fn stalls(planted: Planted) -> Result<(), String> {
     }
 }
 
-/// Every in-flight effect resolves by its deadline (B2), whatever it waits
+/// Every in-flight effect resolves by its deadline (P2), whatever it waits
 /// on: a file, or another actor's log.
 #[tokio::test]
 async fn reads_edits_and_deliveries_resolve_by_their_deadlines() {
@@ -1884,7 +1884,7 @@ async fn reads_edits_and_deliveries_resolve_by_their_deadlines() {
         .expect("every stalled call resolves by its deadline");
 }
 
-/// The planted bug for B2 beyond `bash`: no deadline is armed. The check
+/// The planted bug for P2 beyond `bash`: no deadline is armed. The check
 /// must catch the waits.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -2086,7 +2086,7 @@ async fn stopping_an_actor_stops_its_children() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// The actor cap is the registry's (B3): a spawn past it does not start.
+/// The actor cap is the registry's (P3): a spawn past it does not start.
 #[tokio::test]
 async fn a_spawn_past_the_actor_limit_does_not_start() {
     let env = Arc::new(MemEnv::default());
@@ -2108,7 +2108,7 @@ async fn a_spawn_past_the_actor_limit_does_not_start() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// O2 between logs, checked: actor A sends to actor B, and the daemon
+/// C2 between logs, checked: actor A sends to actor B, and the daemon
 /// crashes after B's `Delivered` is durable and before A's result is. The
 /// restart runs the send again under its key. What broke, if anything:
 /// B holding the envelope other than once, or A's send not resolved `Ok`.
@@ -2182,7 +2182,7 @@ async fn exactly_once(planted: Planted) -> Result<(), String> {
 }
 
 /// A `Keyed` send takes effect exactly once across a crash: the rerun
-/// carries the same envelope id, and the recipient takes it once (O2).
+/// carries the same envelope id, and the recipient takes it once (C2).
 #[tokio::test]
 async fn a_send_lands_exactly_once_across_a_crash() {
     exactly_once(Planted::None)
@@ -2190,7 +2190,7 @@ async fn a_send_lands_exactly_once_across_a_crash() {
         .expect("the envelope lands once and the send resolves Ok");
 }
 
-/// The planted bug for O2: a rerun mints a fresh envelope id.
+/// The planted bug for C2: a rerun mints a fresh envelope id.
 #[cfg(feature = "sim")]
 #[tokio::test]
 async fn a_fresh_key_after_a_crash_delivers_twice() {
@@ -2200,7 +2200,7 @@ async fn a_fresh_key_after_a_crash_delivers_twice() {
     assert!(broken.contains("2 times"), "{broken}");
 }
 
-/// A1 and L3 between logs, checked: A sends to B, A's `Dispatched` is
+/// C1 and T1 between logs, checked: A sends to B, A's `Dispatched` is
 /// slow to become durable, and B's log refuses the envelope (full) if
 /// `full`. What broke, if anything: B's `Delivered` durable before A's
 /// `Dispatched`, or A recording `Ok` for an envelope B does not hold.
@@ -2273,8 +2273,8 @@ async fn delivery_order(planted: Planted, full: bool) -> Result<(), String> {
     }
 }
 
-/// A delivery starts only after its `Dispatched` is durable (A1), and an
-/// `Ok` send is in its recipient's log (L3: an ack means durable).
+/// A delivery starts only after its `Dispatched` is durable (C1), and an
+/// `Ok` send is in its recipient's log (T1: an ack means durable).
 #[tokio::test]
 async fn a_delivery_waits_for_its_dispatch_and_its_recipients_append() {
     delivery_order(Planted::None, false)
@@ -2285,7 +2285,7 @@ async fn a_delivery_waits_for_its_dispatch_and_its_recipients_append() {
         .expect("a refused delivery is not Ok");
 }
 
-/// The planted bug for A1 between logs: a send delivered before its
+/// The planted bug for C1 between logs: a send delivered before its
 /// `Dispatched` is durable.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -2296,7 +2296,7 @@ async fn delivering_a_send_before_its_dispatch_is_durable_is_caught() {
     assert!(broken.contains("before its Dispatched"), "{broken}");
 }
 
-/// The planted bug for L3 between logs: a recipient that acknowledges a
+/// The planted bug for T1 between logs: a recipient that acknowledges a
 /// delivery before its append is durable (here the append is refused).
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -2401,7 +2401,7 @@ fn spawn_dispatched(log: &[Record<Parsed>]) -> bool {
         .any(|record| matches!(record, Record::Dispatched { .. }))
 }
 
-/// A stop is `Keyed` and has no deadline (O2): one whose child's append
+/// A stop is `Keyed` and has no deadline (C2): one whose child's append
 /// stalls is still running when the daemon crashes, and the restart sends
 /// it again, so the stopped parent's child ends stopped.
 #[tokio::test]
@@ -2460,7 +2460,7 @@ async fn a_stop_the_crash_caught_in_flight_lands_after_the_restart() {
     assert!(stopped.is_ok(), "the stopped parent's child is stopped");
 }
 
-/// H2 for a spawn: once it has made its child, it has acted. A child
+/// T2 for a spawn: once it has made its child, it has acted. A child
 /// stopped before its prompt lands is reported `Ok`, never `NotStarted`.
 #[tokio::test]
 async fn a_spawn_whose_child_is_stopped_before_its_prompt_is_ok() {
@@ -2521,7 +2521,7 @@ async fn a_spawn_whose_child_is_stopped_before_its_prompt_is_ok() {
 
 /// A log a spawn made, whose birth a crash tore and which no spawn will
 /// birth (its parent was stopped), hosts no actor: a message to it is
-/// refused as to no actor, and the daemon lives on (L3: no crash loop).
+/// refused as to no actor, and the daemon lives on (T1: no crash loop).
 #[tokio::test]
 async fn a_message_to_an_unborn_actor_is_refused() {
     let env = Arc::new(MemEnv::default());
@@ -2588,7 +2588,7 @@ async fn a_message_to_an_unborn_actor_is_refused() {
     );
 }
 
-/// A2: the rules file is read before every delivery and before each model
+/// C1: the rules file is read before every delivery and before each model
 /// response is settled, not only before your messages. A rule you remove
 /// stops granting to every actor, a spawned child included, from its next
 /// delivery on: the child's `bash` asks, and nothing runs.
@@ -2648,7 +2648,7 @@ async fn a_removed_rule_stops_granting_to_a_child() {
     );
 }
 
-/// L3: an error never answers a message the log holds. A message to an
+/// T1: an error never answers a message the log holds. A message to an
 /// idle actor at its limit of turns would start no turn: it is refused
 /// before anything is recorded, and a retry is refused the same way.
 #[tokio::test]
@@ -2689,7 +2689,7 @@ async fn a_message_past_the_turn_limit_is_refused_and_not_recorded() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// A2 for subjects, end to end: an `exact` rule grants its command alone.
+/// C1 for subjects, end to end: an `exact` rule grants its command alone.
 /// A command that runs more, or another one, asks; nothing it did not
 /// grant runs before you answer.
 #[tokio::test]
