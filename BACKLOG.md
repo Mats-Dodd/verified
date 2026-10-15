@@ -219,12 +219,12 @@ across them. *Leaning,* all of it.
   blocking. *Idea.* Possibly cleaner than ad hoc `reply_to`.
 - **Virtual actors as an explicit design point:** an actor with an empty
   mailbox costs nothing and is woken by a message. *Idea.*
-- **Context compaction.** *Next.*
-  - The model's context grows without bound for long-lived actors (the LSM
-    analogy: recent turns as the mutable table, summaries as older levels).
-  - v owns *when* and the guarantee of headroom; the summary's quality
-    isn't promised.
-  - Deserves its own design round.
+- **LSM compaction.** *Open.* Model history compaction is built: the cut
+  is always now, the next prompt is the summary, the open work and the
+  unread mail, and each summary is made from the last. Next would keep
+  recent turns verbatim (the mutable table) and re-summarize older levels
+  from source. A cut inside a step is then possible: `Planted::CutMidStep`
+  already guards it.
 - **Storage-engine work.** *Idea, later.*
   - checkpoints per bar (bounded recovery time);
   - log compaction and retention;
@@ -233,9 +233,6 @@ across them. *Leaning,* all of it.
   - headroom on the log once v owns its storage.
 - **A VOPR-style liveness mode.** *Leaning.* Run the simulation, heal every
   fault, and assert the system goes quiet within a bound. It's the check P1 needs.
-- **A full context parks the actor.** *Decided* (in `PRINCIPLES.md`, Not
-  promised): its turns end at the first beat and its mail waits. Compaction
-  unparks it.
 - **The default rules.** *Open.* The default is exactly `read: allow`, so
   `wake`, `tasks`, `cancel`, `send` and `spawn` all ask unless
   `.verified/v.toml` allows them. The draft API proposes dropping defaults
@@ -265,9 +262,10 @@ across them. *Leaning,* all of it.
 **Fidelity gaps**
 - **Orphans never act in the sim.** Real `bash` children outlive the
   daemon, but the fake never lets an orphaned run act after a crash.
-- **The fake model never loops.** No seed reaches a limit (context, steps,
-  calls, turns), so a wrong limits wiring would go unnoticed. One directed
-  scenario covers the step bound.
+- **The fake model never loops.** No seed reaches the steps, calls or
+  turns limit, so a wrong wiring of those would go unnoticed. One directed
+  scenario covers the step bound. Seeds with a small context do reach the
+  context limit and compact.
 
 - **No fake fills a disk.** Full-disk fail-stop is tested with a log that
   refuses the way the file log does; the file log cutting a partial write

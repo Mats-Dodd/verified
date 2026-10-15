@@ -1,7 +1,7 @@
 //! The whole client (runtime, HTTP client, follower, app) against a scripted
 //! daemon over in-memory pipes: create the session, catch up on the stream,
 //! reconnect from the last offset after the daemon closes it, send a message
-//! with a stamp-minted id, and quit.
+//! with a stamp-minted id, `/compact` without sending one, and quit.
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -18,7 +18,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use verified_domain::Millis;
 use verified_domain::id::{MessageId, UnixMillis};
-use verified_tui::app::Start;
+use verified_tui::app::{COMPACT, Start};
 use verified_tui::seam::{Clock, Dialer, Entropy, Stream};
 use verified_tui::tea::Seams;
 use verified_tui::terminal::{Keyboard, TestScreen, scripted};
@@ -173,6 +173,8 @@ async fn serve(mut stream: DuplexStream, seen: SyncSender<Seen>) {
         respond_json(stream, r#"{"outcome":"created"}"#).await;
     } else if line.starts_with("GET /actors ") {
         respond_json(stream, r#"{"actors":[]}"#).await;
+    } else if line.contains("/compact ") {
+        respond_json(stream, r#"{"outcome":"created"}"#).await;
     } else if line.contains("/messages ") {
         seen.send(Seen::Message(body))
             .expect("the test is listening");
@@ -304,6 +306,65 @@ async fn creates_catches_up_reconnects_sends_and_quits() {
     let at = UnixMillis::new(NOW).expect("in range");
     assert_eq!(message.message_id, MessageId::from_parts(at, &[3; 10]));
     assert!(screen.text().contains("Hi there, friend."));
+}
+
+/// `/compact` posts to the actor's compact route, and sends no message.
+#[tokio::test]
+async fn compact_posts_to_the_compact_route_and_sends_no_message() {
+    let (seen_by_daemon, seen): (SyncSender<Seen>, Receiver<Seen>) = sync_channel(64);
+    let (keyboard, input) = scripted(16);
+    let entropy = Counting::default();
+    let session = new_session(&FixedClock, &entropy);
+    let seams = Seams {
+        input: Box::new(input),
+        dialer: Arc::new(ScriptedDaemon {
+            seen: seen_by_daemon,
+        }),
+        clock: Arc::new(FixedClock),
+        entropy: Box::new(entropy),
+    };
+    let mut screen = TestScreen::new(80, 12);
+    let route = format!("POST /actors/{session}/compact HTTP/1.1");
+    let mut script = Script::CatchingUp;
+    let mut seen_log = Vec::new();
+    let mut observe = |app: &verified_tui::app::App| {
+        seen_log.extend(seen.try_iter());
+        match script {
+            Script::CatchingUp if app.caught_up() && app.transcript().turns().len() == 1 => {
+                keyboard
+                    .try_send(Keyboard::paste(COMPACT.to_owned()))
+                    .expect("queued");
+                keyboard.try_send(Keyboard::enter()).expect("queued");
+                script = Script::Sending;
+            }
+            Script::Sending
+                if app.settled()
+                    && seen_log
+                        .iter()
+                        .any(|seen| matches!(seen, Seen::Request { line } if *line == route)) =>
+            {
+                assert_eq!(app.notice(), None, "the daemon compacted");
+                keyboard.try_send(Keyboard::quit()).expect("queued");
+                script = Script::Quitting;
+            }
+            Script::CatchingUp | Script::Sending | Script::Quitting => {}
+        }
+    };
+    let _app = verified_tui::run(
+        Start::New(session),
+        Limits::DEFAULT,
+        seams,
+        &mut screen,
+        &mut observe,
+    )
+    .await
+    .expect("runs");
+    assert_eq!(script, Script::Quitting);
+    seen_log.extend(seen.try_iter());
+    assert!(
+        !seen_log.iter().any(|seen| matches!(seen, Seen::Message(_))),
+        "no message was posted"
+    );
 }
 
 /// Refuses the first `refusals` dials, then serves like [`ScriptedDaemon`].

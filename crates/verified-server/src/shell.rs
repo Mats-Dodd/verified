@@ -109,9 +109,9 @@ pub struct ShellConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Planted {
     None,
-    /// Start tool runs before their decision is durable (breaks Law 2:
-    /// persist before acting). The model's replay must catch the run it
-    /// has not started.
+    /// Start tool runs and summarize calls before their decision is
+    /// durable (breaks T1: write before you act). The model's replay must
+    /// catch the run, or the summarize call, it has not started.
     #[cfg(feature = "sim")]
     RunBeforePersist,
     /// Run each tool twice, reporting once (breaks at-most-once inside one
@@ -167,6 +167,16 @@ pub enum Planted {
     /// records it consumed (breaks T4: the model never sees it).
     #[cfg(feature = "sim")]
     UntoldTaskEnds,
+    /// Take the mail no step carried yet into a compaction's summary
+    /// (breaks T4: unread mail inside a cut). The step that carries it
+    /// never tells it.
+    #[cfg(feature = "sim")]
+    CutSwallowsMail,
+    /// Cut the history between the last step's `tool_use` and its results
+    /// (breaks T4's well-formed history). The core only ever cuts at a
+    /// beat; this guards a history that keeps recent turns verbatim.
+    #[cfg(feature = "sim")]
+    CutMidStep,
     /// Acknowledge a group commit without its fsync (breaks T1): a crash
     /// loses records the shell acted on. The simulation's log store
     /// plants it ([`crate::log::FileLogStore::skipping_sync`]).
@@ -1306,29 +1316,20 @@ impl Session {
     fn start_effect(&mut self, effect: Effect<Parsed>) {
         match effect {
             Effect::CallModel { id, .. } => {
+                #[cfg(not(feature = "sim"))]
                 let request = history::request(
                     &self.records,
                     &self.config.system,
                     self.config.limits.model_max_tokens,
                 );
-                // The planted defects: a steer spliced into its step, or a
-                // task's end never told.
+                // The history's planted defects, if one is planted.
                 #[cfg(feature = "sim")]
-                let request = if self.config.planted == Planted::SpliceSteering {
-                    history::spliced(
-                        &self.records,
-                        &self.config.system,
-                        self.config.limits.model_max_tokens,
-                    )
-                } else if self.config.planted == Planted::UntoldTaskEnds {
-                    history::untold(
-                        &self.records,
-                        &self.config.system,
-                        self.config.limits.model_max_tokens,
-                    )
-                } else {
-                    request
-                };
+                let request = history::planted(
+                    &self.records,
+                    &self.config.system,
+                    self.config.limits.model_max_tokens,
+                    self.config.planted,
+                );
                 #[cfg(feature = "sim")]
                 crate::shim::observe(crate::shim::Observation::Requested {
                     actor: self.id,
@@ -1371,16 +1372,23 @@ impl Session {
             // v's housekeeping: the conversation so far, summarized under
             // the same bound as a step's call (one budget).
             Effect::Summarize { id } => {
+                #[cfg(not(feature = "sim"))]
                 let request = history::summarize(
                     &self.records,
                     &self.config.system,
                     self.config.limits.model_max_tokens,
                 );
                 #[cfg(feature = "sim")]
-                crate::shim::observe(crate::shim::Observation::Summarizing { actor: self.id, id });
+                let request = history::planted_summary(
+                    &self.records,
+                    &self.config.system,
+                    self.config.limits.model_max_tokens,
+                    self.config.planted,
+                );
                 let cancel = CancellationToken::new();
                 self.cancels.insert(id, cancel.clone());
                 let task = SummaryTask {
+                    actor: self.id,
                     model: Arc::clone(&self.seams.model),
                     inbox: self.inbox.clone(),
                     config: Arc::clone(&self.config),
@@ -1733,6 +1741,7 @@ enum Next {
 /// A summarize call: the model's text, within `summary_bytes`. Tool calls
 /// it proposes are ignored; no text at all fails it.
 struct SummaryTask {
+    actor: ActorId,
     model: Arc<dyn Model>,
     inbox: mpsc::Sender<Input>,
     config: Arc<ShellConfig>,
@@ -1742,6 +1751,11 @@ struct SummaryTask {
 
 impl SummaryTask {
     async fn run(self, request: ModelRequest) {
+        barrier(Barrier::Summarizing {
+            actor: self.actor,
+            id: self.id,
+        })
+        .await;
         let (sender, receiver) = mpsc::channel(self.config.limits.model_parts_queue);
         // Stops the stream when the summary grows too large; an interrupt
         // still stops both.

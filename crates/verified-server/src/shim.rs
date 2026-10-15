@@ -526,6 +526,12 @@ pub enum Barrier {
         actor: verified_domain::ActorId,
         id: verified_domain::EffectId,
     },
+    /// The summarize call of `actor` with this id is about to be sent: its
+    /// `CompactionStarted` (at `id.seq`) must be durable (T1).
+    Summarizing {
+        actor: verified_domain::ActorId,
+        id: verified_domain::EffectId,
+    },
 }
 
 /// Triggers `point` for a simulation's barriers. Under `sim` it is first
@@ -576,12 +582,6 @@ pub enum Observation {
         actor: verified_domain::ActorId,
         id: verified_domain::EffectId,
         said: Vec<String>,
-    },
-    /// The summarize call `id` of `actor` is about to be sent: its
-    /// `CompactionStarted` (at `id.seq`) must be durable (T1).
-    Summarizing {
-        actor: verified_domain::ActorId,
-        id: verified_domain::EffectId,
     },
     /// A barrier was reached.
     Passed(Barrier),

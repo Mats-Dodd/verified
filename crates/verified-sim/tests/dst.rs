@@ -82,6 +82,8 @@ seeds! {
     seed_0 = 0;
     seed_1 = 1;
     seed_2 = 2;
+    // A small context: the history is compacted between turns, and by the
+    // user's `/compact`.
     seed_3 = 3;
     seed_4 = 4;
     seed_5 = 5;
@@ -425,6 +427,8 @@ fn the_fixed_seeds_replay_every_kind_of_step() {
         Kind::Crash,
         Kind::Read,
         Kind::Reconnect,
+        Kind::Compact,
+        Kind::Summarize,
     ] {
         assert!(
             taken.contains(&Key::Action(kind)),
@@ -785,6 +789,50 @@ fn a_task_end_never_told_is_caught() {
     );
     let outcome = played(&a_background_command(), Planted::UntoldTaskEnds);
     assert!(broke(&outcome, "I14"), "{:#?}", outcome.violations);
+}
+
+/// T4, as a mutation test: a cut that takes the mail no step carried yet
+/// into its summary. The long message waits behind a cut at the first
+/// step of its turn; the step that carries it then never tells it, and
+/// I14 finds a model call whose request lacks what its step carried.
+#[test]
+fn a_cut_that_swallows_unread_mail_fails_i14() {
+    let outcome = played(
+        &directed::compacted_at_the_first_step(),
+        Planted::CutSwallowsMail,
+    );
+    assert!(broke(&outcome, "I14"), "{:#?}", outcome.violations);
+}
+
+/// T1, as a mutation test: a shell that asks for a summary before its
+/// `CompactionStarted` is durable. The replay finds a summarize call sent
+/// that the model has not started.
+#[test]
+fn summarizing_before_the_cut_is_durable_fails_the_replay() {
+    let outcome = played(
+        &directed::compacted_at_the_first_step(),
+        Planted::RunBeforePersist,
+    );
+    assert!(
+        matches!(
+            &outcome.replayed,
+            Err(Mismatch::Diverged(divergence))
+                if matches!(divergence.observed, Observed::Summarizing(_))
+        ),
+        "{:?}",
+        outcome.replayed
+    );
+}
+
+/// T4's well-formed history, as a mutation test: a cut placed between a
+/// step's `tool_use` and its results. The core cuts only at a beat, so
+/// this guards a history that keeps recent turns verbatim: the
+/// conversation after the cut opens with results of calls it never made,
+/// and the fake provider refuses it (I13).
+#[test]
+fn a_cut_between_a_tool_use_and_its_result_fails_i13() {
+    let outcome = played(&directed::compacted_after_tools(), Planted::CutMidStep);
+    assert!(broke(&outcome, "I13"), "{:#?}", outcome.violations);
 }
 
 /// A command that never reports, whatever it is told.

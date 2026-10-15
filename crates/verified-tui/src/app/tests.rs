@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::Value;
 use verified_domain::Millis;
 use verified_domain::id::{ActorId, CallId, MessageId, TurnId, UnixMillis};
-use verified_wire::chunk::UiChunk;
+use verified_wire::chunk::{CompactedData, UiChunk};
 use verified_wire::command::{
     ActorList, ActorState, ActorSummary, CreateActorReply, Outcome, Rejection, SendMessageReply,
     Verdict,
@@ -490,6 +490,63 @@ fn only_the_answer_for_the_turn_being_cancelled_settles_it() {
         app.notice()
             .is_some_and(|notice| notice.contains("is not running"))
     );
+}
+
+#[test]
+fn compact_on_the_draft_compacts_instead_of_sending() {
+    let mut app = opened();
+    type_text(&mut app, " /compact ");
+    assert_eq!(
+        app.update(Msg::Submit(stamp(1))),
+        Cmd::Send(Command::Compact(session())),
+        "no message is sent"
+    );
+    assert_eq!(app.draft(), "");
+    assert!(!app.settled(), "the compaction is on its way");
+    type_text(&mut app, COMPACT);
+    assert_eq!(
+        app.update(Msg::Submit(stamp(2))),
+        Cmd::None,
+        "one at a time"
+    );
+    let _cmd = answer(
+        &mut app,
+        Answer::Compacted {
+            actor: session(),
+            result: Err(ClientError::Rejected(Rejection::TurnRunning {
+                actor_id: session(),
+            })),
+        },
+    );
+    assert!(app.settled());
+    assert!(
+        app.notice()
+            .is_some_and(|notice| notice.contains("a turn is running")),
+        "{:?}",
+        app.notice()
+    );
+}
+
+#[test]
+fn a_compaction_shows_where_it_fell() {
+    let mut app = opened();
+    let mut chunks = fixture("simple");
+    chunks.push(UiChunk::Compacted {
+        payload: CompactedData {
+            summary: "Summary: 3 messages.".to_owned(),
+            bytes: 20,
+        },
+    });
+    let next = u64::try_from(chunks.len()).expect("few chunks");
+    let _cmd = read(&mut app, chunks, next);
+    let shown = screen(&mut app, 80, 20);
+    let marker = shown
+        .find("history compacted")
+        .expect("the marker is shown");
+    let summary = shown
+        .find("Summary: 3 messages.")
+        .expect("the summary is shown");
+    assert!(marker < summary, "{shown}");
 }
 
 #[test]

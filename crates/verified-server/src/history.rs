@@ -48,6 +48,31 @@ struct Step {
     calls: Vec<usize>,
     /// What the planted history spliced into the step (`spliced`).
     spliced: Vec<String>,
+    /// The planted cut fell inside this step: its `tool_use` is in the
+    /// summary, so only its results are rendered (`Planted::CutMidStep`).
+    halved: bool,
+}
+
+/// A planted defect of the history, under `sim` only: the fair history has
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "sim"),
+    expect(dead_code, reason = "the planted defects are built under `sim` only")
+)]
+enum Defect {
+    None,
+    /// A message lands where it was delivered, inside the step that was
+    /// running (`Planted::SpliceSteering`).
+    Splice,
+    /// A task's end is never told (`Planted::UntoldTaskEnds`).
+    Untold,
+    /// The cut takes the mail no step carried yet into the summary
+    /// (`Planted::CutSwallowsMail`).
+    SwallowMail,
+    /// The cut falls after the last step's `tool_use`, before its results
+    /// (`Planted::CutMidStep`).
+    CutMidStep,
 }
 
 struct Builder {
@@ -57,11 +82,7 @@ struct Builder {
     /// What each envelope delivered or notified says, until a step carries
     /// it.
     mail: BTreeMap<EnvelopeId, String>,
-    /// The planted defect: a message lands where it was delivered, inside
-    /// the step that was running ([`spliced`]).
-    splice: bool,
-    /// The planted defect: a task's end is never told ([`untold`]).
-    untold: bool,
+    defect: Defect,
 }
 
 /// What opens the summary at a cut: the model reads what follows as its
@@ -136,7 +157,17 @@ impl Builder {
     /// work, as the user's. The step the cut closed is in the summary.
     fn restart(&mut self, summary: &str, open: &OpenWork) {
         self.messages.clear();
-        self.step = None;
+        let step = self.step.take();
+        match self.defect {
+            Defect::SwallowMail => self.mail.clear(),
+            Defect::CutMidStep => {
+                self.step = step.map(|step| Step {
+                    halved: true,
+                    ..step
+                });
+            }
+            Defect::None | Defect::Splice | Defect::Untold => {}
+        }
         let mut said = vec![Content::Text {
             text: format!("{SUMMARY_HEADER}{summary}"),
         }];
@@ -194,7 +225,9 @@ impl Builder {
                 kind,
             });
         }
-        self.push(Role::Assistant, assistant);
+        if !step.halved {
+            self.push(Role::Assistant, assistant);
+        }
         let mut said: Vec<Content> = step
             .spliced
             .into_iter()
@@ -219,7 +252,7 @@ impl Builder {
                         ),
                     };
                     match &mut self.step {
-                        Some(step) if self.splice && !step.calls.is_empty() => {
+                        Some(step) if self.defect == Defect::Splice && !step.calls.is_empty() => {
                             step.spliced.push(said);
                         }
                         Some(_) | None => {
@@ -228,7 +261,7 @@ impl Builder {
                     }
                 }
             }
-            Record::TaskEnded { .. } if self.untold => {}
+            Record::TaskEnded { .. } if self.defect == Defect::Untold => {}
             Record::TaskEnded { task, exit, output } => {
                 let output = output
                     .as_ref()
@@ -352,29 +385,7 @@ fn tool_use(id: &CallId, name: &ToolName, input: &ToolInput) -> Content {
 /// The request for the next model call, from every record so far.
 #[must_use]
 pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    build(records, system, max_tokens, (false, false))
-}
-
-/// The planted defect `Planted::SpliceSteering` (breaks T4).
-///
-/// The request with each message rendered where it was delivered, so one
-/// that arrived while a step's calls ran sits between their `tool_use` and
-/// their results. Only under `sim`.
-#[cfg(feature = "sim")]
-#[must_use]
-pub fn spliced(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    build(records, system, max_tokens, (true, false))
-}
-
-/// The planted defect `Planted::UntoldTaskEnds` (breaks T4 as the
-/// model sees them).
-///
-/// The request without any task's end: a step that carries one records it
-/// consumed, and the model is never told. Only under `sim`.
-#[cfg(feature = "sim")]
-#[must_use]
-pub fn untold(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    build(records, system, max_tokens, (false, true))
+    build(records, system, max_tokens, Defect::None).0
 }
 
 /// The request for a summarize call, its `CompactionStarted` the last record.
@@ -383,15 +394,93 @@ pub fn untold(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mode
 /// Mail not yet carried is not in it (T4: a cut never holds unread mail).
 #[must_use]
 pub fn summarize(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
-    let mut request = request(records, system, max_tokens);
-    let instruction = Content::Text {
-        text: INSTRUCTION.to_owned(),
+    summarized(records, system, max_tokens, Defect::None)
+}
+
+/// The request for the next model call under the planted defect of
+/// `planted`, if it is one of the history's. Only under `sim`.
+///
+/// - `SpliceSteering` (breaks T4's well-formed history): each message is
+///   rendered where it was delivered, so one that arrived while a step's
+///   calls ran sits between their `tool_use` and their results.
+/// - `UntoldTaskEnds` (breaks T4 as the model sees them): no task's end is
+///   told, though a step that carries one records it consumed.
+/// - `CutSwallowsMail` (breaks T4): the mail no step carried before a cut
+///   is taken into the summary, so the step that carries it never tells it.
+/// - `CutMidStep` (breaks T4's well-formed history): the cut falls after
+///   the last step's `tool_use`, so the conversation after it opens with
+///   results of calls it never made.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn planted(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    planted: crate::shell::Planted,
+) -> ModelRequest {
+    build(records, system, max_tokens, defect(planted)).0
+}
+
+/// The request for a summarize call under the planted defect of `planted`:
+/// under `CutSwallowsMail`, the mail no step carried is rendered before
+/// the instruction, to be summarized. Only under `sim`.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn planted_summary(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    planted: crate::shell::Planted,
+) -> ModelRequest {
+    summarized(records, system, max_tokens, defect(planted))
+}
+
+#[cfg(feature = "sim")]
+const fn defect(planted: crate::shell::Planted) -> Defect {
+    use crate::shell::Planted;
+    match planted {
+        Planted::SpliceSteering => Defect::Splice,
+        Planted::UntoldTaskEnds => Defect::Untold,
+        Planted::CutSwallowsMail => Defect::SwallowMail,
+        Planted::CutMidStep => Defect::CutMidStep,
+        Planted::None
+        | Planted::RunTwice
+        | Planted::UnknownAsNotStarted
+        | Planted::StoppedAsNotStarted
+        | Planted::ActAfterRefusal
+        | Planted::NoDeadline
+        | Planted::AckBeforeAppend
+        | Planted::FreshKeyOnResume
+        | Planted::DeliverBeforePersist
+        | Planted::ConsumeAtInjection
+        | Planted::StopSkipsChildren
+        | Planted::RunBeforePersist
+        | Planted::SkipFsync => Defect::None,
+    }
+}
+
+fn summarized(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    defect: Defect,
+) -> ModelRequest {
+    let (mut request, mail) = build(records, system, max_tokens, defect);
+    let mut said: Vec<Content> = match defect {
+        Defect::SwallowMail => mail
+            .into_values()
+            .map(|text| Content::Text { text })
+            .collect(),
+        Defect::None | Defect::Splice | Defect::Untold | Defect::CutMidStep => Vec::new(),
     };
+    said.push(Content::Text {
+        text: INSTRUCTION.to_owned(),
+    });
     match request.messages.last_mut() {
-        Some(last) if last.role == Role::User => last.content.push(instruction),
+        Some(last) if last.role == Role::User => last.content.extend(said),
         Some(_) | None => request.messages.push(Message {
             role: Role::User,
-            content: vec![instruction],
+            content: said,
         }),
     }
     request
@@ -418,19 +507,19 @@ pub fn said(request: &ModelRequest) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The request, and the mail no step carried yet.
 fn build(
     records: &[Record<Parsed>],
     system: &str,
     max_tokens: u32,
-    (splice, untold): (bool, bool),
-) -> ModelRequest {
+    defect: Defect,
+) -> (ModelRequest, BTreeMap<EnvelopeId, String>) {
     let mut builder = Builder {
         messages: Vec::new(),
         calls: Vec::new(),
         step: None,
         mail: BTreeMap::new(),
-        splice,
-        untold,
+        defect,
     };
     // The latest summary, and the cut it starts the conversation at.
     let cut = records.iter().rev().find_map(|record| {
@@ -445,10 +534,25 @@ fn build(
             None
         }
     });
+    // The planted defect moves the cut back to the last `StepFinished`.
+    let cut = cut.map(|(started, summary, open)| match defect {
+        Defect::CutMidStep => {
+            let finished = records
+                .get(..usize::try_from(started).unwrap_or(usize::MAX))
+                .unwrap_or(records)
+                .iter()
+                .rposition(|record| matches!(record, Record::StepFinished { .. }))
+                .and_then(|at| u64::try_from(at).ok());
+            (finished.unwrap_or(started), summary, open)
+        }
+        Defect::None | Defect::Splice | Defect::Untold | Defect::SwallowMail => {
+            (started, summary, open)
+        }
+    });
     for (seq, record) in (0u64..).zip(records) {
         builder.record(seq, record);
-        if let Some((started, summary, open)) = cut
-            && seq == started
+        if let Some((at, summary, open)) = cut
+            && seq == at
         {
             builder.restart(summary, open);
         }
@@ -483,12 +587,15 @@ fn build(
             | Record::Compacted { .. } => None,
         })
         .unwrap_or_default();
-    ModelRequest {
-        system: system.to_owned(),
-        messages: builder.messages,
-        max_tokens,
-        tools,
-    }
+    (
+        ModelRequest {
+            system: system.to_owned(),
+            messages: builder.messages,
+            max_tokens,
+            tools,
+        },
+        builder.mail,
+    )
 }
 
 #[cfg(test)]

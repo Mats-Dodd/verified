@@ -13,17 +13,21 @@
 use core::time::Duration;
 use std::collections::BTreeSet;
 
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use verified_domain::{Limits, LimitsConfig, Unstarted};
+use verified_model::Kind;
 use verified_model::Replayed;
-use verified_model::coverage::{Class, Ended, Key, Phase, Resolved, Situation, Started};
+use verified_model::coverage::{
+    Class, Compaction, Ended, Key, Phase, Resolved, Situation, Started,
+};
 use verified_server::limits::ServerLimits;
+use verified_tui::app::COMPACT;
 use verified_wire::command::Verdict;
 
 use crate::hosts;
 use crate::run::{self, Broken, RunError};
-use crate::scenario::{CancelAt, Hold, Scenario, TurnPlan};
+use crate::scenario::{Aim, AimedCrash, CancelAt, Hold, Scenario, TurnPlan, long};
 
 /// A gap random seeds miss, and the scenario that reaches it.
 #[derive(Debug, Clone)]
@@ -56,6 +60,46 @@ fn shrunk(change: impl FnOnce(&mut LimitsConfig)) -> ServerLimits {
     let mut limits = hosts::limits();
     limits.core = Limits::new(config);
     limits
+}
+
+/// v0's limits with a context of `bytes`: a few turns fill it.
+fn small_context(bytes: u64) -> ServerLimits {
+    shrunk(|config| {
+        config.context_bytes = NonZeroU64::new(bytes).expect("non-zero");
+    })
+}
+
+/// The context a directed compaction runs in: a greeting and its echo
+/// take a fifth of it, and [`long`] messages of 200 words do not fit
+/// after one.
+const CONTEXT: u64 = 1_200;
+
+/// A greeting, then a long message whose step does not fit: the history
+/// is compacted at the first step of its turn, the message unread behind
+/// the cut, then carried.
+#[must_use]
+pub fn compacted_at_the_first_step() -> Scenario {
+    Scenario {
+        limits: small_context(CONTEXT),
+        ..Scenario::of(vec![
+            TurnPlan::granted("hello 0"),
+            TurnPlan::granted(&long(200)),
+        ])
+    }
+}
+
+/// A command whose output leaves no room for the next step: the history
+/// is compacted at the beat after it, its `tool_use` and result both
+/// behind the cut, and the turn goes on.
+#[must_use]
+pub fn compacted_after_tools() -> Scenario {
+    Scenario {
+        limits: small_context(CONTEXT),
+        ..Scenario::of(vec![TurnPlan::granted(&format!(
+            "bash echo {} then bash touch c1",
+            "x".repeat(300)
+        ))])
+    }
 }
 
 /// Every directed scenario.
@@ -191,6 +235,91 @@ pub fn all() -> Vec<Directed> {
                 resolved: Resolved::NotStarted(Unstarted::Limit),
             },
             scenario: one_turn(TurnPlan::granted(&["read other.txt"; 17].join(" ; ")), None),
+        },
+        // A forced compaction: a long message that does not fit, unread
+        // behind the cut, carried once the summary made room. No seed's
+        // context is small enough by default.
+        Directed {
+            name: "a_compaction_at_the_first_step",
+            target: Key::Compaction {
+                forced: true,
+                ended: Compaction::Written,
+            },
+            scenario: compacted_at_the_first_step(),
+        },
+        Directed {
+            name: "a_compaction_after_tools",
+            target: Key::Compaction {
+                forced: true,
+                ended: Compaction::Written,
+            },
+            scenario: compacted_after_tools(),
+        },
+        // Each greeting leaves the context past 80%: a compaction after
+        // each turn, the second summarizing the first.
+        Directed {
+            name: "compactions_between_turns",
+            target: Key::Compaction {
+                forced: false,
+                ended: Compaction::Written,
+            },
+            scenario: Scenario {
+                limits: small_context(300),
+                ..Scenario::of(vec![
+                    TurnPlan::granted("hello 0"),
+                    TurnPlan::granted("hello 1"),
+                ])
+            },
+        },
+        // A message too long for any summary to make room parks the
+        // actor; `/compact` compacts it and its message is tried again.
+        Directed {
+            name: "compact_a_parked_actor",
+            target: Key::Action(Kind::Compact),
+            scenario: Scenario {
+                limits: small_context(CONTEXT),
+                ..Scenario::of(vec![
+                    TurnPlan::granted(&long(400)),
+                    TurnPlan::granted(COMPACT),
+                ])
+            },
+        },
+        // Esc while the summary is written: the turn ends, and the
+        // actor waits, its message unread, for the next.
+        Directed {
+            name: "esc_during_a_compaction",
+            target: Key::Compaction {
+                forced: true,
+                ended: Compaction::Cancelled,
+            },
+            scenario: Scenario {
+                hold: Some(Hold::CancelledFirst),
+                limits: small_context(CONTEXT),
+                ..Scenario::of(vec![
+                    TurnPlan::granted("hello 0"),
+                    TurnPlan {
+                        cancel: Some(CancelAt::Running),
+                        ..TurnPlan::granted(&long(200))
+                    },
+                ])
+            },
+        },
+        // The daemon crashes as the summary is about to be asked for: a
+        // dangling `CompactionStarted`, and resume compacts again.
+        Directed {
+            name: "a_crash_during_a_compaction",
+            target: Key::Compaction {
+                forced: true,
+                ended: Compaction::Crashed,
+            },
+            scenario: Scenario {
+                aimed: Some(AimedCrash {
+                    aim: Aim::Summarizing,
+                    occurrence: 0,
+                    down: Duration::from_millis(500),
+                }),
+                ..compacted_after_tools()
+            },
         },
         // A call past v0's 16 calls a step fails by the limit and never
         // runs. No seed proposes more than four calls in a step.

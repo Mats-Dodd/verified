@@ -9,13 +9,18 @@
 //! add actors (turns that spawn, send, run in the background, wake, list
 //! and cancel tasks, under a rules file that grants the children their
 //! tools), a message that steers a running turn, and a stop of the root
-//! at the end.
+//! at the end. A third may shrink the context, so the history is
+//! compacted, and add a long message, a `/compact` and a crash aimed at a
+//! summarize call.
 
+use core::num::NonZeroU64;
 use core::time::Duration;
 
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
+use verified_domain::{Limits, LimitsConfig};
 use verified_server::limits::ServerLimits;
+use verified_tui::app::COMPACT;
 use verified_wire::command::Verdict;
 
 use crate::hosts;
@@ -38,6 +43,9 @@ pub enum CancelAt {
     ToolRunning,
     /// Instead of answering an approval prompt.
     Prompt,
+    /// As soon as the turn runs: before anything streams, while a summary
+    /// is being written for a step with no room.
+    Running,
 }
 
 /// When the user sends a second message while a turn runs, steering it.
@@ -146,6 +154,9 @@ pub enum Aim {
     /// the sender heard: the `Keyed` call runs again on resume, under the
     /// same id, and lands once.
     Delivered,
+    /// A summarize call is about to be sent: its `CompactionStarted` is
+    /// durable, and resume compacts again.
+    Summarizing,
 }
 
 /// A crash at the `occurrence`th time the daemon reaches `aim`.
@@ -162,8 +173,9 @@ pub enum Hold {
     /// The first tool run to act waits, before it reports, until a second
     /// has acted too: two runs act before either reports.
     RanTogether,
-    /// A tool run waits, before it starts, until the user's interrupt is
-    /// durable (and so its run is cancelled): it is stopped before it acts.
+    /// A tool run or a summarize call waits, before it starts, until the
+    /// user's interrupt is durable (and so it is cancelled): it is stopped
+    /// before it acts.
     CancelledFirst,
 }
 
@@ -195,6 +207,43 @@ pub struct Scenario {
 
 /// Mixed into the seed for the second stream: actors, steering, a stop.
 const MORE_SALT: u64 = 0x6163_746f_7273;
+/// Mixed into the seed for the third stream: a small context.
+const CONTEXT_SALT: u64 = 0x0063_6f6d_7061_6374;
+
+/// A message of `words` words the fake model echoes: long enough, in a
+/// small context, that its step may not fit.
+#[must_use]
+pub fn long(words: usize) -> String {
+    format!("long{}", " word".repeat(words))
+}
+
+/// A small context, drawn from the third stream for some seeds: the turns
+/// fill it, so the history is compacted (between turns, at a beat with no
+/// room, after a crash), and a long message may not fit at all and park
+/// the actor until a `/compact`.
+fn small_context(rng: &mut ChaCha8Rng, scenario: &mut Scenario) {
+    let mut config = LimitsConfig::v0();
+    config.context_bytes =
+        NonZeroU64::new(rng.random_range(800..3_000)).unwrap_or(config.context_bytes);
+    scenario.limits.core = Limits::new(config);
+    // Within a small log's message bound (1,000 bytes), as some tests set.
+    if rng.random_bool(0.5) {
+        let at = rng.random_range(0..=scenario.turns.len());
+        let words = rng.random_range(40..190usize);
+        scenario.turns.insert(at, TurnPlan::granted(&long(words)));
+    }
+    if rng.random_bool(0.5) {
+        let at = rng.random_range(0..=scenario.turns.len());
+        scenario.turns.insert(at, TurnPlan::granted(COMPACT));
+    }
+    if scenario.aimed.is_none() && rng.random_bool(0.3) {
+        scenario.aimed = Some(AimedCrash {
+            aim: Aim::Summarizing,
+            occurrence: rng.random_range(0..2),
+            down: Duration::from_millis(rng.random_range(0..2_000)),
+        });
+    }
+}
 
 /// A turn of the root that works with actors and tasks, the `index`th of
 /// the plan.
@@ -399,7 +448,7 @@ impl Scenario {
         } else {
             aimed
         };
-        Self {
+        let mut scenario = Self {
             seed,
             turns,
             faults,
@@ -410,7 +459,12 @@ impl Scenario {
             limits: hosts::limits(),
             rules: actors.then(|| RULES.to_owned()),
             stop,
+        };
+        let mut context = ChaCha8Rng::seed_from_u64(seed ^ CONTEXT_SALT);
+        if context.random_bool(0.2) {
+            small_context(&mut context, &mut scenario);
         }
+        scenario
     }
 
     /// A scenario of seed 0 that plays `turns` with no faults, under the
@@ -432,12 +486,15 @@ impl Scenario {
         }
     }
 
-    /// The messages the user plans to send: each turn's, and its steer.
+    /// The messages the user plans to send: each turn's (but a
+    /// `/compact`), and its steer.
     #[must_use]
     pub fn messages(&self) -> usize {
         self.turns
             .iter()
-            .map(|turn| 1usize.saturating_add(usize::from(turn.steer.is_some())))
+            .map(|turn| {
+                usize::from(turn.text != COMPACT).saturating_add(usize::from(turn.steer.is_some()))
+            })
             .sum()
     }
 }

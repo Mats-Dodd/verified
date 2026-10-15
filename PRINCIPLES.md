@@ -254,7 +254,7 @@ well-formed history for the provider) are mechanisms, described in
   answers, or ordering between senders.
 - **That every message is read.** A stopped actor, one at a cap, or one
   with a full context keeps its mail unread. A full context parks an actor
-  until compaction.
+  until a summary fits.
 - **Latency.** No bound on how fast a stop lands or a turn ends.
 - **Storage.** One machine, one disk, and fsync telling the truth. A full
   disk halts progress (T1).

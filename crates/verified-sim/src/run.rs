@@ -185,6 +185,7 @@ const fn aimed_at(aim: Aim, point: &Barrier) -> bool {
             | (Aim::GroupWritten, Barrier::GroupWritten { .. })
             | (Aim::Delivering, Barrier::Delivering { .. })
             | (Aim::Delivered, Barrier::Delivered { .. })
+            | (Aim::Summarizing, Barrier::Summarizing { .. })
     )
 }
 
@@ -201,7 +202,10 @@ impl Faults {
             hold,
             barrier: SimBarrier::build(Reaction::Suspend, move |point: &Barrier| match hold {
                 Hold::RanTogether => matches!(point, Barrier::ToolRan { .. }),
-                Hold::CancelledFirst => matches!(point, Barrier::Dispatched { .. }),
+                Hold::CancelledFirst => matches!(
+                    point,
+                    Barrier::Dispatched { .. } | Barrier::Summarizing { .. }
+                ),
             }),
             waiting: Vec::new(),
         });

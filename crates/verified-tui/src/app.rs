@@ -13,7 +13,9 @@
 //! followed. A message typed while a turn runs is sent at once: it steers
 //! the turn, and shows as queued until a step carries it. While an
 //! approval waits, `y` and `n` answer it on an empty draft; any other text
-//! is typed, and Enter sends it too, denying the waiting calls.
+//! is typed, and Enter sends it too, denying the waiting calls. Enter on
+//! `/compact` asks the actor followed to summarize its model history
+//! instead; the transcript keeps everything and marks where it fell.
 //!
 //! Ported from q's `app.rs`, plus approvals and actors.
 
@@ -35,6 +37,11 @@ use crate::Limits;
 use crate::client::{Answer, ClientError, Command, StreamUpdate};
 use crate::tea::{Cmd, Feedback, FollowId, Stamp};
 use crate::view::{self, Activity, Connection, Status};
+
+/// The draft that compacts the actor followed instead of sending a
+/// message: its model history is summarized, and the transcript keeps all
+/// of it.
+pub const COMPACT: &str = "/compact";
 
 /// Which actor the program shows first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +173,8 @@ pub struct App {
     approving: Option<CallId>,
     /// The turn whose cancellation is being sent.
     cancelling: Option<TurnId>,
+    /// The actor whose `/compact` is being sent.
+    compacting: Option<ActorId>,
     /// The stop being confirmed or sent.
     stopping: Option<Stopping>,
     /// The last thing worth telling the user.
@@ -225,6 +234,7 @@ impl App {
         self.pending.is_none()
             && self.approving.is_none()
             && self.cancelling.is_none()
+            && self.compacting.is_none()
             && self.stopping.is_none()
     }
 
@@ -399,6 +409,9 @@ impl App {
             self.notice = Some("the actor is still being created".to_owned());
             return Cmd::None;
         }
+        if draft == COMPACT {
+            return self.compact();
+        }
         let text = match MessageText::parse(draft.to_owned(), &self.limits.wire) {
             Ok(text) => text,
             Err(error) => {
@@ -414,6 +427,18 @@ impl App {
             text,
             delivery: Delivery::Sending,
         })
+    }
+
+    /// `/compact`: the actor followed summarizes its model history.
+    fn compact(&mut self) -> Cmd {
+        if self.compacting.is_some() {
+            self.notice = Some("a compaction is still on its way".to_owned());
+            return Cmd::None;
+        }
+        self.draft.clear();
+        self.notice = None;
+        self.compacting = Some(self.actor);
+        Cmd::Send(Command::Compact(self.actor))
     }
 
     fn cancel_turn(&mut self) -> Cmd {
@@ -602,7 +627,10 @@ impl App {
                 Cmd::None
             }
             Answer::Compacted { actor, result } => {
-                if actor == self.actor
+                if self
+                    .compacting
+                    .take_if(|compacting| *compacting == actor)
+                    .is_some()
                     && let Err(error) = result
                 {
                     self.notice = Some(format!("cannot compact: {}", explain(&error)));
@@ -702,10 +730,20 @@ impl App {
                 None => self.rendered.push(fresh()),
             }
         }
-        self.rendered
-            .iter()
-            .flat_map(|rendered| rendered.lines.iter().cloned())
-            .collect()
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let compacted = self.transcript.compacted();
+        for (index, rendered) in self.rendered.iter().enumerate() {
+            if let Some(compaction) = compacted.filter(|compaction| compaction.turns == index) {
+                lines.extend(view::compaction_lines(compaction));
+            }
+            lines.extend(rendered.lines.iter().cloned());
+        }
+        if let Some(compaction) =
+            compacted.filter(|compaction| compaction.turns >= self.rendered.len())
+        {
+            lines.extend(view::compaction_lines(compaction));
+        }
+        lines
     }
 
     /// The app on `start`, and its startup effects.
@@ -729,6 +767,7 @@ impl App {
             pending: None,
             approving: None,
             cancelling: None,
+            compacting: None,
             stopping: None,
             notice: None,
             scroll: None,

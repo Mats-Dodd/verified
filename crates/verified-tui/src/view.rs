@@ -15,7 +15,9 @@ use verified_domain::id::{ActorId, TaskId};
 use verified_wire::chunk::TurnEndReason;
 use verified_wire::command::{ActorState, ActorSummary};
 use verified_wire::stream::Freshness;
-use verified_wire::transcript::{Mail, Part, TaskView, ToolPart, ToolState, TranscriptTurn};
+use verified_wire::transcript::{
+    Compaction, Mail, Part, TaskView, ToolPart, ToolState, TranscriptTurn,
+};
 
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const ERROR: Style = Style::new().fg(Color::Red);
@@ -190,6 +192,26 @@ fn markdown(text: &str) -> Vec<Line<'static>> {
             ..line
         })
         .collect()
+}
+
+/// The latest compaction, where it fell: a marker, then the summary the
+/// model is sent in place of everything above it.
+#[must_use]
+pub fn compaction_lines(compaction: &Compaction) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(
+        format!(
+            "· history compacted: the model now reads this summary ({} bytes)",
+            compaction.bytes
+        ),
+        QUIET.italic(),
+    )];
+    lines.extend(
+        compaction
+            .summary
+            .lines()
+            .map(|line| Line::styled(format!("  {line}"), QUIET)),
+    );
+    lines
 }
 
 /// Mail that landed and no step has carried yet: it waits for the running

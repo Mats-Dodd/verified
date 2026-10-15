@@ -59,6 +59,9 @@ pub enum Observed {
     Acked { first: u64, records: Vec<Rec> },
     /// A tool run is about to start: its `Dispatched` is durable.
     Dispatched(EffectId),
+    /// A summarize call is about to be sent: its `CompactionStarted` is
+    /// durable (T1).
+    Summarizing(EffectId),
     /// A tool run acted on the world: an `Unsafe` run, at most once, before
     /// it returns.
     Mutated(EffectId),
@@ -86,6 +89,7 @@ impl Observed {
             | Self::Refused
             | Self::Acked { .. }
             | Self::Dispatched(_)
+            | Self::Summarizing(_)
             | Self::Mutated(_)
             | Self::Ran { .. }
             | Self::Hung(_)
@@ -403,6 +407,17 @@ fn means(
             running(world, slot, *id)?;
             Ok(Vec::new())
         }
+        Observed::Summarizing(id) => match actor.flights.get(id) {
+            Some(Flight {
+                job: Job::Summarize,
+                ..
+            }) => Ok(Vec::new()),
+            Some(_) | None => Err(format!(
+                "summarize call {id:?} is sent, but the model has no summarize call in flight \
+                 (staged: {:?})",
+                actor.staged
+            )),
+        },
         Observed::Mutated(id) => {
             let tool = running(world, slot, *id)?;
             if tool.class() == Class::Safe {
@@ -526,6 +541,7 @@ fn agrees(before: &World, after: World, slot: Slot, observed: &Observed) -> Resu
             }
         }
         Observed::Dispatched(_)
+        | Observed::Summarizing(_)
         | Observed::Mutated(_)
         | Observed::Ran { .. }
         | Observed::Hung(_) => Ok(after),

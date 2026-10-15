@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use verified_domain::Address;
 use verified_domain::Millis;
 use verified_domain::id::UnixMillis;
-use verified_tui::app::{App, Start};
+use verified_tui::app::{App, COMPACT, Start};
 use verified_tui::seam::{Clock as _, TcpDialer};
 use verified_tui::tea::Seams;
 use verified_tui::terminal::{Keyboard, KeyboardError, TestScreen, scripted};
@@ -219,6 +219,9 @@ impl User {
             }
             self.unstick(&seen).await?;
         }
+        if turn.text == COMPACT {
+            return self.compact(index).await;
+        }
         self.ledger
             .record(Entry::User(format!("send {index}: {}", turn.text)));
         self.press(Keyboard::paste(turn.text.clone())).await?;
@@ -287,6 +290,7 @@ impl User {
                 Some(CancelAt::Streaming) => seen.running_text,
                 Some(CancelAt::ToolRunning) => seen.tool_running,
                 Some(CancelAt::Prompt) => seen.approval.is_some(),
+                Some(CancelAt::Running) => seen.settled,
                 None => false,
             };
             // After a steer, Esc waits for it to be durable: it then
@@ -328,6 +332,25 @@ impl User {
             };
             self.press(Keyboard::key(KeyCode::Char(letter), KeyModifiers::NONE))
                 .await?;
+        }
+    }
+
+    /// Types `/compact` (turn `index` of the plan), and waits for the
+    /// daemon's answer: no message, so nothing more to wait for. `false`
+    /// when the TUI says the session takes no more.
+    async fn compact(&mut self, index: usize) -> Result<bool, ScriptError> {
+        self.ledger.record(Entry::User(format!("compact {index}")));
+        self.press(Keyboard::paste(COMPACT.to_owned())).await?;
+        self.press(Keyboard::enter()).await?;
+        loop {
+            let seen = self.glance().await?;
+            if seen.over {
+                return Ok(false);
+            }
+            if seen.settled && !seen.draft {
+                return Ok(true);
+            }
+            self.unstick(&seen).await?;
         }
     }
 

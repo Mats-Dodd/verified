@@ -92,6 +92,9 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
             Entry::Shell(Observation::Passed(Barrier::Dispatched { actor, id })) => {
                 trace.push((*actor, Observed::Dispatched(*id)));
             }
+            Entry::Shell(Observation::Passed(Barrier::Summarizing { actor, id })) => {
+                trace.push((*actor, Observed::Summarizing(*id)));
+            }
             Entry::Shell(Observation::Passed(Barrier::ToolRan { actor, id, stopped })) => {
                 trace.push((
                     *actor,
@@ -103,7 +106,6 @@ pub fn observed(entries: &[Stamped]) -> Vec<(ActorId, Observed)> {
             }
             Entry::Shell(
                 Observation::Requested { .. }
-                | Observation::Summarizing { .. }
                 | Observation::Passed(
                     Barrier::GroupWritten { .. }
                     | Barrier::Delivering { .. }
@@ -171,6 +173,7 @@ pub fn harness(limits: Limits, trace: &[(ActorId, Observed)]) -> Harness {
         | Observed::Refused
         | Observed::Acked { .. }
         | Observed::Dispatched(_)
+        | Observed::Summarizing(_)
         | Observed::Mutated(_)
         | Observed::Ran { .. }
         | Observed::Hung(_)

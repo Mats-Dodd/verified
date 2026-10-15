@@ -26,11 +26,12 @@ impl Session {
         match self.config.planted {
             Planted::UnknownAsNotStarted => (unknown_as_not_started(records), effects),
             Planted::ConsumeAtInjection => self.consumed_at_injection(records, effects),
-            // The decision's tool runs start at once, before its records
-            // are durable.
+            // The decision's tool runs and summarize calls start at once,
+            // before its records are durable.
             Planted::RunBeforePersist => {
-                for run in effects.extract_if(.., |effect| matches!(effect, Effect::RunTool { .. }))
-                {
+                for run in effects.extract_if(.., |effect| {
+                    matches!(effect, Effect::RunTool { .. } | Effect::Summarize { .. })
+                }) {
                     self.start_effect(run);
                 }
                 (records, effects)
@@ -55,6 +56,8 @@ impl Session {
             | Planted::StopSkipsChildren
             | Planted::SpliceSteering
             | Planted::UntoldTaskEnds
+            | Planted::CutSwallowsMail
+            | Planted::CutMidStep
             | Planted::SkipFsync => (records, effects),
         }
     }

@@ -37,7 +37,10 @@
 //!   stop of it (a `Keyed` rerun reuses its key).
 //! - I10 every envelope an actor holds (a message, a notification) is
 //!   carried by at most one model call, and at quiescence by exactly one,
-//!   unless the actor stopped or reached its turn limit (T4).
+//!   unless the actor stopped, reached its turn limit, or is parked: its
+//!   last turn ended at a full context, or by Esc during a compaction (T4).
+//!   No envelope is ever inside a cut: a compaction leaves the mail as it
+//!   was, and I14 still finds each one told where a step carries it.
 //! - I11 at quiescence every task ended (T3); each end is its one
 //!   notification (T4).
 //! - I12 at quiescence every actor a stopped actor spawned is stopped
@@ -294,9 +297,49 @@ fn quiescent(actor: ActorId, log: &[Record<Parsed>], when: &str, found: &mut Vec
     }
 }
 
+/// Whether `log`'s actor is parked: its last turn ended at a full context
+/// (a summary did not make room), or by Esc during a compaction. Its mail
+/// waits for the next message or `/compact`.
+fn parked(log: &[Record<Parsed>]) -> bool {
+    let mut compacting = false;
+    let mut parked = false;
+    for record in log {
+        match record {
+            Record::CompactionStarted { .. } => compacting = true,
+            Record::Compacted { .. } | Record::TurnStarted { .. } => {
+                compacting = false;
+                parked = false;
+            }
+            Record::TurnEnded { outcome, .. } => {
+                parked = match outcome {
+                    TurnOutcome::Failed(Failure::Limit(Limit::Context)) => true,
+                    TurnOutcome::Cancelled => compacting,
+                    TurnOutcome::Completed | TurnOutcome::Failed(_) => false,
+                };
+                compacting = false;
+            }
+            Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::EpochBumped { .. } => {}
+        }
+    }
+    parked
+}
+
 /// I10 over the log of `actor`: each envelope it holds carried at most
-/// once, and (`settled`) exactly once unless it stopped or reached its
-/// turn limit.
+/// once, and (`settled`) exactly once unless it stopped, reached its turn
+/// limit, or is parked.
 fn carried(
     actor: ActorId,
     log: &[Record<Parsed>],
@@ -339,16 +382,7 @@ fn carried(
         .iter()
         .filter(|record| matches!(record, Record::TurnStarted { .. }))
         .count();
-    let context = log.iter().any(|record| {
-        matches!(
-            record,
-            Record::TurnEnded {
-                outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)),
-                ..
-            }
-        )
-    });
-    let exempt = stopped(log) || started >= turns || context;
+    let exempt = stopped(log) || started >= turns || parked(log);
     for id in held {
         match steps.get(&id).copied().unwrap_or(0) {
             0 if settled && !exempt => found.push(violation(
@@ -655,7 +689,9 @@ pub fn world(entries: &[Stamped], scenario: &Scenario) -> Vec<Violation> {
                 refusals.push((*actor, stamped.at));
             }
             Entry::Shell(Observation::Passed(
-                Barrier::Dispatched { actor, .. } | Barrier::Delivering { actor, .. },
+                Barrier::Dispatched { actor, .. }
+                | Barrier::Delivering { actor, .. }
+                | Barrier::Summarizing { actor, .. },
             )) if halted.contains_key(actor) => found.push(violation(
                 "I16",
                 format!(
