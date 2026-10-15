@@ -1789,10 +1789,14 @@ pub struct Core<P: Payload> {
     /// yet, its call live or not (`CoreView::compacting`).
     compacting: Option<u64>,
     /// The last turn ended at a full context, or while it compacted (Esc,
-    /// a failed summary): no turn starts until new mail lands or a
-    /// `/compact` writes its summary. Read from the log, so a crash keeps
-    /// it.
+    /// a failed summary): no turn starts until the user's next message
+    /// lands or a `/compact` writes its summary; other mail waits. Read
+    /// from the log, so a crash keeps it.
     parked: bool,
+    /// The running turn compacted at this beat: its next step starts or
+    /// the turn fails, with no second compaction. Read from the log, so a
+    /// crash that tears the `Compacted` from what follows it keeps it.
+    compacted: bool,
     /// The children in `children` whose `spawn` was refused: never born,
     /// so not open work.
     unborn: Vec<ActorId>,
@@ -2476,6 +2480,7 @@ impl<P: Payload> Core<P> {
             children: Vec::new(),
             compacting: None,
             parked: false,
+            compacted: false,
             unborn: Vec::new(),
         };
         assert(core@.calls =~= initial().calls);
@@ -2620,6 +2625,7 @@ impl<P: Payload> Core<P> {
             children: copy_of(self.children.as_slice()),
             compacting: self.compacting,
             parked: self.parked,
+            compacted: self.compacted,
             unborn: copy_of(self.unborn.as_slice()),
         };
         proof {
@@ -3099,7 +3105,9 @@ impl<P: Payload> Core<P> {
                 self.mailbox.push(
                     Waiting { id: envelope.id, user: matches!(envelope.from, Address::User), bytes: text.bytes },
                 );
-                self.parked = false;
+                if matches!(envelope.from, Address::User) {
+                    self.parked = false;
+                }
             },
             Body::Stop => {
                 self.stopped = true;
@@ -3226,6 +3234,7 @@ impl<P: Payload> Core<P> {
         );
         self.context = self.context.grow(bytes, self.limits.context_bytes());
         self.step_base = self.context;
+        self.compacted = false;
         self.seq = next;
         Ok(())
     }
@@ -3388,7 +3397,6 @@ impl<P: Payload> Core<P> {
             None => 0,
         };
         self.mailbox.push(Waiting { id: EnvelopeId::Task(task), user: false, bytes });
-        self.parked = false;
         self.seq = next;
         assert(self@.tasks =~= end_task(view.tasks, task.0));
         Ok(())
@@ -3514,6 +3522,7 @@ impl<P: Payload> Core<P> {
                     outcome,
                     TurnOutcome::Failed(Failure::Limit(Limit::Context)),
                 );
+                self.compacted = false;
                 self.turn = Turn::Idle;
                 self.seq = next;
                 Ok(())
@@ -3584,6 +3593,7 @@ impl<P: Payload> Core<P> {
                     lemma_actor_keeps(self@, Record::<P>::Compacted { started, summary: *summary, open: *open });
                 };
                 self.turn = Turn::Open(Open { stage: then.stage(), ..running });
+                self.compacted = true;
             },
         }
         let entries = open.tasks.len().saturating_add(open.children.len());
@@ -3757,9 +3767,9 @@ impl<P: Payload> Core<P> {
     /// of the mailbox (nothing, for a retry), unless a bound says the turn
     /// is over. The index is widened, so the step after the last `u32` is
     /// past the bound too. When the step would not fit the context, a beat
-    /// (`may_compact`: not a retry, and not right after a compaction)
+    /// (not a retry, and not one that compacted already: `Core::compacted`)
     /// compacts the history instead; the step starts once it is written.
-    fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64, may_compact: bool)
+    fn start_step(&self, plan: &mut Plan<P>, turn: TurnId, index: u64)
         requires
             old(plan).inv(),
             may_start(old(plan).scratch@, turn, index as int),
@@ -3789,7 +3799,7 @@ impl<P: Payload> Core<P> {
         if index >= u64::from(self.limits.steps_per_turn()) {
             plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Steps)) });
         } else if matches!(plan.scratch.context.grow(bytes, self.limits.context_bytes()), Context::Exceeded) {
-            if may_compact && matches!(open.stage, Stage::Starting | Stage::Tools) {
+            if !plan.scratch.compacted && matches!(open.stage, Stage::Starting | Stage::Tools) {
                 plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
             } else {
                 plan.emit(Record::TurnEnded { turn, outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)) });
@@ -3838,7 +3848,7 @@ impl<P: Payload> Core<P> {
         let turn = TurnId(plan.scratch.seq);
         plan.emit(Record::TurnStarted { turn });
         assert(resolved(plan.scratch@.calls, 0, plan.scratch@.calls.len() as int));
-        self.start_step(plan, turn, 0, true);
+        self.start_step(plan, turn, 0);
     }
 
     /// Compaction at the end of a turn, for `begin`: when this decision
@@ -3995,7 +4005,7 @@ impl<P: Payload> Core<P> {
                     } else if count == open.first_call {
                         plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Completed });
                     } else {
-                        self.start_step(plan, open.turn, u64::from(open.step.index) + 1, true);
+                        self.start_step(plan, open.turn, u64::from(open.step.index) + 1);
                     }
                 },
             }
@@ -4337,11 +4347,12 @@ impl<P: Payload> Core<P> {
     }
 
     /// A summarize call ended. In a turn, its summary is recorded and the
-    /// step it made room for starts (or the turn fails at the full context);
-    /// a failed one fails the turn so, and one under a cancel ends it
-    /// `Cancelled`; either way the actor parks (`Core::parked`). Between turns, a summary is recorded and unparks the
-    /// actor, and a failure changes nothing. A compaction a turn
-    /// superseded, or one before a crash, is stale.
+    /// step it made room for starts. A summary that still leaves the step
+    /// too big, or a failed one, fails the turn at the full context, and
+    /// one under a cancel ends it `Cancelled`: in each of those three cases
+    /// the actor parks (`Core::parked`). Between turns, a summary is
+    /// recorded and unparks the actor, and a failure changes nothing. A
+    /// compaction a turn superseded, or one before a crash, is stale.
     fn on_summarized(&self, id: EffectId, result: Summary<P>) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -4378,7 +4389,7 @@ impl<P: Payload> Core<P> {
                                 Then::Starting => 0,
                                 Then::Tools => u64::from(open.step.index) + 1,
                             };
-                            self.start_step(&mut plan, open.turn, index, false);
+                            self.start_step(&mut plan, open.turn, index);
                         },
                         Summary::Failed(_) => {
                             plan.emit(
@@ -4843,7 +4854,7 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         if matches!(open.intent, Intent::Proceed) && !plan.scratch.stopped {
-            self.start_step(&mut plan, open.turn, u64::from(open.step.index), true);
+            self.start_step(&mut plan, open.turn, u64::from(open.step.index));
         } else if matches!(open.intent, Intent::Cancel) {
             plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
         }
@@ -4932,11 +4943,11 @@ impl<P: Payload> Core<P> {
                     plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
                 },
                 (Stage::Starting, Intent::Proceed) => {
-                    self.start_step(plan, open.turn, 0, true);
+                    self.start_step(plan, open.turn, 0);
                 },
                 (Stage::Model { .. }, Intent::Proceed) => {
                     plan.emit(Record::StepReset { step: open.step, reason: Reset::Restart });
-                    self.start_step(plan, open.turn, u64::from(open.step.index), true);
+                    self.start_step(plan, open.turn, u64::from(open.step.index));
                 },
                 (Stage::Backoff { since, reset }, Intent::Proceed) => {
                     let id = plan.id(since);
@@ -5168,6 +5179,7 @@ impl<P: Payload> fmt::Debug for Core<P> {
             .field("children", &self.children)
             .field("compacting", &self.compacting)
             .field("parked", &self.parked)
+            .field("compacted", &self.compacted)
             .field("unborn", &self.unborn)
             .finish_non_exhaustive()
     }
@@ -5194,6 +5206,7 @@ impl<P: Payload> PartialEq for Core<P> {
             && self.children == other.children
             && self.compacting == other.compacting
             && self.parked == other.parked
+            && self.compacted == other.compacted
             && self.unborn == other.unborn
     }
 }

@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use verified_core::rules::rule_fits;
 use verified_domain::{
-    Abstract, ActorName, Body, CallId, CallIx, Class, EnvelopeId, Exit, Failure, Grant, Limit,
-    Limits, Payload as _, Proposal, Record, Request, Rules, TaskId, TurnId, TurnOutcome, Unstarted,
-    named,
+    Abstract, ActorName, Address, Body, CallId, CallIx, Class, EnvelopeId, Exit, Failure, Grant,
+    Limit, Limits, Payload as _, Proposal, Record, Request, Rules, TaskId, TurnId, TurnOutcome,
+    Unstarted, named,
 };
 
 /// Facts read back from the log.
@@ -35,8 +35,9 @@ pub(crate) struct Audit {
     pub(crate) stopped: bool,
     pub(crate) turns: usize,
     /// The last turn parked the actor: it ended at the context bound (no
-    /// summary made room), or was cancelled while compacting. Its mail
-    /// waits for new input (PRINCIPLES, not promised).
+    /// summary made room), or was cancelled while compacting, and neither
+    /// the user's message nor a summary between turns has landed since.
+    /// Its mail waits (PRINCIPLES, not promised).
     pub(crate) parked: bool,
     /// Children dispatched `spawn`s named.
     pub(crate) children: usize,
@@ -160,6 +161,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 match envelope.body {
                     Body::Text(_) => {
                         audit.mail.push(envelope.id);
+                        audit.parked &= envelope.from != Address::User;
                         messages = messages.saturating_add(1);
                         if messages > limits.messages_per_actor() {
                             audit.breaches.insert(Breach::OverLimit);
@@ -301,6 +303,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
                 between = !in_turn;
             }
             Record::Compacted { .. } => {
+                audit.parked &= in_turn;
                 compacting = false;
                 compacted = in_turn;
                 audit.compactions.landed |= !in_turn;

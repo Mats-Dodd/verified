@@ -1272,11 +1272,54 @@ fn a_summary_without_room_fails_the_turn() {
     );
 }
 
+/// A crash that tears a summary without room from the turn's end it
+/// decided (`Compacted` durable, `TurnEnded` lost) parks the actor as the
+/// run without the crash does: its beat compacted already, so recovery
+/// fails the turn at the context bound with no second summarize call. At
+/// the first step and after tools alike.
+#[test]
+fn a_torn_summary_without_room_parks_without_compacting_again() {
+    for tools in [false, true] {
+        let mut driver = Driver::new(small_limits());
+        let id = if tools {
+            let call = driver.start();
+            driver.send(Event::ModelParts {
+                id: call,
+                parts: payload(990),
+            });
+            let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+            let read = single_run(&effects, "read");
+            let (_, effects) = driver.tool_done(read, Exit::Ok);
+            summarize_of(&effects)
+        } else {
+            forced_at_the_first_step(&mut driver)
+        };
+        let turn = last_turn(&driver);
+        driver.send(Event::Summarized {
+            id,
+            summary: Summary::Written(payload(1001)),
+        });
+        let failed = Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Failed(Failure::Limit(Limit::Context)),
+        };
+        assert_eq!(driver.log.last(), Some(&failed), "tools {tools}: no room");
+        driver.log.pop();
+        assert!(
+            matches!(driver.log.last(), Some(Record::Compacted { .. })),
+            "tools {tools}: torn after the summary"
+        );
+        let effects = driver.crash();
+        assert!(effects.is_empty(), "tools {tools}: no call: {effects:?}");
+        assert_eq!(driver.log.last(), Some(&failed), "tools {tools}: parked");
+    }
+}
+
 /// A failed summarize call parks the actor: the turn fails at the context
 /// bound, its message waits, and no turn starts in that decision (no retry
-/// loop). The next message retries.
+/// loop). Another actor's message waits too; the user's next one retries.
 #[test]
-fn a_failed_compaction_parks_the_actor_until_new_mail() {
+fn a_failed_compaction_parks_the_actor_until_the_users_next_message() {
     let mut driver = Driver::new(small_limits());
     let id = forced_at_the_first_step(&mut driver);
     let turn = last_turn(&driver);
@@ -1295,9 +1338,25 @@ fn a_failed_compaction_parks_the_actor_until_new_mail() {
         "parked"
     );
     assert_eq!(driver.core.unread(), 1, "its message waits");
+    let peer = ActorId::from_parts(at(1), &[5; 10]);
+    let (_, effects) = driver.send(Event::Deliver {
+        envelope: Envelope {
+            id: EnvelopeId::Minted {
+                actor: peer,
+                seq: 7,
+            },
+            from: Address::Actor(peer),
+            ..envelope(0, 10)
+        },
+    });
+    assert!(
+        effects.is_empty(),
+        "another actor's message waits: {effects:?}"
+    );
+    assert_eq!(driver.core.unread(), 2, "both wait");
     let (_, effects) = driver.send(deliver(3, 10));
     let again = summarize_of(&effects);
-    assert!(again.seq > id.seq, "a new message retries: a new cut");
+    assert!(again.seq > id.seq, "the user's message retries: a new cut");
 }
 
 /// `/compact` unparks a parked actor: its summary makes room, and the

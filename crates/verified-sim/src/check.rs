@@ -38,7 +38,8 @@
 //! - I10 every envelope an actor holds (a message, a notification) is
 //!   carried by at most one model call, and at quiescence by exactly one,
 //!   unless the actor stopped, reached its turn limit, or is parked: its
-//!   last turn ended at a full context, or by Esc during a compaction (T4).
+//!   last turn ended at a full context, or by Esc during a compaction, and
+//!   no message of the user's or summary has landed since (T4).
 //!   No envelope is ever inside a cut: a compaction leaves the mail as it
 //!   was, and I14 still finds each one told where a step carries it.
 //! - I11 at quiescence every task ended (T3); each end is its one
@@ -301,14 +302,18 @@ fn quiescent(actor: ActorId, log: &[Record<Parsed>], when: &str, found: &mut Vec
 }
 
 /// Whether `log`'s actor is parked: its last turn ended at a full context
-/// (a summary did not make room), or by Esc during a compaction. Its mail
-/// waits for the next message or `/compact`.
+/// (a summary did not make room), or by Esc during a compaction, and
+/// neither the user's message nor a summary has landed since. Its mail
+/// waits for the user's next message or `/compact`.
 fn parked(log: &[Record<Parsed>]) -> bool {
     let mut compacting = false;
     let mut parked = false;
     for record in log {
         match record {
             Record::CompactionStarted { .. } => compacting = true,
+            Record::Delivered { envelope } => {
+                parked &= envelope.from != Address::User || matches!(envelope.body, Body::Stop);
+            }
             Record::Compacted { .. } | Record::TurnStarted { .. } => {
                 compacting = false;
                 parked = false;
@@ -323,7 +328,6 @@ fn parked(log: &[Record<Parsed>]) -> bool {
             }
             Record::Born { .. }
             | Record::RulesLoaded { .. }
-            | Record::Delivered { .. }
             | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
@@ -825,45 +829,18 @@ fn told(
         ));
         return;
     };
+    let mail = mail(log);
     for id in carries {
-        let text = match id {
-            EnvelopeId::Task(task) => Some(format!("task {} ended", task.0)),
-            EnvelopeId::User(_) | EnvelopeId::Minted { .. } => {
-                log.iter().find_map(|record| match record {
-                    Record::Delivered { envelope } if envelope.id == *id => match &envelope.body {
-                        Body::Text(text) => Some(text.body.clone()),
-                        Body::Stop => None,
-                    },
-                    Record::Delivered { .. }
-                    | Record::Born { .. }
-                    | Record::RulesLoaded { .. }
-                    | Record::TurnStarted { .. }
-                    | Record::StepStarted { .. }
-                    | Record::ModelOutput { .. }
-                    | Record::StepReset { .. }
-                    | Record::StepFinished { .. }
-                    | Record::Approved { .. }
-                    | Record::Dispatched { .. }
-                    | Record::ToolResult { .. }
-                    | Record::TaskEnded { .. }
-                    | Record::StopSent { .. }
-                    | Record::CancelRequested { .. }
-                    | Record::TurnEnded { .. }
-                    | Record::EpochBumped { .. }
-                    | Record::CompactionStarted { .. }
-                    | Record::Compacted { .. } => None,
-                })
-            }
-        };
-        let seen = text
-            .as_deref()
-            .is_some_and(|text| said.iter().any(|block| block.contains(text)));
-        if !seen {
+        let told = mail
+            .iter()
+            .find(|(mailed, _)| mailed == id)
+            .map(|(_, told)| told);
+        if !told.is_some_and(|told| said.iter().any(|block| told.is(block))) {
             found.push(violation(
                 "I14",
                 format!(
                     "model call {seq} of {actor} carried envelope {id:?}, which its request \
-                     never told ({text:?} not in {said:?})"
+                     never told ({told:?} not in {said:?})"
                 ),
             ));
         }
@@ -885,22 +862,51 @@ fn kept_out(
     let before = log
         .get(..usize::try_from(cut).unwrap_or(usize::MAX))
         .unwrap_or(log);
-    let mut carried = BTreeSet::new();
-    let mut mail = Vec::new();
-    for record in before {
-        match record {
-            Record::Delivered { envelope } => {
-                if let Body::Text(text) = &envelope.body {
-                    mail.push((envelope.id, Told::Text(text.body.clone())));
-                }
+    let carried: BTreeSet<EnvelopeId> = before
+        .iter()
+        .filter_map(|record| {
+            if let Record::StepStarted { carries, .. } = record {
+                Some(carries)
+            } else {
+                None
             }
-            Record::TaskEnded { task, .. } => {
-                mail.push((EnvelopeId::Task(*task), Told::Task(task.0)));
-            }
-            Record::StepStarted { carries, .. } => carried.extend(carries.iter().copied()),
+        })
+        .flatten()
+        .copied()
+        .collect();
+    let mail = mail(before);
+    for (id, told) in mail.iter().filter(|(id, _)| !carried.contains(id)) {
+        let times = said.iter().filter(|block| told.is(block)).count();
+        let shared = mail
+            .iter()
+            .filter(|(other, same)| carried.contains(other) && same == told)
+            .count();
+        if times > shared {
+            found.push(violation(
+                "I14",
+                format!(
+                    "summarize call {cut} of {actor} was told envelope {id:?}, unread at its \
+                     cut ({told:?} in {said:?})"
+                ),
+            ));
+        }
+    }
+}
+
+/// The mail in `log`, in arrival order: each text delivered and each
+/// task's end, with how a request tells it.
+fn mail(log: &[Record<Parsed>]) -> Vec<(EnvelopeId, Told)> {
+    log.iter()
+        .filter_map(|record| match record {
+            Record::Delivered { envelope } => match &envelope.body {
+                Body::Text(text) => Some((envelope.id, Told::Text(text.body.clone()))),
+                Body::Stop => None,
+            },
+            Record::TaskEnded { task, .. } => Some((EnvelopeId::Task(*task), Told::Task(task.0))),
             Record::Born { .. }
             | Record::RulesLoaded { .. }
             | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
             | Record::ModelOutput { .. }
             | Record::StepReset { .. }
             | Record::StepFinished { .. }
@@ -912,29 +918,14 @@ fn kept_out(
             | Record::TurnEnded { .. }
             | Record::EpochBumped { .. }
             | Record::CompactionStarted { .. }
-            | Record::Compacted { .. } => {}
-        }
-    }
-    for (id, told) in mail.iter().filter(|(id, _)| !carried.contains(id)) {
-        let times = said.iter().filter(|block| told.is(block)).count();
-        let shared = mail
-            .iter()
-            .filter(|(other, same)| carried.contains(other) && same == told)
-            .count();
-        if times > shared {
-            found.push(violation(
-                "I14",
-                format!(
-                    "summarize call {cut} of {actor} was told envelope {id:?}, unread at its cut                      ({told:?} in {said:?})"
-                ),
-            ));
-        }
-    }
+            | Record::Compacted { .. } => None,
+        })
+        .collect()
 }
 
-/// How a summarize call's request would tell an envelope: a message by
-/// its text, alone (the user's) or after its sender (`[from …] text`), and
-/// a task's end as its notification (`[v] task N ended: …`).
+/// How a request tells an envelope: a message by its text, alone (the
+/// user's) or after its sender (`[from …] text`), and a task's end as its
+/// notification (`[v] task N ended: …`).
 #[derive(Debug, PartialEq, Eq)]
 enum Told {
     Text(String),

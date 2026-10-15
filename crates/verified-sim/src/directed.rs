@@ -303,7 +303,8 @@ pub fn all() -> Vec<Directed> {
             },
         },
         // Esc while the summary is written: the turn ends, and the
-        // actor waits, its message unread, for the next.
+        // actor parks, its message unread, until the user's next one,
+        // which compacts again and carries both.
         Directed {
             name: "esc_during_a_compaction",
             target: Key::Compaction {
@@ -319,6 +320,7 @@ pub fn all() -> Vec<Directed> {
                         cancel: Some(CancelAt::Running),
                         ..TurnPlan::granted(&long(200))
                     },
+                    TurnPlan::granted("hello 2"),
                 ])
             },
         },
