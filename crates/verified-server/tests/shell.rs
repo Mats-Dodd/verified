@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use verified_domain::id::{ActorId, CallId, IdEntropy, MessageId, TurnId, UnixMillis};
 use verified_domain::{
-    Exit, Grant, INSTRUCTION, Limits, LimitsConfig, Millis, ModelFault, Record, TurnOutcome,
+    Exit, Failure, Grant, INSTRUCTION, Limit, Limits, LimitsConfig, Millis, ModelFault, Record,
+    TurnOutcome,
 };
 use verified_server::daemon::{self, DaemonError, Registry};
 use verified_server::env::{
@@ -674,9 +675,7 @@ async fn overloaded_retries_then_fails() {
         log.iter().any(|record| matches!(
             record,
             Record::TurnEnded {
-                outcome: TurnOutcome::Failed(verified_domain::Failure::Model(
-                    ModelFault::Overloaded
-                )),
+                outcome: TurnOutcome::Failed(Failure::Model(ModelFault::Overloaded)),
                 ..
             }
         )),
@@ -2790,12 +2789,7 @@ impl Model for StalledSummaries {
         parts: mpsc::Sender<ModelPart>,
         cancel: &CancellationToken,
     ) -> Result<(), ModelError> {
-        let summarizing = request
-            .messages
-            .last()
-            .and_then(|message| message.content.last())
-            .is_some_and(|block| matches!(block, Content::Text { text } if text == INSTRUCTION));
-        if summarizing {
+        if is_summarize(request) {
             cancel.cancelled().await;
             return Err(ModelError::Interrupted);
         }
@@ -3042,6 +3036,138 @@ async fn compact_between_turns_and_never_during_one() {
         reply_text(&transcript, 1),
         ".".repeat(40),
         "the next turn runs after the summary"
+    );
+    daemon.tasks.shutdown().cancel();
+}
+
+/// Whether `request` is a summarize call's: the instruction ends it.
+fn is_summarize(request: &ModelRequest) -> bool {
+    request
+        .messages
+        .last()
+        .and_then(|message| message.content.last())
+        .is_some_and(|block| matches!(block, Content::Text { text } if text == INSTRUCTION))
+}
+
+/// The scripted model, except that a summarize call is answered with
+/// `text`; every request's `max_tokens` is noted, and whether it was a
+/// summarize call's.
+#[derive(Debug)]
+struct Summaries {
+    model: Arc<dyn Model>,
+    text: String,
+    budgets: Arc<std::sync::Mutex<Vec<(bool, u32)>>>,
+}
+
+#[async_trait]
+impl Model for Summaries {
+    async fn stream(
+        &self,
+        request: &ModelRequest,
+        parts: mpsc::Sender<ModelPart>,
+        cancel: &CancellationToken,
+    ) -> Result<(), ModelError> {
+        let summarizing = is_summarize(request);
+        self.budgets
+            .lock()
+            .expect("unpoisoned")
+            .push((summarizing, request.max_tokens));
+        if !summarizing {
+            return self.model.stream(request, parts, cancel).await;
+        }
+        for part in [
+            ModelPart::TextStart { block: 0 },
+            ModelPart::TextDelta {
+                block: 0,
+                delta: self.text.clone(),
+            },
+            ModelPart::TextEnd { block: 0 },
+        ] {
+            if parts.send(part).await.is_err() {
+                return Err(ModelError::Interrupted);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A daemon whose summarize calls answer `text`, and the budgets its
+/// requests were sent.
+async fn summarizing(
+    text: &str,
+    limits: ServerLimits,
+) -> (Daemon, Arc<std::sync::Mutex<Vec<(bool, u32)>>>) {
+    let budgets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let noted = Arc::clone(&budgets);
+    let text = text.to_owned();
+    let store = Arc::new(MemLogStore::new(
+        MemDisk::new(),
+        limits.log_line_bytes,
+        limits.log_file_bytes,
+    ));
+    let daemon = boot_model(
+        store,
+        Arc::new(MemEnv::default()),
+        limits,
+        Planted::None,
+        move |model| {
+            Arc::new(Summaries {
+                model,
+                text,
+                budgets: noted,
+            })
+        },
+    )
+    .await;
+    (daemon, budgets)
+}
+
+/// A summary past `summary_bytes`, or a blank one, fails the summarize
+/// call: the forced compaction fails, the turn ends at the full context,
+/// and nothing is recorded as a summary.
+#[tokio::test]
+async fn a_summary_too_large_or_blank_fails_the_compaction() {
+    let mut limits = small_context();
+    limits.summary_bytes = 100;
+    for text in ["y".repeat(101), "  \n ".to_owned()] {
+        let (daemon, _) = summarizing(&text, limits.clone()).await;
+        let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+        let turn = overflow(&handle).await;
+        let log = until_log(&handle, |log| turn_outcome(log, turn).is_some()).await;
+        assert_eq!(
+            turn_outcome(&log, turn),
+            Some(TurnOutcome::Failed(Failure::Limit(Limit::Context))),
+            "{} bytes: the actor parks",
+            text.len()
+        );
+        assert!(summaries(&log).is_empty(), "no summary is recorded");
+        daemon.tasks.shutdown().cancel();
+    }
+}
+
+/// One budget: a summarize call asks for as many tokens as a step.
+#[tokio::test]
+async fn a_summarize_call_has_a_steps_budget() {
+    let (daemon, budgets) = summarizing("all of it", small_context()).await;
+    let (_, handle) = daemon.registry.create(session_id()).await.expect("created");
+    let turn = overflow(&handle).await;
+    until_log(&handle, |log| turn_outcome(log, turn).is_some()).await;
+    let budgets = budgets.lock().expect("unpoisoned").clone();
+    let steps: Vec<u32> = budgets
+        .iter()
+        .filter_map(|(summarizing, tokens)| (!summarizing).then_some(*tokens))
+        .collect();
+    let summaries: Vec<u32> = budgets
+        .iter()
+        .filter_map(|(summarizing, tokens)| summarizing.then_some(*tokens))
+        .collect();
+    assert!(!steps.is_empty() && !summaries.is_empty(), "{budgets:?}");
+    assert!(
+        summaries
+            .iter()
+            .chain(&steps)
+            .all(|tokens| *tokens == small_context().model_max_tokens),
+        "{budgets:?}"
     );
     daemon.tasks.shutdown().cancel();
 }

@@ -1768,7 +1768,7 @@ impl SummaryTask {
             (Err(TooLarge), _) => Summary::Failed(ModelFault::TooLarge),
             (Ok(_), Err(error)) => Summary::Failed(error.core_fault()),
             (Ok(text), Ok(())) if text.trim().is_empty() => Summary::Failed(ModelFault::Other),
-            (Ok(text), Ok(())) => Summary::Written(measure(text)),
+            (Ok(text), Ok(())) => Summary::Written(history::summary(text)),
         };
         report(
             &self.inbox,

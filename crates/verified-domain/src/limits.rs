@@ -68,8 +68,10 @@ impl Limits {
         self.tasks_per_actor
     }
 
-    /// Children one actor ever spawns; a `spawn` past it does not start.
-    /// It bounds what a `Compacted` lists as open.
+    /// Children one actor ever spawns; a `spawn` past it resolves
+    /// `NotStarted(Limit)`, as a background call past `tasks_per_actor`
+    /// does. It bounds the core's list of children, and so what a
+    /// `Compacted` lists as open.
     #[must_use]
     pub const fn children_per_actor(&self) -> usize {
         self.children_per_actor
@@ -101,9 +103,10 @@ impl Limits {
         self.calls_per_turn
     }
 
-    /// Conversation size the model is sent; a step that would exceed it
+    /// Conversation size a step is sent; a step that would exceed it
     /// compacts the history first, and fails before the call if no summary
-    /// makes room.
+    /// makes room. A step's own output and its tools' may carry the
+    /// conversation past it; the next beat then compacts.
     #[must_use]
     pub const fn context_bytes(&self) -> u64 {
         self.context_bytes

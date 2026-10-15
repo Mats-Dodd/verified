@@ -264,8 +264,9 @@ across them. *Leaning,* all of it.
   daemon, but the fake never lets an orphaned run act after a crash.
 - **The fake model never loops.** No seed reaches the steps, calls or
   turns limit, so a wrong wiring of those would go unnoticed. One directed
-  scenario covers the step bound. Seeds with a small context do reach the
-  context limit and compact.
+  scenario covers the step bound. Seeds with a small context compact, but
+  none fails a summarize call or parks an actor: directed scenarios cover
+  a failed forced compaction and a parked actor.
 
 - **No fake fills a disk.** Full-disk fail-stop is tested with a log that
   refuses the way the file log does; the file log cutting a partial write

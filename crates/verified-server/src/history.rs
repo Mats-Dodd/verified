@@ -23,11 +23,11 @@ use std::collections::BTreeMap;
 
 use verified_domain::id::{CallId, ToolName};
 use verified_domain::{
-    Address, Body, EnvelopeId, Exit, INSTRUCTION, OpenWork, Record, Request, Unstarted,
+    Address, Body, EnvelopeId, Exit, INSTRUCTION, Measured, OpenWork, Record, Request, Unstarted,
 };
 
 use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
-use crate::payload::{ModelPart, Parsed, ToolInput};
+use crate::payload::{ModelPart, Parsed, ToolInput, measure};
 
 /// One tool call of the current turn, as the history sees it.
 struct Call {
@@ -88,6 +88,14 @@ struct Builder {
 /// What opens the summary at a cut: the model reads what follows as its
 /// own summary of everything before it.
 pub const SUMMARY_HEADER: &str = "Summary of the conversation before this point:\n\n";
+
+/// A summarize call's text, measured as the conversation renders it: its
+/// header included, so the core's reset counts what the model is sent.
+#[must_use]
+pub fn summary(text: String) -> Measured<String> {
+    let bytes = measure(format!("{SUMMARY_HEADER}{text}")).bytes;
+    Measured { body: text, bytes }
+}
 
 /// What opens each line of open work beside a summary.
 pub const OPEN_HEADER: &str = "[v] open: ";
@@ -388,7 +396,8 @@ pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> Mod
     build(records, system, max_tokens, Defect::None).0
 }
 
-/// The request for a summarize call, its `CompactionStarted` the last record.
+/// The request for a summarize call, made once its `CompactionStarted` is
+/// durable.
 ///
 /// The conversation so far, from the latest summary, then [`INSTRUCTION`].
 /// Mail not yet carried is not in it (T4: a cut never holds unread mail).
@@ -603,7 +612,19 @@ mod tests {
     use verified_domain::id::{ActorId, TaskId, UnixMillis};
     use verified_domain::{OPEN_ENTRY_BYTES, OpenWork};
 
-    use super::open_lines;
+    use super::{SUMMARY_HEADER, open_lines, summary};
+    use crate::payload::measure;
+
+    #[test]
+    fn a_summary_counts_its_header() {
+        let written = summary("done".to_owned());
+        assert_eq!(written.body, "done", "the model's text is kept");
+        assert_eq!(
+            written.bytes,
+            measure(format!("{SUMMARY_HEADER}done")).bytes,
+            "measured as rendered"
+        );
+    }
 
     #[test]
     fn every_open_line_fits_its_entry() {

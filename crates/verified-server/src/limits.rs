@@ -26,7 +26,11 @@ pub struct ServerLimits {
     /// Most streamed parts one model call may produce before it is failed.
     pub model_parts_per_call: usize,
     /// `max_tokens` sent with every model request, a summarize call's
-    /// included: if a step would fit, so does its summary (one budget).
+    /// included (one budget): a summarize call never asks for more output
+    /// than the step it stands in for. It is sent the conversation the step
+    /// would have been, less the unread mail, plus `INSTRUCTION`; past
+    /// `context_bytes` by what the last step's output and its tools' added,
+    /// when those overran it.
     pub model_max_tokens: u32,
     /// Largest summary a summarize call may write; past it the call fails
     /// (`ModelFault::TooLarge`). [`ServerLimits::check`] makes sure its

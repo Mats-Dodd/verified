@@ -2,11 +2,12 @@
 //! addressed by its id.
 //!
 //! - `POST /actors`, `/actors/{id}/messages`, `/approvals`, `/cancel`,
-//!   `/compact`, `/stop`:
-//!   commands with client-minted ids; a repeat answers `exists`
+//!   `/stop`: commands with client-minted ids; a repeat answers `exists`
 //!   (`TigerBeetle`), a conflicting repeat is a 409 rejection. A message is
 //!   answered once it is durably in the actor's mailbox; to a busy actor it
 //!   steers the running turn.
+//! - `POST /actors/{id}/compact`: compacts the actor's history between
+//!   turns. It carries no id: a repeat compacts again.
 //! - `GET /actors`: every born actor, with who waits for the user and how
 //!   many tasks run, from each actor's live session.
 //! - `GET /actors/{id}/stream?offset=…`: SSE from the offset, then every

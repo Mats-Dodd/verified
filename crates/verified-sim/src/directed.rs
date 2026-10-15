@@ -255,6 +255,24 @@ pub fn all() -> Vec<Directed> {
             },
             scenario: compacted_after_tools(),
         },
+        // A summary past `summary_bytes` (the fake's digest is longer
+        // than 10 bytes): the summarize call fails `TooLarge`, the turn
+        // fails at the full context and the actor parks, its message
+        // unread. No seed's summary is too large.
+        Directed {
+            name: "a_forced_compaction_that_fails",
+            target: Key::Compaction {
+                forced: true,
+                ended: Compaction::Failed,
+            },
+            scenario: Scenario {
+                limits: ServerLimits {
+                    summary_bytes: 10,
+                    ..small_context(CONTEXT)
+                },
+                ..compacted_at_the_first_step()
+            },
+        },
         // Each greeting leaves the context past 80%: a compaction after
         // each turn, the second summarizing the first.
         Directed {

@@ -301,8 +301,11 @@ pub struct CoreView {
     pub tasks: Seq<Task>,
     /// Every actor a dispatched `spawn` names: the stop cascade's targets.
     pub children: Seq<ActorId>,
-    /// The seq of the `CompactionStarted` of a compaction between turns,
-    /// until its `Compacted` or a turn supersedes it.
+    /// The seq of the latest `CompactionStarted` between turns, until its
+    /// `Compacted` or a turn supersedes it. Its summarize call may be in
+    /// flight, failed (a failure records nothing) or cut short by a crash:
+    /// the log cannot tell, so `resume` compacts again, and a stop or a
+    /// turn cancels it.
     pub compacting: Option<u64>,
 }
 
@@ -1602,7 +1605,8 @@ impl Context {
     }
 
     /// A conversation that starts over from a summary of `summary` bytes
-    /// and `open` entries of open work.
+    /// (measured as the shell renders it, its header included) and `open`
+    /// entries of open work.
     #[expect(clippy::as_conversions, reason = "a usize fits in a u64 on every target")]
     const fn restart(summary: u64, open: usize, bound: u64) -> Context {
         match (open as u64).checked_mul(OPEN_ENTRY_BYTES) {
@@ -1779,7 +1783,8 @@ pub struct Core<P: Payload> {
     runs: Vec<Option<TaskRun<P>>>,
     /// Every actor a dispatched `spawn` names.
     children: Vec<ActorId>,
-    /// The seq of a compaction between turns awaiting its summary.
+    /// The seq of the latest compaction between turns with no summary
+    /// yet, its call live or not (`CoreView::compacting`).
     compacting: Option<u64>,
 }
 
@@ -3750,8 +3755,10 @@ impl<P: Payload> Core<P> {
     }
 
     /// Starts a turn when the actor is idle, live and has mail, within
-    /// `Limits::turns_per_actor`. Runs once per decision, so a turn the
-    /// context bound fails at once cannot loop.
+    /// `Limits::turns_per_actor`; with no mail, compacts after a turn this
+    /// decision ended (`after_turn`). Runs once per decision, so a turn the
+    /// context bound fails at once cannot loop. A turn supersedes a
+    /// compaction between turns and cancels its summarize call.
     fn begin(&self, plan: &mut Plan<P>)
         requires
             old(plan).inv(),
@@ -3762,7 +3769,11 @@ impl<P: Payload> Core<P> {
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
-        if plan.open().is_some() || plan.scratch.live().is_none() || plan.scratch.mailbox.len() == 0 {
+        if plan.open().is_some() || plan.scratch.live().is_none() {
+            return;
+        }
+        if plan.scratch.mailbox.len() == 0 {
+            self.after_turn(plan);
             return;
         }
         #[expect(clippy::as_conversions, reason = "a usize fits in a u64 on every target")]
@@ -3770,20 +3781,26 @@ impl<P: Payload> Core<P> {
         if plan.scratch.turns >= limit {
             return;
         }
+        if let Some(since) = plan.scratch.compacting {
+            let id = plan.id(since);
+            plan.effect(Effect::CancelModel { id });
+        }
         let turn = TurnId(plan.scratch.seq);
         plan.emit(Record::TurnStarted { turn });
         assert(resolved(plan.scratch@.calls, 0, plan.scratch@.calls.len() as int));
         self.start_step(plan, turn, 0, true);
     }
 
-    /// Compaction at the end of a turn: when this decision ended a turn
-    /// (other than at a full context, which a compaction just failed to
-    /// cure) and left the conversation past 80% of `context_bytes`, the
-    /// idle actor with no mail compacts its history now. Mail that waits
-    /// starts a turn instead, whose beat compacts if it must.
+    /// Compaction at the end of a turn, for `begin`: when this decision
+    /// ended a turn and left the conversation past 80% of `context_bytes`,
+    /// the idle actor compacts its history now. Not after a turn that ended
+    /// at a full context or while it compacted (Esc, or a failed summary):
+    /// that actor parks, with or without a crash between.
     fn after_turn(&self, plan: &mut Plan<P>)
         requires
             old(plan).inv(),
+            old(plan).scratch@.turn is Idle,
+            live(old(plan).scratch@),
         ensures
             final(plan).inv(),
             final(plan).start == old(plan).start,
@@ -3791,7 +3808,11 @@ impl<P: Payload> Core<P> {
             final(plan).from == old(plan).from,
             final(plan).scratch@.epoch == old(plan).scratch@.epoch,
     {
-        if plan.open().is_some() || plan.scratch.live().is_none() || plan.scratch.mailbox.len() > 0 {
+        let compacted = match self.turn {
+            Turn::Open(open) => matches!(open.stage, Stage::Compacting { .. }),
+            Turn::Idle => false,
+        };
+        if compacted {
             return;
         }
         let Some(ended) = plan.ended() else {
@@ -4250,7 +4271,8 @@ impl<P: Payload> Core<P> {
     }
 
     /// The user's `/compact`: compact the history between turns. Refused
-    /// while a turn runs: its beats compact it when they must.
+    /// while a turn runs: its beats compact it when they must. A repeat
+    /// starts over under a new cut and cancels the summarize call before.
     fn on_compact(&self) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -4268,6 +4290,10 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Rejected(Rejection::Running));
         }
         let mut plan = self.plan();
+        if let Some(since) = plan.scratch.compacting {
+            let id = plan.id(since);
+            plan.effect(Effect::CancelModel { id });
+        }
         plan.emit(Record::CompactionStarted { through: plan.scratch.seq });
         plan.finish(Outcome::Accepted, Runs::New)
     }
@@ -4423,7 +4449,6 @@ impl<P: Payload> Core<P> {
             self.steer(&mut plan);
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4480,7 +4505,6 @@ impl<P: Payload> Core<P> {
         }
         self.settle(&mut plan);
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4505,7 +4529,6 @@ impl<P: Payload> Core<P> {
         plan.emit(Record::CancelRequested { turn });
         self.revoke(&mut plan, turn);
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4629,7 +4652,6 @@ impl<P: Payload> Core<P> {
             },
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.ask();
         plan.finish(Outcome::Accepted, Runs::New)
     }
@@ -4725,7 +4747,6 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4761,7 +4782,6 @@ impl<P: Payload> Core<P> {
             return quiet(Outcome::Stale);
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4791,7 +4811,6 @@ impl<P: Payload> Core<P> {
             plan.emit(Record::TurnEnded { turn: open.turn, outcome: TurnOutcome::Cancelled });
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.finish(Outcome::Accepted, Runs::New)
     }
 
@@ -4841,7 +4860,6 @@ impl<P: Payload> Core<P> {
             Self::stop_children(&mut plan);
         }
         self.begin(&mut plan);
-        self.after_turn(&mut plan);
         plan.ask();
         plan.finish(Outcome::Accepted, Runs::All)
     }

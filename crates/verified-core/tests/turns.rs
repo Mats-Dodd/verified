@@ -1398,8 +1398,8 @@ fn waiting_mail_starts_a_turn_instead_of_compacting() {
     model_call(&effects);
 }
 
-/// A compaction between turns is superseded by a turn the mail starts: its
-/// late summary is stale.
+/// A compaction between turns is superseded by a turn the mail starts:
+/// its summarize call is cancelled, and a late summary is stale.
 #[test]
 fn a_turn_supersedes_a_compaction_between_turns() {
     let mut driver = Driver::new(small_limits());
@@ -1407,6 +1407,10 @@ fn a_turn_supersedes_a_compaction_between_turns() {
     let (_, effects) = driver.finish(model_call(&effects), Vec::new());
     let id = summarize_of(&effects);
     let (_, effects) = driver.send(deliver(2, 100));
+    assert!(
+        effects.contains(&Effect::CancelModel { id }),
+        "the superseded call is stopped: {effects:?}"
+    );
     model_call(&effects);
     let from = driver.log.len();
     let (outcome, _) = driver.send(Event::Summarized {
@@ -1444,6 +1448,64 @@ fn esc_cancels_a_forced_compaction() {
         "cancelled"
     );
     assert_eq!(driver.core.unread(), 1, "parked: its message waits");
+}
+
+/// A repeated `/compact` starts over under a new cut and stops the call
+/// before it.
+#[test]
+fn a_repeated_compact_cancels_the_first() {
+    let mut driver = Driver::new(small_limits());
+    let (_, effects) = driver.send(deliver(1, 100));
+    driver.finish(model_call(&effects), Vec::new());
+    let (_, effects) = driver.send(Event::Compact);
+    let first = summarize_of(&effects);
+    let (outcome, effects) = driver.send(Event::Compact);
+    assert_eq!(outcome, Outcome::Accepted, "idle: compacts again");
+    let second = summarize_of(&effects);
+    assert!(second.seq > first.seq, "a new cut");
+    assert!(
+        effects.contains(&Effect::CancelModel { id: first }),
+        "the first call is stopped: {effects:?}"
+    );
+    let (outcome, _) = driver.send(Event::Summarized {
+        id: first,
+        summary: Summary::Written(payload(10)),
+    });
+    assert_eq!(outcome, Outcome::Stale, "the first is superseded");
+}
+
+/// Esc during a compaction forced after tools, then a crash before its
+/// call answers: recovery ends the turn `Cancelled` and the actor stays
+/// parked, as it would without the crash.
+#[test]
+fn a_crash_after_esc_during_a_forced_compaction_stays_parked() {
+    let mut driver = Driver::new(small_limits());
+    let call = driver.start();
+    driver.send(Event::ModelParts {
+        id: call,
+        parts: payload(990),
+    });
+    let (_, effects) = driver.finish(call, vec![propose("read", Tool::Read)]);
+    let read = single_run(&effects, "read");
+    let (_, effects) = driver.tool_done(read, Exit::Ok);
+    summarize_of(&effects);
+    let turn = last_turn(&driver);
+    driver.send(Event::Interrupt { turn });
+    let effects = driver.crash();
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Summarize { .. })),
+        "no summarize call: {effects:?}"
+    );
+    assert_eq!(
+        driver.log.last(),
+        Some(&Record::TurnEnded {
+            turn,
+            outcome: TurnOutcome::Cancelled,
+        }),
+        "cancelled, and parked"
+    );
 }
 
 /// A stop during a forced compaction stops it like any foreground call.
