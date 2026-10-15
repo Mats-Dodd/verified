@@ -257,7 +257,7 @@ pub fn deliveries_across_crashes() -> Harness {
     )
 }
 
-/// T2 and T3: a command in the background and a timer, each a task; the
+/// T3 and T4: a command in the background and a timer, each a task; the
 /// daemon may crash anywhere. Two tasks and three turns an actor.
 ///
 /// # Panics
@@ -281,7 +281,7 @@ pub fn tasks_across_crashes() -> Harness {
     )
 }
 
-/// T2: reports race cancels, Esc and deadlines, for a call and for a task.
+/// T3: reports race cancels, Esc and deadlines, for a call and for a task.
 #[must_use]
 pub fn completions_race_cancels_and_deadlines() -> Harness {
     Harness::bounded(
@@ -315,7 +315,7 @@ fn steering(steps: u32, bounded: Bounded) -> Harness {
     )
 }
 
-/// T3: the user's messages steer a turn that waits for an approval,
+/// T4: the user's messages steer a turn that waits for an approval,
 /// with Esc and a crash anywhere; a step a turn, so a steered message
 /// lands in the next turn.
 #[must_use]
@@ -330,7 +330,7 @@ pub fn steering_cancels_and_crashes() -> Harness {
     )
 }
 
-/// T3: a steered message lands at the next step of its turn, or
+/// T4: a steered message lands at the next step of its turn, or
 /// after Esc, in the next turn.
 #[must_use]
 pub fn steering_across_steps() -> Harness {
@@ -356,7 +356,7 @@ pub fn an_actor_cycle_goes_quiet() -> Harness {
     )
 }
 
-/// P2: a run, in the foreground or as a task, may go silent; its deadline
+/// P1: a run, in the foreground or as a task, may go silent; its deadline
 /// resolves it.
 #[must_use]
 pub fn hung_runs_resolve_by_their_deadline() -> Harness {
@@ -374,7 +374,7 @@ pub fn hung_runs_resolve_by_their_deadline() -> Harness {
     )
 }
 
-/// P3: a chain of spawns past the registry's cap on actors, and a stop of
+/// P1: a chain of spawns past the registry's cap on actors, and a stop of
 /// the root that cascades.
 #[must_use]
 pub fn chatter_goes_quiet_within_limits() -> Harness {

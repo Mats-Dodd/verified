@@ -317,7 +317,7 @@ fn a_crash_while_a_command_runs_is_after_it_acted() {
 }
 
 /// What the shell makes durable is what the core decided, as a mutation
-/// test: a shell that persists an `Unknown` result as `NotStarted` (T2,
+/// test: a shell that persists an `Unknown` result as `NotStarted` (T3,
 /// broken below the core) leaves the model where a group commit becomes
 /// durable holding other records than the model's.
 #[test]
@@ -343,7 +343,7 @@ fn persisting_unknown_as_not_started_fails_the_replay() {
     );
 }
 
-/// T2, as a mutation test: a shell whose stopped command reports
+/// T3, as a mutation test: a shell whose stopped command reports
 /// `NotStarted`, as `Interrupted` did, claims a run that acted never began.
 /// The replay refuses the report: the model admits `NotStarted` only from a
 /// cancelled run that never acted.
@@ -697,7 +697,7 @@ fn a_steer_lost_to_esc() -> Scenario {
     }])
 }
 
-/// T3, as a mutation test: a shell that counts a steered message consumed
+/// T4, as a mutation test: a shell that counts a steered message consumed
 /// when it lands, not when a model call carries it, loses it to Esc. I10
 /// finds it unread at quiescence, and the replay finds the next turn
 /// missing from the log.
@@ -737,7 +737,7 @@ fn a_steer_while_a_command_runs() -> Scenario {
     }])
 }
 
-/// T3, as a mutation test: a history that renders a steer where it was
+/// T4, as a mutation test: a history that renders a steer where it was
 /// delivered sends the model the message between the command's `tool_use`
 /// and its result. The fake provider refuses such a conversation (I13).
 #[test]
@@ -768,7 +768,7 @@ fn a_background_command() -> Scenario {
     Scenario::of(vec![TurnPlan::granted("bg touch t0")])
 }
 
-/// T3, as a mutation test: a shell that never tells the model a
+/// T4, as a mutation test: a shell that never tells the model a
 /// task's end, though the step that carries it records it consumed. I14
 /// finds a model call whose request lacks what its step carried.
 #[test]
@@ -791,9 +791,9 @@ fn a_silent_run() -> Scenario {
     Scenario::of(vec![TurnPlan::granted("bash hang")])
 }
 
-/// P2, as a mutation test: a shell that arms no deadline waits on a
+/// P1, as a mutation test: a shell that arms no deadline waits on a
 /// silent run for good, so its report is lost. I15 finds the run still
-/// open long past its deadline, and I5 (T2: a result for every call at
+/// open long past its deadline, and I5 (T3: a result for every call at
 /// quiescence) a world that never goes quiet; with deadlines it resolves
 /// `Unknown` by it.
 #[test]
@@ -864,7 +864,7 @@ fn acting_after_a_refused_append_fails_the_check() {
         .expect("the fair shell fails stop there and breaks nothing");
 }
 
-/// P3 in the simulation: two actors that answer each other's every
+/// P1 in the simulation: two actors that answer each other's every
 /// message chatter until the limits stop them, and the world goes quiet.
 #[test]
 fn chattering_actors_go_quiet_within_their_limits() {

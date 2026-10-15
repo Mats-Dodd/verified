@@ -1614,7 +1614,7 @@ fn task_end(log: &[Record<Parsed>], task: u64) -> Option<(Exit, Option<String>)>
 
 /// A background command resolves its call at its durable start (no turn
 /// waits for it, P1), runs on as a task, and its end reaches the actor as
-/// a notification a later model call carries (T3).
+/// a notification a later model call carries (T4).
 #[tokio::test]
 async fn a_background_command_resolves_at_once_and_notifies_when_it_ends() {
     let env = Arc::new(MemEnv::default());
@@ -1687,7 +1687,7 @@ async fn a_timer_wakes_its_actor() {
 
 /// `tasks` lists the actor's tasks, and `cancel` signals a running one,
 /// which then records what came back: a command stopped mid-run is
-/// `Unknown` (T2).
+/// `Unknown` (T3).
 #[tokio::test]
 async fn tasks_lists_and_cancel_signals_a_running_task() {
     let env = Arc::new(MemEnv::default());
@@ -1732,7 +1732,7 @@ async fn tasks_lists_and_cancel_signals_a_running_task() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// P2, checked: a foreground `bash` and a background one whose runs never
+/// P1, checked: a foreground `bash` and a background one whose runs never
 /// report (they ignore their cancel). What broke, if anything: a call or a
 /// task not resolved `Unknown` within two seconds of its deadline.
 async fn deadlines(planted: Planted) -> Result<(), String> {
@@ -1788,7 +1788,7 @@ async fn deadlines(planted: Planted) -> Result<(), String> {
     }
 }
 
-/// Every in-flight effect resolves by its deadline (P2): a run that never
+/// Every in-flight effect resolves by its deadline (P1): a run that never
 /// reports is `Unknown` once v stops waiting.
 #[tokio::test]
 async fn a_run_that_never_reports_resolves_unknown_at_its_deadline() {
@@ -1797,7 +1797,7 @@ async fn a_run_that_never_reports_resolves_unknown_at_its_deadline() {
         .expect("every run resolves by its deadline");
 }
 
-/// The planted bug for P2: no deadline is armed. The check must catch the
+/// The planted bug for P1: no deadline is armed. The check must catch the
 /// wait.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -1808,7 +1808,7 @@ async fn waiting_on_a_run_that_never_reports_is_caught() {
     assert!(broken.contains("past its deadline"), "{broken}");
 }
 
-/// P2 beyond `bash`, checked: a `read` and an `edit` whose file never
+/// P1 beyond `bash`, checked: a `read` and an `edit` whose file never
 /// answers, a `send` whose recipient's append never returns, and a `spawn`
 /// whose child's birth never does. What broke, if anything: a call not
 /// resolved `Unknown` within two seconds of its deadline.
@@ -1875,7 +1875,7 @@ async fn stalls(planted: Planted) -> Result<(), String> {
     }
 }
 
-/// Every in-flight effect resolves by its deadline (P2), whatever it waits
+/// Every in-flight effect resolves by its deadline (P1), whatever it waits
 /// on: a file, or another actor's log.
 #[tokio::test]
 async fn reads_edits_and_deliveries_resolve_by_their_deadlines() {
@@ -1884,7 +1884,7 @@ async fn reads_edits_and_deliveries_resolve_by_their_deadlines() {
         .expect("every stalled call resolves by its deadline");
 }
 
-/// The planted bug for P2 beyond `bash`: no deadline is armed. The check
+/// The planted bug for P1 beyond `bash`: no deadline is armed. The check
 /// must catch the waits.
 #[cfg(feature = "sim")]
 #[tokio::test]
@@ -2086,7 +2086,7 @@ async fn stopping_an_actor_stops_its_children() {
     daemon.tasks.shutdown().cancel();
 }
 
-/// The actor cap is the registry's (P3): a spawn past it does not start.
+/// The actor cap is the registry's (P1): a spawn past it does not start.
 #[tokio::test]
 async fn a_spawn_past_the_actor_limit_does_not_start() {
     let env = Arc::new(MemEnv::default());
@@ -2460,7 +2460,7 @@ async fn a_stop_the_crash_caught_in_flight_lands_after_the_restart() {
     assert!(stopped.is_ok(), "the stopped parent's child is stopped");
 }
 
-/// T2 for a spawn: once it has made its child, it has acted. A child
+/// T3 for a spawn: once it has made its child, it has acted. A child
 /// stopped before its prompt lands is reported `Ok`, never `NotStarted`.
 #[tokio::test]
 async fn a_spawn_whose_child_is_stopped_before_its_prompt_is_ok() {

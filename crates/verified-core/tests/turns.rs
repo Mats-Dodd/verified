@@ -353,7 +353,7 @@ fn text_turn_completes() {
     assert_eq!(driver.core.running(), None, "no turn is running");
 }
 
-/// T3: a repeat is `Exists` and records nothing; a second message to a
+/// T4: a repeat is `Exists` and records nothing; a second message to a
 /// busy actor waits in its mailbox, and the turn's end starts the next
 /// turn, whose first model call carries it.
 #[test]
@@ -739,7 +739,7 @@ fn a_second_interrupt_signals_nothing() {
     assert_eq!(driver.since(from), Vec::new(), "nothing recorded");
 }
 
-/// T2, the deadline first: v stops waiting, records `Unknown` and asks the
+/// T3, the deadline first: v stops waiting, records `Unknown` and asks the
 /// run to stop; the run's late report changes nothing.
 #[test]
 fn a_deadline_before_the_report_resolves_unknown() {
@@ -766,7 +766,7 @@ fn a_deadline_before_the_report_resolves_unknown() {
     assert_eq!(outcome, Outcome::Stale, "and so does a repeated deadline");
 }
 
-/// T2, the report first: its outcome stands, and the deadline is stale.
+/// T3, the report first: its outcome stands, and the deadline is stale.
 #[test]
 fn a_report_before_the_deadline_wins() {
     let mut driver = Driver::new(small_limits());
@@ -1209,7 +1209,7 @@ fn crash_restarts_model_step() {
     assert_eq!(model_call(&effects).epoch, Epoch(1), "new epoch");
 }
 
-/// T2: a crash while the turn is being cancelled leaves a dispatched read
+/// T3: a crash while the turn is being cancelled leaves a dispatched read
 /// `Unknown`, never `NotStarted`: it was dispatched, so it may have acted.
 #[test]
 fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
@@ -1235,7 +1235,7 @@ fn a_crash_while_cancelling_leaves_a_dispatched_read_unknown() {
     );
 }
 
-/// T2: the log refuses a result that claims more than v knows.
+/// T3: the log refuses a result that claims more than v knows.
 #[test]
 fn a_log_claiming_more_than_v_knows_is_corrupt() {
     let mut dispatched = proposed(vec![propose("bash", Tool::Bash)]);
@@ -1365,7 +1365,7 @@ fn proposed(calls: Vec<Proposal<Abstract>>) -> Vec<Record<Abstract>> {
     log
 }
 
-/// T3 (a command accepted once): a log delivering one envelope twice is
+/// T4 (a command accepted once): a log delivering one envelope twice is
 /// refused.
 #[test]
 fn a_log_repeating_a_message_is_corrupt() {

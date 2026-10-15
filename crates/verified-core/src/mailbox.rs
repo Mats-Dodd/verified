@@ -1,7 +1,7 @@
 //! The mailbox: envelopes delivered and not yet consumed, in arrival order.
 //!
 //! A model call consumes the batch at the head of the mailbox when its
-//! `StepStarted` is durable (T3): a user message alone, or the run of other
+//! `StepStarted` is durable (T4): a user message alone, or the run of other
 //! envelopes (agents' messages, notifications) before the next user
 //! message. So a user message is never coalesced with anything, and
 //! notifications that arrive together are carried together.

@@ -8,7 +8,7 @@
 //! - `sleep MS`: waits on the Clock seam until done, cancelled or timed out
 //! - `false`: exits 1
 //! - `hang`: never returns, whatever it is told: a run that ignores its
-//!   cancel and its kill, which only v's deadline ends (P2)
+//!   cancel and its kill, which only v's deadline ends (P1)
 //! - anything else: echoes the command, exits 0
 //!
 //! An `edit`'s write is ledgered with the text it writes when it starts, and

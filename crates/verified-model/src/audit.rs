@@ -35,7 +35,7 @@ pub(crate) struct Audit {
     pub(crate) stopped: bool,
     pub(crate) turns: usize,
     /// A turn ended at the context bound: the mail after it may stay
-    /// unread (T3 and P3 have yet to decide what a full context does).
+    /// unread (T4 and P1 have yet to decide what a full context does).
     pub(crate) context_full: bool,
     /// Each task by its seq, and whether it ended.
     pub(crate) tasks: BTreeMap<u64, bool>,
@@ -58,16 +58,16 @@ pub(crate) enum Breach {
     /// empty one: what the model checks of patterns is only `Any`'s.
     GrantUnfit,
     /// A call or a task resolved a second time, or a task never started
-    /// ended (T2).
+    /// ended (T3).
     ResolvedTwice,
     /// A step carried an envelope a step had carried already, or one not
-    /// in the mailbox (T3).
+    /// in the mailbox (T4).
     CarriedTwice,
     /// A step carried mail while a call of the step before it was still
-    /// unresolved: an injection between a call and its result (T3).
+    /// unresolved: an injection between a call and its result (T4).
     Spliced,
     /// The actor went past one of its lifetime caps: turns, messages,
-    /// tasks, depth (P3).
+    /// tasks, depth (P1).
     OverLimit,
 }
 
@@ -269,7 +269,7 @@ pub(crate) fn audit(log: &[Record<Abstract>], limits: &Limits) -> Audit {
 
 impl Audit {
     /// Whether all the actor's mail has been carried, unless it stopped or
-    /// reached its turn cap or a full context (T3's exceptions).
+    /// reached its turn cap or a full context (T4's exceptions).
     pub(crate) fn read_all(&self, limits: &Limits) -> bool {
         self.stopped
             || self.context_full

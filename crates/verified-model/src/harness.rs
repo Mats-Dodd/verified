@@ -203,14 +203,14 @@ pub struct Bounded {
     pub slots: usize,
     /// The first of them, born at boot (the rest are born by `spawn`).
     pub roots: usize,
-    /// The registry's cap on actors (P3).
+    /// The registry's cap on actors (P1).
     pub actors: usize,
     /// Messages the user may send the first root while a turn runs.
     pub steers: u8,
     /// Stops the user may send the first root.
     pub stops: u8,
     pub max_hangs: u8,
-    /// Whether the shell's deadlines fire (P2).
+    /// Whether the shell's deadlines fire (P1).
     pub expiries: bool,
     /// The rules file every actor's shell loads (`None`: there is none, so
     /// the default rules); the harness takes it.
@@ -249,26 +249,26 @@ pub enum Bug {
     /// append it, before the append is durable (C2).
     AckBeforeDurable,
     /// After a crash, the resume ends again a task that already ended
-    /// (T2).
+    /// (T3).
     EndTaskTwice,
     /// After a crash, drop the `Unknown` end of a running `Unsafe` task,
-    /// and all the resume decided after it, so the task never ends (T2).
+    /// and all the resume decided after it, so the task never ends (T3).
     LeaveTaskRunning,
     /// The shell starts a step without the mail at the head of the
-    /// mailbox: it never reaches the model (T3).
+    /// mailbox: it never reaches the model (T4).
     SkipCarry,
     /// The shell starts a step carrying again an envelope a step carried
-    /// before (T3).
+    /// before (T4).
     CarryTwice,
     /// A user's message is spliced into a step whose calls have not all
-    /// resolved (T3).
+    /// resolved (T4).
     SpliceSteering,
     /// A `send` blocks its turn until the recipient's turn that read it
     /// ends: an `ask` (P1).
     BlockingSend,
-    /// The shell arms no deadline: a silent run is waited on for ever (P2).
+    /// The shell arms no deadline: a silent run is waited on for ever (P1).
     NoDeadline,
-    /// The registry ignores its cap on actors (P3).
+    /// The registry ignores its cap on actors (P1).
     NoActorLimit,
     /// A stop has a deadline like any delivery, and v gives up on one that
     /// misses it (C2): resolved `Unknown`, it is never sent again.
@@ -402,7 +402,7 @@ const fn size(bytes: u64) -> Measured<Unit> {
 /// Whether `flight`, effect `id`, may reply `event`: a reply of its own
 /// job's kind, a cancelled one only once it was asked to stop, and a tool's
 /// other reports only once it ran. A cancelled run reports `NotStarted`
-/// only if it never acted (T2); a run that acted and was stopped (a cancel,
+/// only if it never acted (T3); a run that acted and was stopped (a cancel,
 /// or its own timeout) reports `Unknown`. A delivery reports what its
 /// recipient answered, and `Ok` for an append only once it is durable
 /// (`durable`).
@@ -1445,7 +1445,7 @@ impl Harness {
                         Landing::Pending
                     }
                     Outcome::Exists => Landing::Answered(Exit::Ok),
-                    // A spawn made its child, so it acted (T2): a stopped
+                    // A spawn made its child, so it acted (T3): a stopped
                     // or full child is `Ok`, said so in its output.
                     Outcome::Rejected(Rejection::Stopped | Rejection::Limit)
                         if what == Delivery::Spawn =>
@@ -1900,7 +1900,7 @@ impl Model for Harness {
                     })
                 },
             ),
-            // T2.
+            // T3.
             Property::always(
                 "after a crash a dispatched Unsafe call resolves Unknown",
                 |model: &Self, world: &World| {
@@ -1915,7 +1915,7 @@ impl Model for Harness {
                     (0..world.actors.len()).all(|slot| model.core(world, slot).is_some())
                 },
             ),
-            // T4.
+            // T2.
             Property::always(
                 "the client sees a prefix of the durable log",
                 |_, world: &World| {
@@ -1946,7 +1946,7 @@ impl Model for Harness {
                 "calls past a bound never run",
                 |model: &Self, world: &World| !breached(model, world, Breach::OverBoundDispatched),
             ),
-            // T2, held: a result for every call at quiescence.
+            // T3, held: a result for every call at quiescence.
             Property::always(
                 "quiescent implies the turn ended",
                 |model: &Self, world: &World| {
@@ -1984,12 +1984,12 @@ impl Model for Harness {
             // C2: a `Keyed` call takes effect at most once, whatever the id
             // it is sent under.
             Property::always("no call is delivered twice", |_, world: &World| once(world)),
-            // T2.
+            // T3.
             Property::always(
                 "every call and task resolves at most once",
                 |model: &Self, world: &World| !breached(model, world, Breach::ResolvedTwice),
             ),
-            // T2 and T3: every task ends, so its actor is notified.
+            // T3 and T4: every task ends, so its actor is notified.
             Property::always(
                 "at quiescence every task has ended",
                 |model: &Self, world: &World| {
@@ -1999,12 +1999,12 @@ impl Model for Harness {
                             .all(|audit| audit.running().next().is_none())
                 },
             ),
-            // T3: at most once.
+            // T4: at most once.
             Property::always(
                 "every envelope is carried at most once",
                 |model: &Self, world: &World| !breached(model, world, Breach::CarriedTwice),
             ),
-            // T3: at least once, unless the actor stopped or ran out of
+            // T4: at least once, unless the actor stopped or ran out of
             // turns or context first.
             Property::always(
                 "at quiescence every envelope is carried",
@@ -2015,12 +2015,12 @@ impl Model for Harness {
                             .all(|audit| audit.read_all(&model.limits))
                 },
             ),
-            // T3.
+            // T4.
             Property::always(
                 "mail is carried only at a step boundary",
                 |model: &Self, world: &World| !breached(model, world, Breach::Spliced),
             ),
-            // P3.
+            // P1.
             Property::always(
                 "every actor stays within its limits",
                 |model: &Self, world: &World| {
@@ -2032,7 +2032,7 @@ impl Model for Harness {
                         && world.actors.iter().filter(|actor| actor.created).count() <= cap
                 },
             ),
-            // P1, P2, P3: no actor waits on another, every run resolves by
+            // P1: no actor waits on another, every run resolves by
             // its deadline, and without new input the world goes quiet.
             // Every path is finite (the world's faults and the user's
             // input are bounded), so this is checked on the states where a

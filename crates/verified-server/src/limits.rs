@@ -81,7 +81,7 @@ pub struct ServerLimits {
     /// Most rules one rules file may hold; one with more grants nothing.
     pub rules_count: usize,
     /// How much longer than a run's own bound v waits for its report
-    /// before it stops waiting and records `Unknown` (P2). A `read` or an
+    /// before it stops waiting and records `Unknown` (P1). A `read` or an
     /// `edit` has no bound of its own: this is its deadline.
     pub deadline_slack: Millis,
     /// The deadline of a delivery between actors (a `send`, a `spawn`):
@@ -187,7 +187,7 @@ impl ServerLimits {
 
     /// When v stops waiting for a run of `args` and records `Unknown`: past
     /// the run's own timeout and drains, so a run's honest report normally
-    /// comes first (P2). `None` for a run that reports at once (`tasks`)
+    /// comes first (P1). `None` for a run that reports at once (`tasks`)
     /// or is a timer (`wake`), and for a `cancel`, which the core does.
     /// A stop is no call and has none.
     #[must_use]

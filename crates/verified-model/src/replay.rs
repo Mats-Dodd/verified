@@ -67,7 +67,7 @@ pub enum Observed {
     /// `NotStarted`: it saw its cancel before acting).
     Ran { id: EffectId, stopped: bool },
     /// A tool run will never return: it ignores its cancel and its kill,
-    /// so only v's deadline resolves it (P2).
+    /// so only v's deadline resolves it (P1).
     Hung(EffectId),
     /// The client folded the record at this offset of the first root's
     /// log. Only the offset: what it folded there is the simulation's I6

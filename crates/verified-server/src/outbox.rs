@@ -13,11 +13,11 @@
 //! only the registry (which awaits no session) and its recipient's bounded
 //! append, so actors cannot deadlock on each other (P1). What comes back is
 //! the outcome: a delivery is not cancelled mid-flight, and a `send`'s or a
-//! `spawn`'s deadline bounds it (P2). A stop has none: it is sent until it
+//! `spawn`'s deadline bounds it (P1). A stop has none: it is sent until it
 //! lands (C2), and its only waits are those of any delivery.
 //!
 //! Once a spawn has made its child, it has acted: whatever its prompt
-//! meets, it is never `NotStarted` (T2).
+//! meets, it is never `NotStarted` (T3).
 
 use verified_core::{Outcome, Rejection};
 use verified_domain::{Address, Body, Born, Envelope, Exit, Unstarted};

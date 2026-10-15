@@ -7,7 +7,7 @@
 //! cancel token is checked at safe points: before any side effect a
 //! cancelled call is `NotStarted`; file operations that started finish;
 //! `bash` has its process group killed, and a command it stopped
-//! (cancelled or timed out) is `Unknown`: it may have acted (T2).
+//! (cancelled or timed out) is `Unknown`: it may have acted (T3).
 //!
 //! `edit` is a compare-and-swap of `old` for `new` in memory: `old` must
 //! appear exactly once in the text read, and the result is written

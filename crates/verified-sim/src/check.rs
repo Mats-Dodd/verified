@@ -37,19 +37,19 @@
 //!   stop of it (a `Keyed` rerun reuses its key).
 //! - I10 every envelope an actor holds (a message, a notification) is
 //!   carried by at most one model call, and at quiescence by exactly one,
-//!   unless the actor stopped or reached its turn limit (T3).
-//! - I11 at quiescence every task ended (T2); each end is its one
-//!   notification (T3).
+//!   unless the actor stopped or reached its turn limit (T4).
+//! - I11 at quiescence every task ended (T3); each end is its one
+//!   notification (T4).
 //! - I12 at quiescence every actor a stopped actor spawned is stopped
 //!   too (the stop cascade).
 //! - I13 every request the model was sent is a well-formed conversation
-//!   (T3): each `tool_use` answered by exactly one result in the next
+//!   (T4): each `tool_use` answered by exactly one result in the next
 //!   message, before any text there.
-//! - I14 every model call is told what its step carried (T3): each
+//! - I14 every model call is told what its step carried (T4): each
 //!   envelope its `StepStarted` carries is in the request's last message,
 //!   a message by its text and a task's end as that task's notification.
 //! - I15 every effect with a deadline resolved by it, in simulated time
-//!   (P2): its result is durable within its deadline of its `Dispatched`,
+//!   (P1): its result is durable within its deadline of its `Dispatched`,
 //!   unless a crash or a full log came between. Which effects have one, and
 //!   how long, is this check's own table (`due`), not the shell's.
 //! - I16 fail-stop (T1): from an actor's refused append until the daemon
@@ -816,7 +816,7 @@ fn told(
     }
 }
 
-/// I15's table: the deadline every run of `args` must resolve by (P2),
+/// I15's table: the deadline every run of `args` must resolve by (P1),
 /// written out apart from the shell's `ServerLimits::deadline`, so a shell
 /// that arms none is caught. Every run has one but a timer's (it waits on
 /// purpose), a `tasks` listing's (it reads the actor's own log) and a

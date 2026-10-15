@@ -158,7 +158,7 @@ pub enum Unstarted {
     Refused,
 }
 
-/// How an effect ended, claiming no more than v knows (T2).
+/// How an effect ended, claiming no more than v knows (T3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[verifier::external_derive]
 pub enum Exit {
@@ -243,7 +243,7 @@ pub enum Record<P: Payload> {
     Approved { call: CallIx, by: Grant },
     /// A call is about to run. At most one per call.
     Dispatched { call: CallIx },
-    /// What a call actually did. At most one per call (T2); one for every
+    /// What a call actually did. At most one per call (T3); one for every
     /// call once the turn is quiescent is held, not promised. `output` is
     /// absent when the core synthesized the result: `NotStarted` for a call
     /// never dispatched (denied, cancelled, invalid, past a limit), and

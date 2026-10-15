@@ -132,7 +132,7 @@ fn resolving_an_unsafe_call_known_after_a_crash_is_caught() {
         );
         // The log refuses it too ("every durable prefix recovers"): a
         // synthesized `NotStarted` for a dispatched call claims more than v
-        // knows (T2).
+        // knows (T3).
         assert_eq!(
             checker
                 .discovery("an Unsafe call is dispatched at most once across crashes")
@@ -409,7 +409,7 @@ fn acknowledging_before_the_append_is_durable_is_caught() {
     );
 }
 
-/// T2 and T3: tasks across a crash end once each, and every task has ended
+/// T3 and T4: tasks across a crash end once each, and every task has ended
 /// at quiescence; their notifications coalesce.
 #[test]
 fn tasks_across_crashes() {
@@ -424,7 +424,7 @@ fn tasks_across_crashes() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// T2: a resume that ends again a task that already ended.
+/// T3: a resume that ends again a task that already ended.
 #[test]
 fn ending_a_task_twice_after_a_crash_is_caught() {
     caught(
@@ -437,7 +437,7 @@ fn ending_a_task_twice_after_a_crash_is_caught() {
     );
 }
 
-/// T2 and T3: a resume that drops a running task's `Unknown` end leaves it
+/// T3 and T4: a resume that drops a running task's `Unknown` end leaves it
 /// running for good, and its actor is never notified.
 #[test]
 fn leaving_a_task_running_after_a_crash_is_caught() {
@@ -448,7 +448,7 @@ fn leaving_a_task_running_after_a_crash_is_caught() {
     );
 }
 
-/// T2: runs report while Esc, a `cancel` and their deadlines race them; a
+/// T3: runs report while Esc, a `cancel` and their deadlines race them; a
 /// known outcome is never followed by another.
 #[test]
 fn completions_race_cancels_and_deadlines() {
@@ -463,7 +463,7 @@ fn completions_race_cancels_and_deadlines() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// T3: the user's messages steer a turn awaiting approval, with Esc
+/// T4: the user's messages steer a turn awaiting approval, with Esc
 /// and a crash anywhere. Every envelope is carried once, at a step
 /// boundary.
 #[test]
@@ -479,7 +479,7 @@ fn steering_cancels_and_crashes() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// T3: a steered message lands at the next step of its own turn.
+/// T4: a steered message lands at the next step of its own turn.
 #[test]
 fn steering_across_steps() {
     let states = check(
@@ -494,7 +494,7 @@ fn steering_across_steps() {
     assert!(states > 1_000, "a real state space: {states}");
 }
 
-/// T3: a step that never carries the mail at the head of the mailbox
+/// T4: a step that never carries the mail at the head of the mailbox
 /// leaves it unread at quiescence.
 #[test]
 fn skipping_the_mail_at_a_step_is_caught() {
@@ -505,7 +505,7 @@ fn skipping_the_mail_at_a_step_is_caught() {
     );
 }
 
-/// T3: a step that carries again what a step carried before.
+/// T4: a step that carries again what a step carried before.
 #[test]
 fn carrying_an_envelope_twice_is_caught() {
     caught(
@@ -515,7 +515,7 @@ fn carrying_an_envelope_twice_is_caught() {
     );
 }
 
-/// T3: a message spliced into a step whose calls are still running.
+/// T4: a message spliced into a step whose calls are still running.
 #[test]
 fn splicing_a_message_into_a_step_is_caught() {
     caught(
@@ -547,7 +547,7 @@ fn a_blocking_send_deadlocks_and_is_caught() {
     );
 }
 
-/// P2: a run that goes silent resolves `Unknown` at its deadline.
+/// P1: a run that goes silent resolves `Unknown` at its deadline.
 #[test]
 fn hung_runs_resolve_by_their_deadline() {
     let states = check(
@@ -557,7 +557,7 @@ fn hung_runs_resolve_by_their_deadline() {
     assert!(states > 100, "a real state space: {states}");
 }
 
-/// P2: without a deadline, a silent run is waited on for ever.
+/// P1: without a deadline, a silent run is waited on for ever.
 #[test]
 fn waiting_on_a_run_that_never_reports_is_caught() {
     caught(
@@ -567,7 +567,7 @@ fn waiting_on_a_run_that_never_reports_is_caught() {
     );
 }
 
-/// P3: a chain of spawns stops at the cap on actors, and a stop of the
+/// P1: a chain of spawns stops at the cap on actors, and a stop of the
 /// root reaches its child; the world settles within its limits.
 #[test]
 fn chatter_goes_quiet_within_limits() {
@@ -582,7 +582,7 @@ fn chatter_goes_quiet_within_limits() {
     assert!(states > 100, "a real state space: {states}");
 }
 
-/// P3: a registry that ignores its cap on actors.
+/// P1: a registry that ignores its cap on actors.
 #[test]
 fn a_missing_actor_limit_is_caught() {
     caught(
@@ -1416,7 +1416,7 @@ fn a_tampered_observed_path_diverges_where_it_was_tampered() {
 /// A run stopped before it acted did not act: its return, observed
 /// `stopped`, takes no `Execute`, so the call resolves `NotStarted` while
 /// still `Dispatched`. The same report from a run that acted claims more
-/// than v knows (T2), and the replay refuses it.
+/// than v knows (T3), and the replay refuses it.
 #[test]
 fn a_stopped_run_did_not_act() {
     let harness = Harness::bounded(

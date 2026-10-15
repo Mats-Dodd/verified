@@ -23,7 +23,7 @@
 //!   `decide` grants by the first fitting rule (`rules::grant`) or asks. A
 //!   user's grant is recorded only on the user's approval command, as its
 //!   decision's first record (`honest`); `resume` records none.
-//! - an envelope is delivered at most once (C2, T3): a `Delivered` for an id
+//! - an envelope is delivered at most once (C2, T4): a `Delivered` for an id
 //!   already seen does not apply.
 //! - `decide` and `resume` return records that apply, one after another,
 //!   to the state they were given (never a refusal), and every effect they
@@ -39,7 +39,7 @@
 //!   actor reruns only its stops).
 //! - a turn the user asked to stop can only end `Cancelled` (`apply` refuses
 //!   anything else), so `decide` never ends one otherwise.
-//! - a result claims no more than v knows (T2, `result_fits`, `end_fits`):
+//! - a result claims no more than v knows (T3, `result_fits`, `end_fits`):
 //!   one the core synthesizes is `NotStarted` only for a call never
 //!   dispatched (or a timer that never fired) and `Unknown` for one that
 //!   may have acted, besides what the core itself does at dispatch (a
@@ -53,16 +53,16 @@
 //!   (`lemma_nothing_starts_after_a_stop`). The stop cascade's `StopSent`
 //!   and their `Stop` effects are the only things a stopped actor starts.
 //! - a known outcome is never overwritten, and a task ends at most once
-//!   (T2): no record gives a resolved call another result
+//!   (T3): no record gives a resolved call another result
 //!   (`lemma_known_outcome_stays`) or ends an ended task
 //!   (`lemma_a_task_ends_once`), so of a run's report and its deadline
 //!   (`Expired`), the first to reach the core wins.
-//! - the mailbox (T3): every envelope the actor held, carried or still
+//! - the mailbox (T4): every envelope the actor held, carried or still
 //!   waiting, appears once (`actor_ok`, kept by `lemma_actor_keeps`), so a
 //!   model call never carries one twice and a task's notification lands
 //!   once; a step carries exactly the batch at the head of the mailbox, and
 //!   only at a step boundary, once every call of the step before resolved
-//!   (`lemma_carried_at_boundaries`, T3).
+//!   (`lemma_carried_at_boundaries`, T4).
 //!
 //! Model-checked or tested, not proved (Stateright, `verified-model`, and
 //! the scenario tests in `tests/turns.rs` and `tests/actors.rs`):
@@ -74,7 +74,7 @@
 //! - no turn waits on another actor or on a task (P1): a background call
 //!   resolves `Ok` in the decision that dispatches it, and a `send` or
 //!   `spawn` on its delivery, never on another actor's turn.
-//! - the limits (P3): `decide` delivers no envelope past
+//! - the limits (P1): `decide` delivers no envelope past
 //!   `messages_per_actor` (a stop always lands), starts no turn past
 //!   `turns_per_actor`, no task past `tasks_per_actor`, and no spawn past
 //!   `depth`.
@@ -251,7 +251,7 @@ pub struct CoreView {
     /// Envelopes delivered or notifications, not yet carried, in arrival
     /// order.
     pub mailbox: Seq<Waiting>,
-    /// Every envelope a model call carried, in order (T3).
+    /// Every envelope a model call carried, in order (T4).
     pub consumed: Seq<EnvelopeId>,
     /// Turns started.
     pub turns: nat,
@@ -329,8 +329,8 @@ pub open spec fn turn_ok(view: CoreView) -> bool {
 /// The actor's part of the invariant: a turn that has not called its model
 /// yet has mail to carry; tasks are named by distinct seqs of earlier
 /// records; and every envelope the actor ever held (carried, then still
-/// waiting) appears once (T3), each a delivered one or the notification of a
-/// task that ended (T3).
+/// waiting) appears once (T4), each a delivered one or the notification of a
+/// task that ended (T4).
 pub open spec fn actor_ok(view: CoreView) -> bool {
     let ids = held(view.consumed, view.mailbox);
     &&& match view.turn {
@@ -421,7 +421,7 @@ pub open spec fn cancels(shape: Option<ShapeView>) -> bool {
     }
 }
 
-/// T2: a result claims no more than v knows. One the core synthesizes
+/// T3: a result claims no more than v knows. One the core synthesizes
 /// (`reported` false) is `NotStarted` only for a call never dispatched, and
 /// `Unknown` for one that was (a dispatched call may have acted), except
 /// for what the core itself did at dispatch: a background call's start
@@ -475,7 +475,7 @@ pub open spec fn end_task(tasks: Seq<Task>, seq: u64) -> Seq<Task> {
     )
 }
 
-/// T2 for a task's end the core synthesizes: `Unknown` (it may have acted),
+/// T3 for a task's end the core synthesizes: `Unknown` (it may have acted),
 /// or `NotStarted` only for a `Safe` one (a timer has no effect to have
 /// had).
 pub open spec fn end_fits(tasks: Seq<Task>, seq: u64, exit: Exit, reported: bool) -> bool {
@@ -1023,7 +1023,7 @@ pub open spec fn resumed<P: Payload>(start: CoreView, decision: Decision<P>) -> 
 }
 
 /// A record the core does not decide on its own: the user's grant (C1),
-/// or a run's report (T2). A decision holds one only as its first record,
+/// or a run's report (T3). A decision holds one only as its first record,
 /// and only from the event that brings it (`honest`).
 pub open spec fn given<P: Payload>(record: Record<P>) -> bool {
     match record {
@@ -1051,7 +1051,7 @@ pub open spec fn gives<P: Payload>(event: Event<P>, record: Record<P>) -> bool {
 }
 
 /// What `decide` records of the world and the user is what `event` says
-/// (C1, T2): a user's grant only on the user's approval command, a run's
+/// (C1, T3): a user's grant only on the user's approval command, a run's
 /// report only on that run's `ToolDone`, exactly as it came, and each only
 /// as the decision's first record. Every other record is the core's own.
 pub open spec fn honest<P: Payload>(event: Event<P>, records: Seq<Record<P>>) -> bool {
@@ -1172,7 +1172,7 @@ pub proof fn lemma_nothing_starts_after_a_stop<P: Payload>(view: CoreView, recor
     }
 }
 
-/// T2: a known outcome is never overwritten. Within its turn, no record
+/// T3: a known outcome is never overwritten. Within its turn, no record
 /// gives a resolved call another result, and none changes it.
 pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, record: Record<P>)
     requires
@@ -1187,7 +1187,7 @@ pub proof fn lemma_known_outcome_stays<P: Payload>(view: CoreView, index: int, r
 {
 }
 
-/// T2 for tasks: a task ends at most once. Once every task started by
+/// T3 for tasks: a task ends at most once. Once every task started by
 /// record `seq` (an earlier one) has ended, no `TaskEnded` for it applies,
 /// and none starts again.
 pub proof fn lemma_a_task_ends_once<P: Payload>(view: CoreView, seq: u64, record: Record<P>)
@@ -1207,7 +1207,7 @@ pub proof fn lemma_a_task_ends_once<P: Payload>(view: CoreView, seq: u64, record
     }
 }
 
-/// T3, the core's part: an envelope reaches the model only at a step
+/// T4, the core's part: an envelope reaches the model only at a step
 /// boundary: a step that carries one starts a turn, or follows a step whose
 /// calls have all resolved.
 pub proof fn lemma_carried_at_boundaries<P: Payload>(view: CoreView, record: Record<P>)
@@ -1285,8 +1285,8 @@ proof fn lemma_actor_frame(view: CoreView, next: CoreView)
 }
 
 /// Every record that applies keeps the actor's part of the invariant: in
-/// particular, no envelope is ever carried twice (T3), and a task's
-/// notification lands once (T3).
+/// particular, no envelope is ever carried twice (T4), and a task's
+/// notification lands once (T4).
 pub proof fn lemma_actor_keeps<P: Payload>(view: CoreView, record: Record<P>)
     requires
         actor_ok(view),
@@ -1521,7 +1521,7 @@ pub enum Violation {
     /// A stop of an actor this one did not spawn, or stops already, or
     /// sent while this one is not stopped.
     WrongStop,
-    /// A result claims more than v knows (T2): a synthesized `NotStarted`
+    /// A result claims more than v knows (T3): a synthesized `NotStarted`
     /// for a dispatched call, anything but `NotStarted` for an undispatched
     /// one, or a run's report for a call never dispatched.
     WrongResult,
@@ -1794,7 +1794,7 @@ impl<P: Payload> Plan<P> {
     }
 
     /// Ends running task `at` without a report: the core synthesizes its
-    /// end (T2: `Unknown`, or `NotStarted` for a `Safe` task).
+    /// end (T3: `Unknown`, or `NotStarted` for a `Safe` task).
     fn end_task(&mut self, at: usize, exit: Exit)
         requires
             old(self).inv(),
@@ -3831,7 +3831,7 @@ impl<P: Payload> Core<P> {
 
     /// An envelope arrives. A repeat is `Exists` and records nothing (C2).
     /// It lands in the mailbox, and a model call consumes it at the next
-    /// step boundary (T3): it starts a turn if the actor is idle, and
+    /// step boundary (T4): it starts a turn if the actor is idle, and
     /// a user's message steers a step waiting for approvals. A stop revokes
     /// everything (C3).
     fn on_deliver(&self, envelope: Envelope<P>) -> (decision: Decision<P>)
@@ -4141,7 +4141,7 @@ impl<P: Payload> Core<P> {
 
     /// A run reported: a call's, a task's or a delivery's. Whichever of
     /// this report and the run's deadline reaches the core first resolves
-    /// it; the other finds it resolved and is stale (T2). A task's end is
+    /// it; the other finds it resolved and is stale (T3). A task's end is
     /// its notification, and may start a turn.
     fn on_tool_done(&self, id: EffectId, exit: Exit, output: Measured<P::Output>) -> (decision: Decision<P>)
         requires
@@ -4151,7 +4151,7 @@ impl<P: Payload> Core<P> {
             honest(Event::ToolDone { id, exit, output }, decision.records@),
     {
         let mut plan = self.plan();
-        // The run's report, recorded exactly as it came (T2).
+        // The run's report, recorded exactly as it came (T3).
         if let Some(index) = Self::running_call(&plan, id) {
             plan.given = Ghost(Some(Record::ToolResult { call: CallIx(index), exit, output: Some(output) }));
             plan.emit(Record::ToolResult { call: CallIx(index), exit, output: Some(output) });
@@ -4172,7 +4172,7 @@ impl<P: Payload> Core<P> {
     /// A run's deadline passed: v stops waiting, records `Unknown` (it may
     /// have acted) and signals the run to stop, unless a cancel already did
     /// (Esc on its turn, a `cancel` of its task). A run that reported first
-    /// keeps its outcome: the deadline is stale (T2).
+    /// keeps its outcome: the deadline is stale (T3).
     fn on_expired(&self, id: EffectId) -> (decision: Decision<P>)
         requires
             self.wf(),
@@ -4360,7 +4360,7 @@ impl<P: Payload> Core<P> {
                     plan.resolve(index, if hit { Exit::Ok } else { Exit::Failed });
                 } else {
                     // It was dispatched, so it may have acted: `NotStarted`
-                    // would claim more than v knows (T2). A `Safe` or
+                    // would claim more than v knows (T3). A `Safe` or
                     // `Keyed` call is rerun only while the turn proceeds:
                     // rerunning it under a cancel would start something
                     // after the cancel is durable (C3).

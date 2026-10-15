@@ -73,7 +73,7 @@ pub struct Flight {
     /// The side effect happened (tools only; others start executed).
     pub executed: bool,
     pub cancelled: bool,
-    /// The world made it silent: it never reports (P2). Only its deadline
+    /// The world made it silent: it never reports (P1). Only its deadline
     /// resolves it.
     pub hung: bool,
 }

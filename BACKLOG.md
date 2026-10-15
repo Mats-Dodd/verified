@@ -80,7 +80,7 @@ the reasoning.
   - **C1, what runs is what you granted:** the fake `Env` compares every
     run's arguments with the `Approved` call in the log, on every run.
     Planted bug: a shell that swaps a call's arguments after approval.
-  - **P3, the beat:** check headroom for the next step at every step
+  - **P1, the beat:** check headroom for the next step at every step
     boundary and end the turn there when there is none; don't start a turn
     with no room for its first step (today a turn starts into a full
     context and fails at once). Planted bug: a limit checked after the
@@ -91,8 +91,8 @@ the reasoning.
   - **"No agent gains authority"** as its own clause. It follows from C1
     (grants come only from you), and isn't worth its own check.
   - **A limit ending the actor.** A limit ends the turn; the actor lives,
-    and its mail waits (T3: at most one model call, never dropped).
-- **The beat.** *Leaning,* now part of P3. TigerBeetle's lesson: run at
+    and its mail waits (T4: at most one model call, never dropped).
+- **The beat.** *Leaning,* now part of P1. TigerBeetle's lesson: run at
   your own pace and batch; don't react to each event.
 
 ## 3. Public API (`docs/rfcs/0002-api.md`)
@@ -129,7 +129,7 @@ the reasoning.
   stop intake, signal once, wait a bounded time, release storage, write
   nothing. Confirm when implementing that it adds no second recovery path.
 - **Open: should actors ever `follow` other actors?** The default is no:
-  information enters a model only as envelopes (T3). It could become a
+  information enters a model only as envelopes (T4). It could become a
   `Safe` read tool later.
 - **Structured message bodies** between agents. *Idea,* as a future `Body`
   variant (a deliberate breaking change).
@@ -232,8 +232,7 @@ across them. *Leaning,* all of it.
     `{hash, bytes}` in the control record);
   - headroom on the log once v owns its storage.
 - **A VOPR-style liveness mode.** *Leaning.* Run the simulation, heal every
-  fault, and assert the system goes quiet within a bound. It's the check P2
-  and P3 need.
+  fault, and assert the system goes quiet within a bound. It's the check P1 needs.
 - **A full context parks the actor.** *Decided* (in `PRINCIPLES.md`, Not
   promised): its turns end at the first beat and its mail waits. Compaction
   unparks it.

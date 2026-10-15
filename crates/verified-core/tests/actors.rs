@@ -336,10 +336,10 @@ fn proposing(driver: &mut Driver, calls: Vec<Proposal<Abstract>>) -> Vec<Effect<
 }
 
 // ---------------------------------------------------------------------------
-// Tasks (P1, T2, T3)
+// Tasks (P1, T3, T4)
 // ---------------------------------------------------------------------------
 
-/// P1, T3: a background call resolves `Ok` in the decision that dispatches
+/// P1, T4: a background call resolves `Ok` in the decision that dispatches
 /// it, so the turn goes on without waiting; the task's end is one
 /// `TaskEnded`, its notification, and it starts the next turn.
 #[test]
@@ -403,7 +403,7 @@ fn a_background_call_resolves_at_its_start_and_its_end_notifies_once() {
     assert_eq!(outcome, Outcome::Stale, "a task ends once");
 }
 
-/// T2: of a task's report and its deadline, the first wins; the deadline
+/// T3: of a task's report and its deadline, the first wins; the deadline
 /// is v cancelling: `Unknown`, and the run is asked to stop.
 #[test]
 fn a_deadline_ends_a_task_unknown() {
@@ -575,7 +575,7 @@ fn a_deadline_after_esc_signals_nothing_more() {
     );
 }
 
-/// C2, T2: after a crash a running `Unsafe` task ends `Unknown` and never
+/// C2, T3: after a crash a running `Unsafe` task ends `Unknown` and never
 /// runs again; a `Safe` one (a timer) runs again under the same seq.
 #[test]
 fn a_crash_ends_an_unsafe_task_unknown_and_reruns_a_timer() {
@@ -630,10 +630,10 @@ fn tasks_are_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// The mailbox (T3) and steering
+// The mailbox (T4) and steering
 // ---------------------------------------------------------------------------
 
-/// T3: notifications that arrive together are carried by one model call;
+/// T4: notifications that arrive together are carried by one model call;
 /// a user message is carried alone, after them.
 #[test]
 fn notifications_coalesce_and_a_user_message_is_carried_alone() {
@@ -679,7 +679,7 @@ fn notifications_coalesce_and_a_user_message_is_carried_alone() {
     assert_eq!(driver.core.unread(), 0, "each consumed once");
 }
 
-/// T3 and steering: a user message while the step waits for approvals
+/// T4 and steering: a user message while the step waits for approvals
 /// denies them ("the user steered"), and lands at the step's boundary,
 /// after every result of the step.
 #[test]
@@ -795,7 +795,7 @@ fn a_message_during_the_model_call_steers_its_step() {
     assert!(has_model_call(&effects), "and the message is carried next");
 }
 
-/// T3: an envelope is consumed when a model call carrying it starts, not
+/// T4: an envelope is consumed when a model call carrying it starts, not
 /// when it arrives: one that arrived and was never carried (the turn was
 /// cancelled first) starts the next turn.
 #[test]
@@ -1182,7 +1182,7 @@ fn a_log_breaking_the_mailbox_or_the_tasks_is_corrupt() {
     );
 }
 
-/// T3: a step carries exactly the batch at the head of the mailbox.
+/// T4: a step carries exactly the batch at the head of the mailbox.
 #[test]
 fn a_log_carrying_other_than_the_head_is_corrupt() {
     let mut driver = Driver::new();
@@ -1381,8 +1381,8 @@ proptest! {
 
     /// With deliveries, steering, tasks, stops and crashes: decide never
     /// panics, apply takes every record decide made, recovery reproduces
-    /// the live state, no envelope is carried twice (T3) and no task ends
-    /// twice (T2).
+    /// the live state, no envelope is carried twice (T4) and no task ends
+    /// twice (T3).
     #[test]
     fn actors_recover_and_carry_each_envelope_once(
         choices in proptest::collection::vec(choice(), 0..80),

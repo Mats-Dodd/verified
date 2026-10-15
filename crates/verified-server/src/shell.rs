@@ -117,13 +117,13 @@ pub enum Planted {
     /// dispatch). The replay must catch the second act.
     #[cfg(feature = "sim")]
     RunTwice,
-    /// Persist an `Unknown` result as `NotStarted` (breaks T2 in the shell,
+    /// Persist an `Unknown` result as `NotStarted` (breaks T3 in the shell,
     /// below the core). The replay must catch the durable records differing
     /// from the decided ones.
     #[cfg(feature = "sim")]
     UnknownAsNotStarted,
     /// Report a command stopped mid-run as `NotStarted`, as `Interrupted`
-    /// did before T2: a run that may have acted claims it never began. The
+    /// did before T3: a run that may have acted claims it never began. The
     /// replay must catch the report of a run that acted.
     #[cfg(feature = "sim")]
     StoppedAsNotStarted,
@@ -131,7 +131,7 @@ pub enum Planted {
     /// (breaks T1's fail-stop: nothing acts without a durable record).
     #[cfg(feature = "sim")]
     ActAfterRefusal,
-    /// Arm no deadline (breaks P2): a run that never reports is waited on
+    /// Arm no deadline (breaks P1): a run that never reports is waited on
     /// for good.
     #[cfg(feature = "sim")]
     NoDeadline,
@@ -149,7 +149,7 @@ pub enum Planted {
     #[cfg(feature = "sim")]
     DeliverBeforePersist,
     /// Count a message consumed when it is injected into a running turn,
-    /// not when a model call carrying it starts (breaks T3): when that turn
+    /// not when a model call carrying it starts (breaks T4): when that turn
     /// ends before carrying it (Esc), the turn it would start is dropped,
     /// and the message is never read.
     #[cfg(feature = "sim")]
@@ -159,11 +159,11 @@ pub enum Planted {
     #[cfg(feature = "sim")]
     StopSkipsChildren,
     /// Render a message where it was delivered, between a running step's
-    /// `tool_use` and its results (breaks T3's well-formed history).
+    /// `tool_use` and its results (breaks T4's well-formed history).
     #[cfg(feature = "sim")]
     SpliceSteering,
     /// Never tell the model a task's end, though the step that carries it
-    /// records it consumed (breaks T3: the model never sees it).
+    /// records it consumed (breaks T4: the model never sees it).
     #[cfg(feature = "sim")]
     UntoldTaskEnds,
     /// Acknowledge a group commit without its fsync (breaks T1): a crash
@@ -541,7 +541,7 @@ pub struct Session {
     /// Where deliveries to other actors go.
     registry: Registry,
     cancels: BTreeMap<EffectId, CancellationToken>,
-    /// The deadline of each run in flight (P2): cancelled when it reports.
+    /// The deadline of each run in flight (P1): cancelled when it reports.
     deadlines: BTreeMap<EffectId, CancellationToken>,
     /// Each child this session's spawn delivery last ran for, and a token
     /// cancelled once that delivery is done: a stop to the child waits for
@@ -1343,7 +1343,7 @@ impl Session {
     }
 
     /// Runs an approved call (a foreground run or a task's), and arms its
-    /// deadline (P2).
+    /// deadline (P1).
     fn run_call(&mut self, call: ToolCall<Approved, Parsed>) {
         let id = call.effect();
         let deadline = self.config.limits.deadline(call.args());
