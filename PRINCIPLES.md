@@ -193,12 +193,13 @@ next turn. One not yet carried stays in the mailbox. A retried command is
 accepted once.
 
 - **Checks.** Proved: `actor_ok`, `lemma_actor_keeps`,
-  `lemma_carried_at_boundaries`. Model-checked: `steering_cancels_and_crashes`,
-  `steering_across_steps`. Property-tested:
-  `actors_recover_and_carry_each_envelope_once`. Simulated: I10, I14.
+  `lemma_carried_at_boundaries`, `lemma_cut_keeps_mail`. Model-checked:
+  `steering_cancels_and_crashes`, `steering_across_steps`. Property-tested:
+  `actors_recover_and_carry_each_envelope_once`. Simulated: I10, I13, I14.
 - **Planted bugs.** Stateright `Bug::CarryTwice`, `Bug::SkipCarry`,
   `Bug::SpliceSteering`; DST `Planted::ConsumeAtInjection`,
-  `Planted::UntoldTaskEnds`; Verus mutations in their commits.
+  `Planted::UntoldTaskEnds`, `Planted::CutSwallowsMail`,
+  `Planted::CutMidStep`; Verus mutations in their commits.
 
 ### P1. Nothing hangs, nothing runs away
 
