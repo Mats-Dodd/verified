@@ -1,0 +1,21 @@
+[package]
+name = "verified-model"
+description = "Stateright model of the verified core in an abstract world, for BFS and for replaying traces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+stateright.workspace = true
+verified-core.workspace = true
+verified-domain.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# The daemon's payload (`Parsed`), for the abstraction's commutation test.
+verified-server.workspace = true
+
+[lints]
+workspace = true

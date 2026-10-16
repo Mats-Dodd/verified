@@ -1,0 +1,212 @@
+[
+  {
+    "id": "1",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-0000000000a1"
+        },
+        "from": "user",
+        "text": "fix the typo in lib.rs",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Let me look.",
+          "state": "done"
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_1",
+          "state": "output-available",
+          "input": {
+            "path": "src/lib.rs"
+          },
+          "output": {
+            "text": "fn mian() {}"
+          },
+          "approval": {
+            "id": "toolu_1",
+            "requestReason": "read-only",
+            "isAutomatic": true,
+            "approved": true
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-edit",
+          "toolCallId": "toolu_2",
+          "state": "output-error",
+          "input": {
+            "path": "src/lib.rs",
+            "old": "mian",
+            "new": "main"
+          },
+          "errorText": "old text not found",
+          "approval": {
+            "id": "toolu_2",
+            "approved": true
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "The edit failed.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "2",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0c"
+        },
+        "from": "user",
+        "text": "run the tests",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "2",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-bash",
+          "toolCallId": "toolu_3",
+          "state": "output-denied",
+          "input": {
+            "command": "cargo test"
+          },
+          "approval": {
+            "id": "toolu_3",
+            "approved": false
+          }
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "3",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0d"
+        },
+        "from": "user",
+        "text": "search for it",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "3",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_5",
+          "state": "output-error",
+          "input": {
+            "path": [
+              1,
+              true
+            ]
+          },
+          "errorText": "invalid input"
+        },
+        {
+          "type": "tool-grep",
+          "toolCallId": "toolu_9",
+          "state": "output-error",
+          "input": {
+            "q": 1
+          },
+          "errorText": "no such tool"
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_6",
+          "state": "output-error",
+          "input": {
+            "path": "README.md"
+          },
+          "errorText": "interrupted",
+          "approval": {
+            "id": "toolu_6",
+            "requestReason": "read-only",
+            "isAutomatic": true,
+            "approved": true
+          }
+        },
+        {
+          "type": "tool-read",
+          "toolCallId": "toolu_7",
+          "state": "input-streaming",
+          "input": {},
+          "rawInput": "{\"path\":"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "cancelled"
+  },
+  {
+    "id": "4",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0e"
+        },
+        "from": "user",
+        "text": "delete the build dir",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "4",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-bash",
+          "toolCallId": "toolu_8",
+          "state": "approval-requested",
+          "input": {
+            "command": "rm -rf target"
+          },
+          "approval": {
+            "id": "toolu_8"
+          }
+        }
+      ]
+    },
+    "errors": [],
+    "end": null
+  }
+]

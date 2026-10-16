@@ -1,0 +1,14 @@
+---
+source: crates/verified-tui/src/app/tests.rs
+expression: "screen(&mut app, 80, 10)"
+---
+
+
+
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│first line                                                                    │
+│second line                                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+ verified  000000f1 ○  ◆ starting   ⏎ send · ⇧⏎ newline · tab actor · esc cancel

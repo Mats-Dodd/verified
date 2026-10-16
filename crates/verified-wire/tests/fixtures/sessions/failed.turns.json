@@ -1,0 +1,64 @@
+[
+  {
+    "id": "1",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b05"
+        },
+        "from": "user",
+        "text": "overloaded",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "1",
+      "role": "assistant",
+      "parts": []
+    },
+    "errors": [
+      "Overloaded"
+    ],
+    "end": "failed"
+  },
+  {
+    "id": "2",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b06"
+        },
+        "from": "user",
+        "text": "fail midway",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "2",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Partial",
+          "state": "streaming"
+        }
+      ]
+    },
+    "errors": [
+      "The model reported an error"
+    ],
+    "end": "failed"
+  },
+  {
+    "id": "3",
+    "inputs": [],
+    "reply": null,
+    "errors": [
+      "The turn failed unexpectedly"
+    ],
+    "end": "failed"
+  }
+]

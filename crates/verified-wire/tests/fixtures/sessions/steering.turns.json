@@ -1,0 +1,115 @@
+[
+  {
+    "id": "2",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000c01"
+        },
+        "from": "user",
+        "text": "edit lib.rs",
+        "step": 0
+      },
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000c02"
+        },
+        "from": "user",
+        "text": "read it first",
+        "step": 1
+      }
+    ],
+    "reply": {
+      "id": "2",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "tool-edit",
+          "toolCallId": "toolu_1",
+          "state": "output-denied",
+          "input": {
+            "path": "lib.rs",
+            "old": "a",
+            "new": "b"
+          },
+          "approval": {
+            "id": "toolu_1",
+            "approved": false
+          }
+        },
+        {
+          "type": "tool-bash",
+          "toolCallId": "toolu_2",
+          "state": "output-available",
+          "input": {
+            "command": "sleep 5",
+            "background": true
+          },
+          "output": {
+            "text": "task 9 started"
+          },
+          "approval": {
+            "id": "toolu_2",
+            "requestReason": "allowed by rule 1",
+            "isAutomatic": true,
+            "approved": true
+          }
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Reading it first.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "31",
+    "inputs": [
+      {
+        "envelope": {
+          "task": "9"
+        },
+        "from": "v",
+        "text": "task 9 ended: ok",
+        "step": 0
+      },
+      {
+        "envelope": {
+          "minted": {
+            "actor": "01a10400-0000-7000-8000-0000000000d1",
+            "seq": 14
+          }
+        },
+        "from": "01a10400-0000-7000-8000-0000000000d1",
+        "replyTo": "01a10400-0000-7000-8000-0000000000d1",
+        "text": "found two typos",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "31",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Noted.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]

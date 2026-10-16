@@ -4,6 +4,38 @@ fail-fast = false
 slow-timeout = { period = "20s", terminate-after = 3 }
 leak-timeout = "500ms"
 
+# The simulation's tests spawn no subprocesses, yet under load nextest on
+# macOS reported LEAK on any of them past a
+# 3s window. The cause is the runner, not our teardown: macOS has no
+# `pipe2`, so a test's output pipe is created and only then marked
+# close-on-exec, and a sibling test that nextest spawns from another thread
+# in between inherits the pipe's write end. That pipe then stays open until
+# the sibling exits, seconds later for a simulation test. Caught in the act
+# with `lsof` during a loaded run: a `dst` test process holding, at fd 23, a
+# PIPE that was another test's output; serially (`--test-threads 1`) under
+# the same load, no LEAK in any run. No wider window fixes a sibling that
+# runs for 10s, so for verified-sim a leak is reported (LEAK) but not
+# failed. Its tests spawn no processes at all; a real leak would still show
+# in the output.
+#
+# Some simulation tests run many whole worlds twice each in an unoptimized
+# build: `a_full_log_ends_the_running_turn_and_replays` takes ~15s on a
+# 16-core laptop and exceeded 60s on a shared 4-core CI runner. Simulated
+# time cannot hang on the wall clock, so give them the model tests' leash.
+[[profile.default.overrides]]
+filter = "package(verified-sim)"
+leak-timeout = { period = "3s", result = "pass" }
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The model-checking tests exhaustively explore state spaces in an unoptimized
+# build: `unsafe_calls_run_together` takes ~42s on a 16-core laptop (~64s
+# under `just ci`'s parallel load), and its predecessor exceeded the default
+# 60s on a shared 4-core CI runner. They are slow by construction, not hung,
+# so give them a longer leash (up to 10 minutes) instead of the default.
+[[profile.default.overrides]]
+filter = "package(verified-model) and binary(model)"
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [profile.ci]
 fail-fast = true
 final-status-level = "flaky"

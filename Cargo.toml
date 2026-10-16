@@ -1,6 +1,21 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# What a plain `cargo build` (and `cargo build --release`) at the root builds:
+# everything but the simulation. Cargo unifies features across the packages
+# of one build, so building verified-sim alongside verified-cli would turn on
+# the `sim` shims of verified-server and verified-tui inside the shipped
+# binary. `just release-without-sim`, the one guard against that, builds this
+# set in release and checks its resolved features.
+default-members = [
+    "crates/verified-cli",
+    "crates/verified-core",
+    "crates/verified-domain",
+    "crates/verified-model",
+    "crates/verified-server",
+    "crates/verified-tui",
+    "crates/verified-wire",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +24,64 @@ license = "MIT"
 repository = "https://github.com/Mats-Dodd/verified"
 
 [workspace.dependencies]
-verified = { path = "crates/verified", version = "0.1.0" }
+# Workspace crates.
+verified-domain = { path = "crates/verified-domain", version = "0.1.0" }
+verified-core = { path = "crates/verified-core", version = "0.1.0" }
+verified-model = { path = "crates/verified-model", version = "0.1.0" }
+verified-wire = { path = "crates/verified-wire", version = "0.1.0" }
+verified-server = { path = "crates/verified-server", version = "0.1.0" }
+verified-tui = { path = "crates/verified-tui", version = "0.1.0" }
+verified-sim = { path = "crates/verified-sim", version = "0.1.0" }
+
+# Every external dependency is declared once here with default features off;
+# crates opt into exactly the features they use.
+
+# Verification. vstd must match the Verus release used by `just verify`
+# (0.2026.10.04.426d8b0); `cargo verus verify` refuses a mismatched pair.
+vstd = { version = "=0.0.0-2026-10-04-0306", default-features = false, features = ["std"] }
+stateright = { version = "=0.31.0", default-features = false }
+turmoil = { version = "=0.7.2", default-features = false, features = ["unstable-fs", "unstable-barriers"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+insta = { version = "1", default-features = false }
+# Simulation only. 0.9 matches the rand turmoil and stateright already link.
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+
+# Async runtime and IO.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "net", "time", "process", "io-util"] }
+tokio-util = { version = "0.7", default-features = false }
+# The Stream trait, to poll crossterm's EventStream without a combinator crate.
+futures-core = { version = "0.3", default-features = false }
+# OS entropy for the real Entropy seam; simulation seeds its own.
+getrandom = { version = "0.3", default-features = false }
+async-trait = { version = "0.1", default-features = false }
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
+# HTTP: injected IO everywhere (axum serves any Listener, hyper takes a connector).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "native-tokio", "tls12"] }
+tower-service = { version = "0.3", default-features = false }
+
+# Data.
+thiserror = { version = "2", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# The rules file, `.verified/v.toml`: parsed once, at the shell.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
+
+# Terminal.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", default-features = false, features = ["event-stream"] }
+tui-markdown = { version = "0.3", default-features = false }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
+# Diagnostics.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 
 [profile.dev]
 debug-assertions = true
@@ -18,6 +90,19 @@ overflow-checks = true
 [profile.release]
 debug = "line-tables-only"
 overflow-checks = true
+# Crash-only (Law 8): a panic anywhere kills the process, including tasks the
+# World does not supervise (axum spawns one per connection). Test harnesses
+# ignore this setting (cargo builds tests with unwinding), and the simulation
+# sweeps in `sim-release` below, so `cargo test --release` and the sim's
+# per-host crash on panic are unaffected.
+panic = "abort"
+
+# The simulation in release: optimized, but unwinding, so that a daemon panic
+# crashes its turmoil host (`shim::crash` under `sim`) and the sweep reports
+# the seed instead of aborting. Never used for the shipped binary.
+[profile.sim-release]
+inherits = "release"
+panic = "unwind"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -35,7 +120,9 @@ redundant_lifetimes = "warn"
 single_use_lifetimes = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
-unexpected_cfgs = "warn"
+# `verus_keep_ghost` and `verus_only` are set by Verus while verifying;
+# plain cargo builds never see them.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_keep_ghost)", "cfg(verus_only)"] }
 unit_bindings = "warn"
 unnameable_types = "warn"
 unreachable_pub = "warn"

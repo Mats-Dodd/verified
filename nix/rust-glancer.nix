@@ -1,23 +1,23 @@
 { lib, stdenv, stdenvNoCC, fetchurl, unzip, autoPatchelfHook }:
 
 let
-  version = "0.1.1";
+  version = "0.3.0";
   assets = {
     "x86_64-linux" = {
       platform = "linux-x64";
-      sha256 = "a07df244d16e266aa661a75c1a72006b307a5ab35ce413f4ec8bf2ad1ba543d3";
+      sha256 = "aef20d0e0ccf70cb1643caafd4c6321ea95cb786d1a413cca963079f5f8184c2";
     };
     "aarch64-linux" = {
       platform = "linux-arm64";
-      sha256 = "bb3c91ae0b8b5984d91c16e27533030b94d96cbc3798277f4b3e502b16e4ea06";
+      sha256 = "e829e382b3274f870c559547568536bf3bdc8b268880e3b8e38f27d5e5e0e504";
     };
     "x86_64-darwin" = {
       platform = "darwin-x64";
-      sha256 = "436e6451e8885e182e8a09ca09186a9b65217f725197b72909e93e6b31d88f65";
+      sha256 = "c9b3222978d875210b2c22a1a22b3dd4ed5a5b083aa814b4887386acce26eeb3";
     };
     "aarch64-darwin" = {
       platform = "darwin-arm64";
-      sha256 = "dac95f6a2ad7cef36c552fd14eb5cf475a6eb3093f4589ecc65aaa841a0339a3";
+      sha256 = "0b05e2e29edb262590eb6d470ddb7b3264e72620271310f12b9ece87f395ffb6";
     };
   };
   asset = assets.${stdenv.hostPlatform.system}

@@ -1,0 +1,34 @@
+---
+source: crates/verified-tui/src/app/tests.rs
+expression: "screen(&mut app, 80, 30)"
+---
+ › run the tests
+
+ ⚙ bash  denied
+   {"command":"cargo test"}
+
+ › search for it
+
+ ⚙ read  error
+   {"path":[1,true]}
+   ✗ invalid input
+ ⚙ grep  error
+   {"q":1}
+   ✗ no such tool
+ ⚙ read  error
+   {"path":"README.md"}
+   ✗ interrupted
+ ⚙ read  preparing
+   {}
+ ⏹ cancelled
+
+ › delete the build dir
+
+ ⚙ bash  awaiting approval
+   {"command":"rm -rf target"}
+
+ allow bash? y allow · n deny · esc cancel turn
+┌──────────────────────────────────────────────────────────────────────────────┐
+│Say something…                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+ verified  000000f1 claude-sonnet-4-5 ● live  ◆ replying   ⏎ send · ⇧⏎ newline ·

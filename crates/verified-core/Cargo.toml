@@ -1,0 +1,21 @@
+[package]
+name = "verified-core"
+description = "Pure, Verus-verified agent state machine: decide, apply, recover, resume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+verified-domain.workspace = true
+vstd.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true

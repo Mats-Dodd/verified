@@ -1,0 +1,60 @@
+[
+  {
+    "id": "1",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b03"
+        },
+        "from": "user",
+        "text": "one",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Echo: one",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  },
+  {
+    "id": "2",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b04"
+        },
+        "from": "user",
+        "text": "two",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "2",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Echo: two",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]

@@ -1,0 +1,661 @@
+//! The conversation the model is sent, rebuilt from the log.
+//!
+//! What the user and others said enters at the step that carried it (its
+//! `StepStarted`), after the previous step's results: never between a
+//! `tool_use` and its result. Only what the log says happened is sent: the
+//! output of attempts that
+//! ended in `StepReset` is dropped, `tool_use` blocks without a result (a
+//! turn failed by a model failure) are dropped, and results the core
+//! synthesized (denied, interrupted, unknown, invalid, past a limit) are
+//! rendered as text from their exit and reason. Consecutive messages of one
+//! role merge. Every payload is already its parsed type: nothing here
+//! guesses or substitutes.
+//!
+//! After a compaction the conversation starts from the latest `Compacted`:
+//! its summary and the actor's open work, as one message of the user's at
+//! its cut, then what follows the cut as before. The log is read whole all
+//! the same: mail delivered before the cut and not yet carried is told at
+//! the step that carries it, and the turn's calls keep their numbers.
+//! A summarize call is sent the conversation as it is now, the latest
+//! summary included, with [`INSTRUCTION`] after it.
+
+use std::collections::BTreeMap;
+
+use verified_domain::id::{CallId, ToolName};
+use verified_domain::{
+    Address, Body, EnvelopeId, Exit, INSTRUCTION, Measured, OpenWork, Record, Request, Unstarted,
+};
+
+use crate::model::{Content, Message, ModelRequest, ResultKind, Role};
+use crate::payload::{ModelPart, Parsed, ToolInput, measure};
+
+/// One tool call of the current turn, as the history sees it.
+struct Call {
+    id: CallId,
+    reason: Option<String>,
+    /// Whether it starts a task (a background run, a timer).
+    background: bool,
+    /// The task it started: the seq of its `Dispatched`.
+    task: Option<u64>,
+    result: Option<(Exit, Option<String>)>,
+}
+
+/// The step being assembled: its last attempt's parts and its calls.
+#[derive(Default)]
+struct Step {
+    parts: Vec<ModelPart>,
+    /// Indexes into the turn's calls proposed by this step.
+    calls: Vec<usize>,
+    /// What the planted history spliced into the step (`spliced`).
+    spliced: Vec<String>,
+    /// The planted cut fell inside this step: its `tool_use` is in the
+    /// summary, so only its results are rendered (`Planted::CutMidStep`).
+    halved: bool,
+}
+
+/// A planted defect of the history, under `sim` only: the fair history has
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "sim"),
+    expect(dead_code, reason = "the planted defects are built under `sim` only")
+)]
+enum Defect {
+    None,
+    /// A message lands where it was delivered, inside the step that was
+    /// running (`Planted::SpliceSteering`).
+    Splice,
+    /// A task's end is never told (`Planted::UntoldTaskEnds`).
+    Untold,
+    /// The cut takes the mail no step carried yet into the summary
+    /// (`Planted::CutSwallowsMail`).
+    SwallowMail,
+    /// The cut falls after the last step's `tool_use`, before its results
+    /// (`Planted::CutMidStep`).
+    CutMidStep,
+}
+
+struct Builder {
+    messages: Vec<Message>,
+    calls: Vec<Call>,
+    step: Option<Step>,
+    /// What each envelope delivered or notified says, until a step carries
+    /// it.
+    mail: BTreeMap<EnvelopeId, String>,
+    defect: Defect,
+}
+
+/// What opens the summary at a cut: the model reads what follows as its
+/// own summary of everything before it.
+pub const SUMMARY_HEADER: &str = "Summary of the conversation before this point:\n\n";
+
+/// A summarize call's text, measured as the conversation renders it: its
+/// header included, so the core's reset counts what the model is sent.
+#[must_use]
+pub fn summary(text: String) -> Measured<String> {
+    let bytes = measure(format!("{SUMMARY_HEADER}{text}")).bytes;
+    Measured { body: text, bytes }
+}
+
+/// What opens each line of open work beside a summary.
+pub const OPEN_HEADER: &str = "[v] open: ";
+
+/// The lines that tell the model its open work beside a summary, one per
+/// running task and per child, each within `OPEN_ENTRY_BYTES`.
+pub fn open_lines(open: &OpenWork) -> impl Iterator<Item = String> + '_ {
+    let tasks = open
+        .tasks
+        .iter()
+        .map(|task| format!("{OPEN_HEADER}task {task} is running"));
+    let children = open
+        .children
+        .iter()
+        .map(|child| format!("{OPEN_HEADER}you spawned child {child}"));
+    tasks.chain(children)
+}
+
+/// The model-facing text of a result the core synthesized.
+#[must_use]
+pub fn synthesized_text(exit: Exit, reason: Option<&str>) -> String {
+    match exit {
+        Exit::Ok => "(no output)".to_owned(),
+        Exit::Failed => "The tool call failed.".to_owned(),
+        Exit::NotStarted(Unstarted::Denied) => {
+            "Not started: the user denied this tool call.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Steered) => {
+            "Not started: the user sent a message instead of answering.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Cancelled) => {
+            "Not started: the user stopped the turn before this call ran.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Stopped) => {
+            "Not started: the user stopped this actor before this call ran.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Refused) => {
+            "Not started: the recipient is unknown or stopped.".to_owned()
+        }
+        Exit::NotStarted(Unstarted::Limit) => {
+            "Not started: the response proposed more tool calls than one step or turn may make."
+                .to_owned()
+        }
+        Exit::NotStarted(Unstarted::Invalid) => reason.map_or_else(
+            || "Not started: the tool call is invalid.".to_owned(),
+            |reason| format!("Invalid tool call: {reason}"),
+        ),
+        Exit::Unknown => {
+            "Unknown outcome: it may or may not have taken effect; look before redoing it."
+                .to_owned()
+        }
+    }
+}
+
+impl Builder {
+    fn push(&mut self, role: Role, content: Vec<Content>) {
+        if content.is_empty() {
+            return;
+        }
+        match self.messages.last_mut() {
+            Some(last) if last.role == role => last.content.extend(content),
+            Some(_) | None => self.messages.push(Message { role, content }),
+        }
+    }
+
+    /// Starts the conversation over at a cut: the summary and the open
+    /// work, as the user's. The step the cut closed is in the summary.
+    fn restart(&mut self, summary: &str, open: &OpenWork) {
+        self.messages.clear();
+        let step = self.step.take();
+        match self.defect {
+            Defect::SwallowMail => self.mail.clear(),
+            Defect::CutMidStep => {
+                self.step = step.map(|step| Step {
+                    halved: true,
+                    ..step
+                });
+            }
+            Defect::None | Defect::Splice | Defect::Untold => {}
+        }
+        let mut said = vec![Content::Text {
+            text: format!("{SUMMARY_HEADER}{summary}"),
+        }];
+        said.extend(open_lines(open).map(|text| Content::Text { text }));
+        self.push(Role::User, said);
+    }
+
+    /// Ends the open step: its text, the calls that have results, then the
+    /// results.
+    fn close_step(&mut self) {
+        let Some(step) = self.step.take() else {
+            return;
+        };
+        let mut assistant = text_blocks(&step.parts);
+        let mut results = Vec::new();
+        for part in &step.parts {
+            let ModelPart::ToolCall {
+                tool_call_id,
+                tool_name,
+                input,
+            } = part
+            else {
+                continue;
+            };
+            let call = step
+                .calls
+                .iter()
+                .filter_map(|index| self.calls.get(*index))
+                .find(|call| call.id == *tool_call_id);
+            let Some(call) = call else {
+                continue;
+            };
+            let Some((exit, output)) = &call.result else {
+                continue;
+            };
+            assistant.push(tool_use(tool_call_id, tool_name, input));
+            let text = output
+                .clone()
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| match (exit, call.task) {
+                    // A background call resolves at its start: the model
+                    // learns its task, to cancel it or to read its end.
+                    (Exit::Ok, Some(task)) => {
+                        format!("Started task {task}: it runs on, and you are told when it ends.")
+                    }
+                    _ => synthesized_text(*exit, call.reason.as_deref()),
+                });
+            let kind = match exit {
+                Exit::Ok => ResultKind::Success,
+                Exit::Failed | Exit::NotStarted(_) | Exit::Unknown => ResultKind::Error,
+            };
+            results.push(Content::ToolResult {
+                id: tool_call_id.clone(),
+                text,
+                kind,
+            });
+        }
+        if !step.halved {
+            self.push(Role::Assistant, assistant);
+        }
+        let mut said: Vec<Content> = step
+            .spliced
+            .into_iter()
+            .map(|text| Content::Text { text })
+            .collect();
+        said.extend(results);
+        self.push(Role::User, said);
+    }
+
+    fn record(&mut self, seq: u64, record: &Record<Parsed>) {
+        match record {
+            Record::Delivered { envelope } => {
+                if let Body::Text(text) = &envelope.body {
+                    let said = match (envelope.from, envelope.reply_to) {
+                        (Address::User, _) => text.body.clone(),
+                        (Address::Runtime | Address::Actor(_), None) => {
+                            format!("[from {}] {}", envelope.from, text.body)
+                        }
+                        (Address::Runtime | Address::Actor(_), Some(reply_to)) => format!(
+                            "[from {}; reply to {reply_to}] {}",
+                            envelope.from, text.body
+                        ),
+                    };
+                    match &mut self.step {
+                        Some(step) if self.defect == Defect::Splice && !step.calls.is_empty() => {
+                            step.spliced.push(said);
+                        }
+                        Some(_) | None => {
+                            self.mail.insert(envelope.id, said);
+                        }
+                    }
+                }
+            }
+            Record::TaskEnded { .. } if self.defect == Defect::Untold => {}
+            Record::TaskEnded { task, exit, output } => {
+                let output = output
+                    .as_ref()
+                    .map(|output| output.body.text.clone())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| synthesized_text(*exit, None));
+                self.mail.insert(
+                    EnvelopeId::Task(*task),
+                    format!("[v] task {task} ended: {output}"),
+                );
+            }
+            Record::TurnStarted { .. } => {
+                self.close_step();
+                self.calls.clear();
+            }
+            Record::StepStarted { carries, .. } => {
+                if !carries.is_empty() {
+                    self.close_step();
+                    let said = carries
+                        .iter()
+                        .filter_map(|id| self.mail.remove(id))
+                        .map(|text| Content::Text { text })
+                        .collect();
+                    self.push(Role::User, said);
+                }
+                match &mut self.step {
+                    Some(step) if step.calls.is_empty() && step.parts.is_empty() => {}
+                    Some(_) | None => {
+                        self.close_step();
+                        self.step = Some(Step::default());
+                    }
+                }
+            }
+            Record::ModelOutput { parts, .. } => {
+                if let Some(step) = &mut self.step {
+                    step.parts.extend_from_slice(&parts.body);
+                }
+            }
+            Record::StepReset { .. } => {
+                if let Some(step) = &mut self.step {
+                    step.parts.clear();
+                }
+            }
+            Record::StepFinished { calls, .. } => {
+                if let Some(step) = &mut self.step {
+                    for proposal in calls {
+                        step.calls.push(self.calls.len());
+                        let (reason, background) = match &proposal.request {
+                            Request::Run { args } => (None, args.shape().background()),
+                            Request::Invalid { reason } => (Some(reason.clone()), false),
+                        };
+                        self.calls.push(Call {
+                            id: proposal.id.clone(),
+                            reason,
+                            background,
+                            task: None,
+                            result: None,
+                        });
+                    }
+                }
+            }
+            Record::ToolResult { call, exit, output } => {
+                if let Some(slot) = self.calls.get_mut(call.0) {
+                    let text = output.as_ref().map(|output| output.body.text.clone());
+                    slot.result = Some((*exit, text));
+                }
+            }
+            Record::Dispatched { call } => {
+                if let Some(slot) = self.calls.get_mut(call.0)
+                    && slot.background
+                {
+                    slot.task = Some(seq);
+                }
+            }
+            Record::TurnEnded { .. } => self.close_step(),
+            Record::Approved { .. }
+            | Record::Born { .. }
+            | Record::RulesLoaded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => {}
+        }
+    }
+}
+
+fn text_blocks(parts: &[ModelPart]) -> Vec<Content> {
+    let mut blocks: Vec<(u32, String)> = Vec::new();
+    for part in parts {
+        match part {
+            ModelPart::TextStart { block } => blocks.push((*block, String::new())),
+            ModelPart::TextDelta { block, delta } => {
+                if let Some((_, text)) = blocks.iter_mut().rev().find(|(id, _)| id == block) {
+                    text.push_str(delta);
+                }
+            }
+            ModelPart::TextEnd { .. }
+            | ModelPart::ToolInputStart { .. }
+            | ModelPart::ToolInputDelta { .. }
+            | ModelPart::ToolInputEnd { .. }
+            | ModelPart::ToolCall { .. }
+            | ModelPart::Finish { .. } => {}
+        }
+    }
+    blocks
+        .into_iter()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(_, text)| Content::Text { text })
+        .collect()
+}
+
+fn tool_use(id: &CallId, name: &ToolName, input: &ToolInput) -> Content {
+    Content::ToolUse {
+        id: id.clone(),
+        name: name.clone(),
+        input: input.to_value(),
+    }
+}
+
+/// The request for the next model call, from every record so far.
+#[must_use]
+pub fn request(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    build(records, system, max_tokens, Defect::None).0
+}
+
+/// The request for a summarize call, made once its `CompactionStarted` is
+/// durable.
+///
+/// The conversation so far, from the latest summary, then [`INSTRUCTION`].
+/// Mail not yet carried is not in it (T4: a cut never holds unread mail).
+#[must_use]
+pub fn summarize(records: &[Record<Parsed>], system: &str, max_tokens: u32) -> ModelRequest {
+    summarized(records, system, max_tokens, Defect::None)
+}
+
+/// The request for the next model call under the planted defect of
+/// `planted`, if it is one of the history's. Only under `sim`.
+///
+/// - `SpliceSteering` (breaks T4's well-formed history): each message is
+///   rendered where it was delivered, so one that arrived while a step's
+///   calls ran sits between their `tool_use` and their results.
+/// - `UntoldTaskEnds` (breaks T4 as the model sees them): no task's end is
+///   told, though a step that carries one records it consumed.
+/// - `CutSwallowsMail` (breaks T4): the mail no step carried before a cut
+///   is taken into the summary, so the step that carries it never tells it.
+/// - `CutMidStep` (breaks T4's well-formed history): the cut falls after
+///   the last step's `tool_use`, so the conversation after it opens with
+///   results of calls it never made.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn planted(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    planted: crate::shell::Planted,
+) -> ModelRequest {
+    build(records, system, max_tokens, defect(planted)).0
+}
+
+/// The request for a summarize call under the planted defect of `planted`:
+/// under `CutSwallowsMail`, the mail no step carried is rendered before
+/// the instruction, to be summarized. Only under `sim`.
+#[cfg(feature = "sim")]
+#[must_use]
+pub fn planted_summary(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    planted: crate::shell::Planted,
+) -> ModelRequest {
+    summarized(records, system, max_tokens, defect(planted))
+}
+
+#[cfg(feature = "sim")]
+const fn defect(planted: crate::shell::Planted) -> Defect {
+    use crate::shell::Planted;
+    match planted {
+        Planted::SpliceSteering => Defect::Splice,
+        Planted::UntoldTaskEnds => Defect::Untold,
+        Planted::CutSwallowsMail => Defect::SwallowMail,
+        Planted::CutMidStep => Defect::CutMidStep,
+        Planted::None
+        | Planted::RunTwice
+        | Planted::UnknownAsNotStarted
+        | Planted::StoppedAsNotStarted
+        | Planted::ActAfterRefusal
+        | Planted::NoDeadline
+        | Planted::AckBeforeAppend
+        | Planted::FreshKeyOnResume
+        | Planted::DeliverBeforePersist
+        | Planted::ConsumeAtInjection
+        | Planted::StopSkipsChildren
+        | Planted::RunBeforePersist
+        | Planted::SkipFsync => Defect::None,
+    }
+}
+
+fn summarized(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    defect: Defect,
+) -> ModelRequest {
+    let (mut request, mail) = build(records, system, max_tokens, defect);
+    let mut said: Vec<Content> = match defect {
+        Defect::SwallowMail => mail
+            .into_values()
+            .map(|text| Content::Text { text })
+            .collect(),
+        Defect::None | Defect::Splice | Defect::Untold | Defect::CutMidStep => Vec::new(),
+    };
+    said.push(Content::Text {
+        text: INSTRUCTION.to_owned(),
+    });
+    match request.messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.extend(said),
+        Some(_) | None => request.messages.push(Message {
+            role: Role::User,
+            content: said,
+        }),
+    }
+    request
+}
+
+/// The text blocks of `request`'s last message, if it is the user's turn:
+/// where what the step about to run carried is told.
+#[must_use]
+pub fn said(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .last()
+        .filter(|message| message.role == Role::User)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::Text { text } => Some(text.clone()),
+                    Content::ToolUse { .. } | Content::ToolResult { .. } => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The text blocks of every message of the user's in `request`.
+#[must_use]
+pub fn said_anywhere(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.clone()),
+            Content::ToolUse { .. } | Content::ToolResult { .. } => None,
+        })
+        .collect()
+}
+
+/// The request, and the mail no step carried yet.
+fn build(
+    records: &[Record<Parsed>],
+    system: &str,
+    max_tokens: u32,
+    defect: Defect,
+) -> (ModelRequest, BTreeMap<EnvelopeId, String>) {
+    let mut builder = Builder {
+        messages: Vec::new(),
+        calls: Vec::new(),
+        step: None,
+        mail: BTreeMap::new(),
+        defect,
+    };
+    // The latest summary, and the cut it starts the conversation at.
+    let cut = records.iter().rev().find_map(|record| {
+        if let Record::Compacted {
+            started,
+            summary,
+            open,
+        } = record
+        {
+            Some((*started, &summary.body, open))
+        } else {
+            None
+        }
+    });
+    // The planted defect moves the cut back to the last `StepFinished`.
+    let cut = cut.map(|(started, summary, open)| match defect {
+        Defect::CutMidStep => {
+            let finished = records
+                .get(..usize::try_from(started).unwrap_or(usize::MAX))
+                .unwrap_or(records)
+                .iter()
+                .rposition(|record| matches!(record, Record::StepFinished { .. }))
+                .and_then(|at| u64::try_from(at).ok());
+            (finished.unwrap_or(started), summary, open)
+        }
+        Defect::None | Defect::Splice | Defect::Untold | Defect::SwallowMail => {
+            (started, summary, open)
+        }
+    });
+    for (seq, record) in (0u64..).zip(records) {
+        builder.record(seq, record);
+        if let Some((at, summary, open)) = cut
+            && seq == at
+        {
+            builder.restart(summary, open);
+        }
+    }
+    // The step about to run has no parts yet; a previous step closes here.
+    if let Some(step) = &builder.step
+        && !(step.parts.is_empty() && step.calls.is_empty())
+    {
+        builder.close_step();
+    }
+    // The tools the actor was born with.
+    let tools = records
+        .iter()
+        .find_map(|record| match record {
+            Record::Born { born } => Some(born.tools.clone()),
+            Record::RulesLoaded { .. }
+            | Record::Delivered { .. }
+            | Record::TurnStarted { .. }
+            | Record::StepStarted { .. }
+            | Record::ModelOutput { .. }
+            | Record::StepReset { .. }
+            | Record::StepFinished { .. }
+            | Record::Approved { .. }
+            | Record::Dispatched { .. }
+            | Record::ToolResult { .. }
+            | Record::TaskEnded { .. }
+            | Record::StopSent { .. }
+            | Record::CancelRequested { .. }
+            | Record::TurnEnded { .. }
+            | Record::EpochBumped { .. }
+            | Record::CompactionStarted { .. }
+            | Record::Compacted { .. } => None,
+        })
+        .unwrap_or_default();
+    (
+        ModelRequest {
+            system: system.to_owned(),
+            messages: builder.messages,
+            max_tokens,
+            tools,
+        },
+        builder.mail,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use verified_domain::id::{ActorId, TaskId, UnixMillis};
+    use verified_domain::{OPEN_ENTRY_BYTES, OpenWork};
+
+    use super::{SUMMARY_HEADER, open_lines, summary};
+    use crate::payload::measure;
+
+    #[test]
+    fn a_summary_counts_its_header() {
+        let written = summary("done".to_owned());
+        assert_eq!(written.body, "done", "the model's text is kept");
+        assert_eq!(
+            written.bytes,
+            measure(format!("{SUMMARY_HEADER}done")).bytes,
+            "measured as rendered"
+        );
+    }
+
+    #[test]
+    fn every_open_line_fits_its_entry() {
+        let child = ActorId::from_parts(
+            UnixMillis::new(UnixMillis::MAX).expect("a time"),
+            &[u8::MAX; 10],
+        );
+        let open = OpenWork {
+            tasks: vec![TaskId(u64::MAX)],
+            children: vec![child],
+        };
+        let lines: Vec<String> = open_lines(&open).collect();
+        assert_eq!(lines.len(), 2, "a line per task and per child");
+        for line in lines {
+            let bytes = u64::try_from(line.len()).expect("a short line");
+            assert!(bytes <= OPEN_ENTRY_BYTES, "{line} is within its entry");
+        }
+    }
+}

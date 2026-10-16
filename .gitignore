@@ -10,3 +10,7 @@ devenv.local.yaml
 
 # Rust Glancer
 .glancer/
+
+# Local secrets and daemon state
+.env
+.verified/

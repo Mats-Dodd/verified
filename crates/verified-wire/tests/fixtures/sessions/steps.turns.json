@@ -1,0 +1,39 @@
+[
+  {
+    "id": "1",
+    "inputs": [
+      {
+        "envelope": {
+          "user": "01a10400-0000-7000-8000-000000000b0a"
+        },
+        "from": "user",
+        "text": "think first",
+        "step": 0
+      }
+    ],
+    "reply": {
+      "id": "1",
+      "role": "assistant",
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "First step.",
+          "state": "done"
+        },
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "Second step, retried.",
+          "state": "done"
+        }
+      ]
+    },
+    "errors": [],
+    "end": "completed"
+  }
+]
